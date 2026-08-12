@@ -18,7 +18,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/sunyanl1236/k8s-personalization-lab.git
+    repoURL: https://github.com/sunyanl1236/k8s-personalization
     targetRevision: HEAD
     path: manifests/argocd-apps
   destination:
