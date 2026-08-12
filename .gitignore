@@ -1,0 +1,8 @@
+# Host-specific runtime state, not project configuration.
+# Records each kind node container's pinned IP so session-start.sh can
+# restore it after a host/WSL restart. See scripts/session-start.sh.
+clusters/kind/.node-ips
+docs/
+.claude/
+CONTEXT.md
+CLAUDE.md

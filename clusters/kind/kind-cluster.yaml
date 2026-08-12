@@ -1,0 +1,84 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: personalization-lab
+# patch the generated kubeadm config with some extra settings
+kubeadmConfigPatches:
+- |
+  apiVersion: kubelet.config.k8s.io/v1beta1
+  kind: KubeletConfiguration
+  evictionHard:
+    nodefs.available: "0%"
+# 3 control plane node and 3 workers
+nodes:
+# the control plane node config
+- role: control-plane
+  image: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+- role: control-plane
+  image: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+- role: control-plane
+  image: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+# the three workers
+- role: worker
+  image: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "topology.kubernetes.io/zone=zone-a"
+  extraPortMappings:
+  # ArgoCD
+  - containerPort: 30010
+    hostPort: 30010
+    protocol: TCP
+  # Flink
+  - containerPort: 30011
+    hostPort: 30011
+    protocol: TCP
+  # Prometheus
+  - containerPort: 30012
+    hostPort: 30012
+    protocol: TCP
+  # Grafana
+  - containerPort: 30013
+    hostPort: 30013
+    protocol: TCP
+  # MinIO
+  - containerPort: 30014
+    hostPort: 30014
+    protocol: TCP
+  - containerPort: 30015
+    hostPort: 30015
+    protocol: TCP
+  # Kafka external listener (Phase 1, ADR 0002). Strimzi's nodeport
+  # listener needs one port for bootstrap plus one PER BROKER, because a
+  # Kafka client is redirected to a specific broker after the metadata
+  # request. A single bootstrap port is not enough.
+  - containerPort: 30016 # bootstrap
+    hostPort: 30016
+    protocol: TCP
+  - containerPort: 30017 # broker-0
+    hostPort: 30017
+    protocol: TCP
+  - containerPort: 30018 # broker-0
+    hostPort: 30018
+    protocol: TCP
+  - containerPort: 30019 # broker-0
+    hostPort: 30019
+    protocol: TCP
+- role: worker
+  image: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "topology.kubernetes.io/zone=zone-b"
+- role: worker
+  image: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "topology.kubernetes.io/zone=zone-c"

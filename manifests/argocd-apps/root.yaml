@@ -1,0 +1,38 @@
+# The app-of-apps root Application (ADR 0004: docs/adr/0004-gitops-from-phase-0.md).
+#
+# This watches manifests/argocd-apps/ in this same repo, at HEAD. Every other
+# Application file committed into this directory from here on gets picked up
+# automatically, no manual `kubectl apply` needed for it. ArgoCD polls Git on
+# its own interval (3 minutes by default) to notice changes, so expect a real,
+# short delay after a push, not instant reactivity.
+#
+# targetRevision is HEAD, not a pinned SHA: this is our own actively-changing
+# repo, and the point of GitOps is that a push should deploy automatically.
+# Pinning makes sense for a third-party chart; not for the source of truth
+# you're actively committing to.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sunyanl1236/k8s-personalization-lab.git
+    targetRevision: HEAD
+    path: manifests/argocd-apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      # selfHeal: false per ADR 0004, needed for the Phase 5 drift-correction
+      # drill (patch a live FlinkDeployment, watch ArgoCD revert it on the
+      # next sync) to actually be observable rather than instant.
+      selfHeal: false
+      # Standard app-of-apps setting: lets child Applications get created AND
+      # removed automatically as files appear/disappear from this directory.
+      # Removing a child's file here will delete that child Application, and
+      # typically cascades to deleting whatever it was managing. Not silent,
+      # but not something to do by accident either.
+      prune: true
