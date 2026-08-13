@@ -1,13 +1,10 @@
 # Strimzi Cluster Operator, installed as an ArgoCD Application (ADR 0004),
-# not the direct `helm install` used earlier and then undone. Confirmed
-# against Strimzi's own docs: a fresh install bundles its CRDs
-# automatically, no crds.enabled-style flag needed like cert-manager.
-#
-# This is a Helm-chart source, not a git/directory source like root.yaml.
-# repoURL here is a Helm chart repository endpoint (the same one added via
-# `helm repo add strimzi https://strimzi.io/charts/`), not a git clone URL.
-# chart + targetRevision (the chart version, not a git ref) is what tells
-# ArgoCD to fetch it as a Helm chart instead of trying to git clone repoURL.
+# not the direct `helm install` used earlier and then undone.
+# Manages the Strimzi operator, third-party software, packaged and 
+# published by the Strimzi project as a Helm chart. You never wrote 
+# its Deployment, RBAC, or CRD YAML, Strimzi's own maintainers did, 
+# and packaged it specifically so you don't have to. Pointing at their 
+# published chart, by name and version, is the only mode that makes sense here.
 # Same shape ArgoCD's own docs show for any Helm-chart Application:
 # https://argo-cd.readthedocs.io/en/stable/user-guide/helm
 apiVersion: argoproj.io/v1alpha1

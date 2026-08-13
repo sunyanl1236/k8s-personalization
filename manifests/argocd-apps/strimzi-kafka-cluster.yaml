@@ -1,0 +1,28 @@
+# strimzi-kafka-cluster.yaml manages the Kafka/KafkaNodePool resources, 
+# content that's entirely yours, hand-written, specific to this project, 
+# your namespace, your ports, your replication settings, your storage size. 
+# Nobody publishes a generic chart for "a personalization lab's Kafka cluster", 
+# it doesn't exist as a packaged product, only as plain YAML you wrote and 
+# committed to your own repo. There's no chart to reference, so the only mode 
+# that applies is "go look in this folder of my own repo and apply what's there as-is."
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: strimzi-kafka-cluster
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sunyanl1236/k8s-personalization-lab.git
+    targetRevision: HEAD
+    path: manifests/strimzi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kafka
+  syncPolicy:
+    automated:
+      # selfHeal: false per ADR 0004, same reasoning as every other
+      # Application here, needed for the Phase 5 drift-correction drill to
+      # be observable rather than instant.
+      selfHeal: false
+      prune: true
