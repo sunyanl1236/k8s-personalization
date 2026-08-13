@@ -1,0 +1,129 @@
+# Doc: https://strimzi.io/docs/operators/latest/deploying.html
+# apiVersion confirmed from the live cluster (`kubectl api-resources
+# --api-group=kafka.strimzi.io`), not a doc example, several docs still show
+# v1beta2, this operator's actual CRDs are v1.
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: personalization
+  # Must match where the Cluster Operator watches. It only watches its own
+  # install namespace by default (confirmed earlier), so this has to be
+  # `kafka`, same namespace the operator itself was installed into.
+  namespace: kafka
+spec:
+  kafka:
+    # Replication/ISR settings. Kafka's default replicates nothing extra,
+    # one copy per partition, so losing any broker loses whatever lived
+    # only on it. These five exist to survive losing one of three brokers,
+    # for both real topics and Kafka's own internal bookkeeping.
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+    listeners:
+      # External access from outside the cluster (ADR 0002), the whole
+      # reason four NodePorts were reserved in kind-cluster.yaml back in
+      # Phase 0. tls: false to keep this a lab-scale setup, no Kafka-side
+      # cert management on top of everything else already running.
+      - name: external
+        port: 9094
+        type: nodeport
+        tls: false
+        configuration:
+          # Step 1 of the two-step connection: one well-known address a new
+          # client asks "who has what" before knowing the real topology.
+          bootstrap:
+            nodePort: 30016
+          # Step 2: the redirect target for each specific broker. Each has
+          # its own dedicated Service, so traffic on a given port always
+          # reaches that one broker, never a random one, no matter which of
+          # the six nodes it arrives on. IDs are 3/4/5, not 0/1/2: node IDs
+          # are assigned cluster-wide across both pools below, and
+          # `controllers` claims 0-2 first (see the pools' annotations).
+          brokers:
+            - broker: 3
+              nodePort: 30017
+              # advertisedHost/Port: what the broker tells a client to
+              # reconnect to *after* the redirect. Unset, it advertises its
+              # internal cluster address, unreachable from outside. This is
+              # the actual address, reachable via the same extraPortMappings
+              # tunnel from Phase 0.
+              advertisedHost: localhost
+              advertisedPort: 30017
+            - broker: 4
+              nodePort: 30018
+              advertisedHost: localhost
+              advertisedPort: 30018
+            - broker: 5
+              nodePort: 30019
+              advertisedHost: localhost
+              advertisedPort: 30019
+    version: "4.3.0"
+    # metadataVersion deliberately omitted. Strimzi derives it automatically
+    # from spec.kafka.version (confirmed from operator source,
+    # KRaftVersionChangeCreator), no need to hardcode a metadata string.
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+---
+# Controller-only pool. Pinned to node IDs 0-2 so the broker pool below is
+# deterministic, rather than discovering the real IDs after creation.
+# Node IDs are assigned cluster-wide, not per pool (confirmed from Strimzi's
+# docs), so without pinning, which pool gets which IDs isn't guaranteed.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: controllers
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: personalization
+  annotations:
+    # Node IDs are assigned cluster-wide, not per pool, so without saying so
+    # explicitly, whichever pool gets created first could claim 0-2.
+    # This pins it, so `controllers` is always 0-2 and `brokers` is always
+    # 3-5, matching the listener's brokers[] IDs above.
+    strimzi.io/next-node-ids: "[0-2]"
+spec:
+  replicas: 3
+  roles:
+    - controller
+  storage:
+    # "Just a Bunch Of Disks": lets a broker use multiple separate volumes
+    # (each with its own id) instead of one. We only use one volume, but
+    # this wrapper is what the volumes[] list requires either way.
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 10Gi
+---
+# Broker-only pool. Pinned to 3-5, matching the listener's brokers[] above.
+# KafkaNodePool defines a pool of nodes with a specific role (confirmed from
+# Strimzi's schema docs); storage can't be changed after creation, so 10Gi
+# is a deliberate choice here, not a placeholder.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: brokers
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: personalization
+  annotations:
+    # Same reasoning as `controllers` above: pins this pool to 3-5 so it
+    # never collides with whatever `controllers` claims, deterministic
+    # instead of discovered after the fact.
+    strimzi.io/next-node-ids: "[3-5]"
+spec:
+  replicas: 3
+  roles:
+    - broker
+  storage:
+    # Same JBOD wrapper as `controllers`: required for volumes[], even
+    # with the single volume we're actually using.
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 10Gi

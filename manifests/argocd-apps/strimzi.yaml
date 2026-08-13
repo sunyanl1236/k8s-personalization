@@ -8,10 +8,16 @@
 # `helm repo add strimzi https://strimzi.io/charts/`), not a git clone URL.
 # chart + targetRevision (the chart version, not a git ref) is what tells
 # ArgoCD to fetch it as a Helm chart instead of trying to git clone repoURL.
+# Same shape ArgoCD's own docs show for any Helm-chart Application:
+# https://argo-cd.readthedocs.io/en/stable/user-guide/helm
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: strimzi
+  # Where this Application OBJECT lives, not where Strimzi gets installed.
+  # ArgoCD's controller only watches Applications in its own namespace by
+  # default, same "watches its own namespace" behavior as Strimzi's own
+  # Cluster Operator, see spec.destination.namespace below for contrast.
   namespace: argocd
 spec:
   project: default
@@ -20,7 +26,14 @@ spec:
     chart: strimzi-kafka-operator
     targetRevision: 1.1.0
   destination:
+    # Which CLUSTER to deploy to, not which namespace. Fixed, special
+    # in-cluster DNS name for "this same cluster ArgoCD runs in." One ArgoCD
+    # can manage other clusters too; this is how you'd point at one.
     server: https://kubernetes.default.svc
+    # Which namespace, on that cluster, Strimzi's operator actually lands
+    # in. Independent of metadata.namespace above, different question
+    # entirely: that's "where's the instruction," this is "where do the
+    # results go."
     namespace: kafka
   syncPolicy:
     automated:
@@ -29,8 +42,9 @@ spec:
       selfHeal: false
       prune: true
     syncOptions:
-      # Without this, sync fails outright: the `kafka` namespace doesn't
-      # exist yet, and nothing else in this project creates it. The earlier
-      # direct `helm install` used --create-namespace for the same reason;
-      # this is the declarative equivalent.
+      # Deployment can't be created in a namespace that doesn't exist.
+      # Nothing else here creates `kafka`, so without this, sync fails with
+      # "namespaces kafka not found." Declarative equivalent of the
+      # --create-namespace flag from the earlier direct `helm install`.
+      # https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options
       - CreateNamespace=true
