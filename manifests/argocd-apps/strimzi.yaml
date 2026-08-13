@@ -1,0 +1,36 @@
+# Strimzi Cluster Operator, installed as an ArgoCD Application (ADR 0004),
+# not the direct `helm install` used earlier and then undone. Confirmed
+# against Strimzi's own docs: a fresh install bundles its CRDs
+# automatically, no crds.enabled-style flag needed like cert-manager.
+#
+# This is a Helm-chart source, not a git/directory source like root.yaml.
+# repoURL here is a Helm chart repository endpoint (the same one added via
+# `helm repo add strimzi https://strimzi.io/charts/`), not a git clone URL.
+# chart + targetRevision (the chart version, not a git ref) is what tells
+# ArgoCD to fetch it as a Helm chart instead of trying to git clone repoURL.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: strimzi
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://strimzi.io/charts/
+    chart: strimzi-kafka-operator
+    targetRevision: 1.1.0
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kafka
+  syncPolicy:
+    automated:
+      # selfHeal: false per ADR 0004, same reasoning as root.yaml, needed
+      # for the Phase 5 drift-correction drill to be observable.
+      selfHeal: false
+      prune: true
+    syncOptions:
+      # Without this, sync fails outright: the `kafka` namespace doesn't
+      # exist yet, and nothing else in this project creates it. The earlier
+      # direct `helm install` used --create-namespace for the same reason;
+      # this is the declarative equivalent.
+      - CreateNamespace=true
