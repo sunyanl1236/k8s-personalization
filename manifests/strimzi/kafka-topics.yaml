@@ -1,0 +1,53 @@
+# The Topic Operator manages these resources. It was enabled in
+# kafka-cluster.yaml by entityOperator.topicOperator: {}.
+# The strimzi.io/cluster label links each topic to the "personalization"
+# cluster. A wrong or missing label causes silent non-reconciliation.
+# No error appears. The topic status simply never becomes Ready.
+#
+# partitions: 3, matching the 3-broker pool. This bounds how far a
+# keyed Flink operator reading this topic can parallelize in later
+# phases. replicas: 3, matching default.replication.factor already
+# set cluster-wide.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: clickstream
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: personalization
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: product-change
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: personalization
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: promo-rule
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: personalization
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: recommendation
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: personalization
+spec:
+  partitions: 3
+  replicas: 3
