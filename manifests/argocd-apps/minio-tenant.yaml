@@ -1,0 +1,24 @@
+# Second Application, directory-sourced, same shape as
+# strimzi-kafka-cluster.yaml. Points at this project's own manifests/minio/,
+# where the actual Tenant CR lives, entirely hand-written content specific
+# to this project, same reasoning as strimzi-kafka-cluster.yaml's own header
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: minio-tenant
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sunyanl1236/k8s-personalization.git
+    targetRevision: HEAD
+    path: manifests/minio
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: minio-tenant
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+    automated:
+      selfHeal: false
+      prune: true

@@ -1,0 +1,29 @@
+# Installs only the MinIO Operator's own controller, same split as
+# strimzi.yaml. No MinIO server pod, no storage, no bucket exists after 
+# this Application syncs on its own.
+# 
+# No local `helm repo add` needed for ArgoCD itself though, same reasoning as
+# strimzi.yaml: ArgoCD's repo-server fetches the chart directly from
+# repoURL, independent of anything registered locally.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: minio-operator
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://operator.min.io
+    chart: operator
+    targetRevision: 7.1.1
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: minio-operator
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+    automated:
+      # selfHeal: false, same reasoning as every other Application here,
+      # per ADR 0004, needed for the Phase 5 drift drill to be observable.
+      selfHeal: false
+      prune: true

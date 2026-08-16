@@ -1,0 +1,62 @@
+# spec.configuration.name points at a Secret this file deliberately does
+# NOT define. Confirmed from the Operator's docs, that Secret carries
+# MINIO_ROOT_USER/MINIO_ROOT_PASSWORD in plaintext, and this repo commits
+# everything else it applies, so committing that Secret would put a
+# plaintext root password in git history. Same reasoning CLAUDE.md already
+# applies to ArgoCD's own admin password: fetched/created out of band, never
+# written into a tracked file. Create it yourself before this Application
+# can go Healthy:
+#   kubectl create namespace minio-tenant
+#   kubectl create secret generic storage-configuration \
+#     -n minio-tenant \
+#     --from-literal=config.env='export MINIO_ROOT_USER="minioadmin"
+#   export MINIO_ROOT_PASSWORD="CHANGE-ME"
+#   export MINIO_STORAGE_CLASS_STANDARD="EC:2"'
+#
+# servers: 1 is the Operator's own documented single-node deployment path,
+# not a workaround, confirmed from its "tenant-tiny" canonical example.
+# volumesPerServer: 4 matches that same example, the minimum that still
+# gives real erasure-coded redundancy on one node (EC:2 above needs it,
+# see docs/knowledge/ for the EC:2 math worked through this session).
+#
+# storage: 5Gi per volume is a guess, splitting the difference between the
+# Operator's own minimal example (2Gi) and this project's Kafka brokers
+# (10Gi persistent-claim volumes). Nothing here derives it from actual
+# expected Flink checkpoint sizes, that's still an open question, change it
+# freely.
+#
+# requestAutoCert: false, same reasoning as kafka-cluster.yaml's external
+# listener choosing tls: false, lab-scale, no extra cert management on top
+# of everything else already running.
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: personalization
+  namespace: minio-tenant
+spec:
+  configuration:
+    name: storage-configuration
+  pools:
+    - name: pool-0
+      # servers: 1 triggers the Operator's standalone mode, confirmed as
+      # the documented single-node deployment path (its "tenant-tiny"
+      # canonical example), not a workaround. Distributed mode needs 2+.
+      servers: 1
+      # volumesPerServer: 4 gives this one server pod 4 separate PVCs,
+      # 4 independent drives from MinIO's perspective, not one big volume.
+      # Needed for erasure coding to mean anything on a single node: with
+      # only 1 volume there's nowhere to spread data+parity pieces, no
+      # redundancy possible. EC:2 (in the Secret, see header comment)
+      # splits into 2 data + 2 parity shards, one per volume, using all 4.
+      volumesPerServer: 4
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 5Gi
+  requestAutoCert: false
+  buckets:
+    - name: checkpoints
+      region: us-east-1
