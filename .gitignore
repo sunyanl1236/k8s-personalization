@@ -6,3 +6,12 @@ docs/
 .claude/
 CONTEXT.md
 CLAUDE.md
+
+# Gradle. Local cache/metadata and build output, regenerated from source
+# every time, not something to track. The wrapper itself,
+# generator/gradlew, generator/gradlew.bat,
+# generator/gradle/wrapper/gradle-wrapper.{jar,properties}, is a different,
+# non-dot-prefixed path and stays committed on purpose, that's the one
+# artifact meant to be reproducible across machines.
+.gradle/
+build/

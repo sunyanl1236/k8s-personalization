@@ -1,0 +1,57 @@
+// Plain Kafka producer now, not a Flink program: per
+// docs/superpowers/specs/2026-08-16-generator-event-production-design.md,
+// the generator doesn't process a stream, it produces one, so
+// flink-streaming-java/flink-clients were removed and kafka-clients added
+// instead. No more provided-vs-bundled split needed either: nothing here
+// runs inside a Flink runtime that already supplies half the classpath,
+// so shadowJar just bundles everything from `implementation` by default,
+// no custom flinkShadowJar configuration required.
+//
+// Shadow plugin is com.gradleup.shadow, not the com.github.johnrengelman
+// one Flink's own docs example still shows; that project is retired,
+// confirmed via search, and its old plugin ID isn't Gradle-9-compatible.
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.gradleup.shadow' version '9.6.1'
+}
+
+group = 'lab.personalization'
+version = '0.1'
+
+// mainClassName as a top-level property was removed from the application
+// plugin; Flink's own docs template still shows it. Current syntax nests
+// it under application {}, confirmed from Gradle's own docs.
+application {
+    mainClass = 'lab.personalization.generator.Generator'
+}
+
+ext {
+    javaVersion = '21'
+    // Matches the Strimzi Kafka cluster's own version, kafka-cluster.yaml's
+    // spec.kafka.version, rather than an unrelated, independently-chosen
+    // client version.
+    kafkaVersion = '4.3.0'
+    log4jVersion = '2.26.1'
+}
+// sourceCompatibility/targetCompatibility as top-level properties are
+// discouraged now too, confirmed from Gradle's own docs: "avoid
+// sourceCompatibility and targetCompatibility unless necessary," toolchains
+// are the current recommended way, and this also fixes which JDK Gradle
+// actually compiles with, not just which bytecode version it targets.
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(javaVersion.toInteger())
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation "org.apache.kafka:kafka-clients:${kafkaVersion}"
+    runtimeOnly "org.apache.logging.log4j:log4j-slf4j-impl:${log4jVersion}"
+    runtimeOnly "org.apache.logging.log4j:log4j-api:${log4jVersion}"
+    runtimeOnly "org.apache.logging.log4j:log4j-core:${log4jVersion}"
+}
