@@ -1,4 +1,4 @@
-package lab.personalization.generator.domain;
+package lab.personalization.domain;
 
 // Minimal set for Phase 4's CEP pattern (view, then cart, then no checkout
 // within a window). "Left without checking out" is the absence of a

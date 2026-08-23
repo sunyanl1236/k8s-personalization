@@ -1,7 +1,7 @@
 package lab.personalization.generator.factory;
 
-import lab.personalization.generator.domain.ActionType;
-import lab.personalization.generator.domain.Click;
+import lab.personalization.domain.ActionType;
+import lab.personalization.domain.Click;
 
 import java.time.Instant;
 import java.util.List;

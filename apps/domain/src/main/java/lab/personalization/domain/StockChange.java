@@ -1,4 +1,4 @@
-package lab.personalization.generator.domain;
+package lab.personalization.domain;
 
 import java.time.Instant;
 

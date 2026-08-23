@@ -1,4 +1,4 @@
-package lab.personalization.generator.domain;
+package lab.personalization.domain;
 
 // Deliberately simple: the discount condition itself (e.g. "within 2
 // seconds of a price drop") lives in the Flink job's own logic in Phase 4,

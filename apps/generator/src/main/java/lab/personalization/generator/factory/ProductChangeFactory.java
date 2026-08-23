@@ -1,8 +1,8 @@
 package lab.personalization.generator.factory;
 
-import lab.personalization.generator.domain.PriceChange;
-import lab.personalization.generator.domain.ProductChange;
-import lab.personalization.generator.domain.StockChange;
+import lab.personalization.domain.PriceChange;
+import lab.personalization.domain.ProductChange;
+import lab.personalization.domain.StockChange;
 
 import java.time.Instant;
 import java.util.List;

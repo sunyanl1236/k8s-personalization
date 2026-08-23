@@ -50,6 +50,11 @@ repositories {
 }
 
 dependencies {
+    // The domain records and JsonCodec, extracted in Phase 3 Task 1 so
+    // :pipeline can share the same definitions rather than a second copy that
+    // drifts. See docs/superpowers/specs/2026-08-23-core-pipeline-design.md.
+    implementation project(':domain')
+
     implementation "org.apache.kafka:kafka-clients:${kafkaVersion}"
     runtimeOnly "org.apache.logging.log4j:log4j-slf4j-impl:${log4jVersion}"
     runtimeOnly "org.apache.logging.log4j:log4j-api:${log4jVersion}"

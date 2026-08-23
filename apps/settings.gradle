@@ -1,0 +1,14 @@
+// Repo-root build. One settings.gradle for the whole project: Gradle walks
+// upward to find this file, and it is the only place modules are declared.
+//
+// generator/settings.gradle used to declare generator/ as a build root in its
+// own right. It was deleted when this file was added, because two settings
+// files means two answers to "where does the build start", and running Gradle
+// from inside generator/ would silently get the old single-project build with
+// no :domain in it.
+//
+// :pipeline joins in Task 3 of the Phase 3 plan, once the directory exists.
+rootProject.name = 'flink-k8s-personalization-lab'
+
+include 'domain'
+include 'generator'

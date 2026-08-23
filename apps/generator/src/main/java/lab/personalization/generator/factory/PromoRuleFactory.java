@@ -1,6 +1,6 @@
 package lab.personalization.generator.factory;
 
-import lab.personalization.generator.domain.PromoRule;
+import lab.personalization.domain.PromoRule;
 
 import java.time.Instant;
 import java.util.Random;

@@ -1,10 +1,4 @@
-package lab.personalization.generator;
-
-import lab.personalization.generator.domain.Click;
-import lab.personalization.generator.domain.PriceChange;
-import lab.personalization.generator.domain.ProductChange;
-import lab.personalization.generator.domain.PromoRule;
-import lab.personalization.generator.domain.StockChange;
+package lab.personalization.domain;
 
 import java.nio.charset.StandardCharsets;
 

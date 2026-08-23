@@ -11,9 +11,10 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
-import lab.personalization.generator.domain.Click;
-import lab.personalization.generator.domain.ProductChange;
-import lab.personalization.generator.domain.PromoRule;
+import lab.personalization.domain.Click;
+import lab.personalization.domain.JsonCodec;
+import lab.personalization.domain.ProductChange;
+import lab.personalization.domain.PromoRule;
 import lab.personalization.generator.factory.Catalog;
 import lab.personalization.generator.factory.ClickFactory;
 import lab.personalization.generator.factory.ProductChangeFactory;

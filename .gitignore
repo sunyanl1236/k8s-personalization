@@ -9,9 +9,13 @@ CLAUDE.md
 
 # Gradle. Local cache/metadata and build output, regenerated from source
 # every time, not something to track. The wrapper itself,
-# generator/gradlew, generator/gradlew.bat,
-# generator/gradle/wrapper/gradle-wrapper.{jar,properties}, is a different,
+# apps/gradlew, apps/gradlew.bat,
+# apps/gradle/wrapper/gradle-wrapper.{jar,properties}, is a different,
 # non-dot-prefixed path and stays committed on purpose, that's the one
 # artifact meant to be reproducible across machines.
+#
+# The whole Gradle build lives under apps/ so the repo root separates the
+# Java build from the infrastructure (manifests/, clusters/, scripts/).
+# The patterns below are path-agnostic, so they match apps/*/build/ too.
 .gradle/
 build/

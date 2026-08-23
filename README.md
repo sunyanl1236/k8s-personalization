@@ -101,22 +101,33 @@ client like `mc` or Flink's S3 plugin, not for browser access.
 
 ## Running the generator
 
-Phase 2's synthetic generator, `generator/`, a plain Java program (not a
+Phase 2's synthetic generator, `apps/generator/`, a plain Java program (not a
 Flink job, see
 [the generator design doc](docs/superpowers/specs/2026-08-16-generator-event-production-design.md)),
 producing `Click`, `PriceChange`/`StockChange`, and `PromoRule` events onto
 `clickstream`, `product-change`, and `promo-rule`.
 
 ```bash
-cd generator
-./gradlew run
+apps/gradlew -p apps :generator:run
 ```
+
+**Two things changed here in Phase 3.** The Gradle build moved under `apps/`,
+so the repo root separates the Java build from `manifests/`, `clusters/`, and
+`scripts/`. And the build is now multi-project, so the task is `:generator:run`
+rather than a bare `run`.
+
+`-p apps` points Gradle at the build root. Gradle finds its build from the
+*working directory*, not from where the `gradlew` script lives, so
+`apps/gradlew run` on its own fails with "does not contain a Gradle build".
+`cd apps && ./gradlew :generator:run` works equally well; the flag form is used
+here so Gradle, `kubectl`, and `kcat` commands can all be run from the repo
+root without changing directory between them.
 
 Runs with sensible defaults and no args: `localhost:30016` for bootstrap
 servers, 5 clicks/sec with up to 2s of injected skew, 1 product-change/sec
 with up to 2s of skew, one promo rule every 30s. Override any of these with
-`./gradlew run --args="--click-rate=10 --click-max-skew-seconds=5"`, see
-`GeneratorConfig.parse` for the full list of `--key=value` options.
+`apps/gradlew -p apps :generator:run --args="--click-rate=10 --click-max-skew-seconds=5"`,
+see `GeneratorConfig.parse` for the full list of `--key=value` options.
 
 **Don't trust it's working from the log line alone.** Same standard as the
 Kafka external listener drill in Phase 1: verify with a real consumer, in
