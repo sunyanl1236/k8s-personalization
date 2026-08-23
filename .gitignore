@@ -2,10 +2,8 @@
 # Records each kind node container's pinned IP so session-start.sh can
 # restore it after a host/WSL restart. See scripts/session-start.sh.
 clusters/kind/.node-ips
-docs/
+docs/snot-original-eks.md
 .claude/
-CONTEXT.md
-CLAUDE.md
 
 # Gradle. Local cache/metadata and build output, regenerated from source
 # every time, not something to track. The wrapper itself,
