@@ -27,7 +27,6 @@ SECRET_NAME="storage-configuration"
 ROOT_USER="minioadmin"
 
 command -v kubectl >/dev/null || die "kubectl not found"
-command -v openssl >/dev/null || die "openssl not found, needed to generate a password"
 
 if kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1; then
   ok "${SECRET_NAME} already exists in ${NAMESPACE}, nothing to do"
@@ -37,7 +36,11 @@ fi
 info "Creating namespace ${NAMESPACE} if it doesn't exist yet"
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-ROOT_PASSWORD="$(openssl rand -base64 24)"
+# /dev/urandom + base64, not openssl: both part of coreutils, already
+# present on essentially any Linux system, no new tooling to install for
+# one password (this project's own environment-constraints reasoning:
+# prefer what's already there over adding something that outlives its use).
+ROOT_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '\n')"
 
 info "Creating ${SECRET_NAME}"
 kubectl create secret generic "${SECRET_NAME}" \
