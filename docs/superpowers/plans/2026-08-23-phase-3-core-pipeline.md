@@ -48,9 +48,9 @@ file.
 | 0 | Confirm the Flink Operator supports Flink 2.2 | done 2026-08-23, gate cleared |
 | 1 | Root multi-project build with `:domain` | done 2026-08-23, Phase 2 regression passed |
 | 2 | Expose MinIO's S3 API on NodePort 30014 | done 2026-08-23, `curl` returned 200 |
-| 3 | `:pipeline` module reading Clicks from Kafka | **next** |
-| 4 | Watermarks, session windows, and `SessionSignal` | not started |
-| 5 | Late Click side output, and Drill B | not started |
+| 3 | `:pipeline` module reading Clicks from Kafka | done 2026-08-23, Clicks printing, Instant confirmed |
+| 4 | Watermarks, session windows, and `SessionSignal` | done 2026-08-23, after a watermark stall |
+| 5 | Late Click side output, and Drill B | **next** |
 | 6 | `RecommendationDecider` | not started |
 | 7 | RocksDB and checkpoints to MinIO | not started |
 | 8 | Exactly-once Kafka sink | not started |
@@ -410,9 +410,10 @@ throw at graph construction if any type falls back to Kryo. The spec flags
 that is the design working as intended**, not a defect. The fix is one
 `pipeline.serialization-config` entry, not a change to `Click`.
 
-- [ ] **Step 1: Add `:pipeline` to the root `settings.gradle`.**
+- [x] **Step 1: Add `:pipeline` to `apps/settings.gradle`.** `mkdir apps/pipeline`
+first, same reason as Task 1.
 
-- [ ] **Step 2: Write `pipeline/build.gradle`.**
+- [x] **Step 2: Write `apps/pipeline/build.gradle`.**
 
 Dependency scopes from the spec's Components section. The `compileOnly` plus
 `runtimeOnly` pairing is Gradle's equivalent of Maven `provided`: present when
@@ -434,9 +435,28 @@ dependencies {
 ```
 
 `kafkaConnectorVersion` is **not** Flink's version. The connector has its own
-line. Find the value that pairs with Flink 2.2 before writing it.
+line. Resolved from Maven Central on 2026-08-23: **`5.0.0-2.2`**. The `4.0.x-2.0`
+versions are the Flink 2.0 line and `3.4.0-1.20` the last 1.x line.
 
-- [ ] **Step 3: Add `fromJson` to `JsonCodec`.**
+**Two deviations from this step as originally written, both deliberate.**
+
+`flink-s3-fs-hadoop` was left out. Nothing before Task 7 writes a checkpoint,
+and it drags in a large Hadoop tree that can pull a second SLF4J binding onto
+the classpath. This task exists to keep three failure signatures
+distinguishable, so an unused heavy dependency works against it. Add it in Task
+7.
+
+A `resolutionStrategy.capabilitiesResolution` block was added, because
+`flink-runtime:2.2.0` and `kafka-clients:4.2.0` pull two different lz4 modules
+that declare the same capability, which is a hard error rather than a version
+conflict. See the knowledge doc for the full explanation.
+
+**Check the report for `FAILED`, do not trust its exit code.**
+`apps/gradlew -p apps :pipeline:dependencies --configuration runtimeClasspath`
+prints `BUILD SUCCESSFUL` even when entries in the tree failed to resolve,
+because the task only prints and never needs the classpath.
+
+- [x] **Step 3: Add `fromJson` to `JsonCodec`.**
 
 Signature: `public static Click fromJson(byte[] bytes)`.
 
@@ -446,7 +466,7 @@ unparseable line should do, and be explicit about it: throwing kills the job on
 one bad record, returning null pushes the problem downstream. Write the choice
 in a comment.
 
-- [ ] **Step 4: Write `PipelineConfig`.**
+- [x] **Step 4: Write `PipelineConfig`.**
 
 Same shape as `GeneratorConfig`: a record, `--key=value` parsing, package-private,
 defaults for everything, no CLI library. For this task only three fields are
@@ -457,7 +477,7 @@ Name it `inputTopic`, not `topic`. Task 8 adds `outputTopic`, and a bare `topic`
 alongside it reads as ambiguous at exactly the moment Task 9's Drill depends on
 telling them apart.
 
-- [ ] **Step 5: Write `ClickDeserializationSchema`.**
+- [x] **Step 5: Write `ClickDeserializationSchema`.**
 
 Two methods carry weight:
 
@@ -470,7 +490,7 @@ public TypeInformation<Click> getProducedType()       // TypeInformation.of(Clic
 stream's type and falls back to a generic type, which `pipeline.generic-types:
 false` then rejects.
 
-- [ ] **Step 6: Write `PersonalizationJob` with a source and a print.**
+- [x] **Step 6: Write `PersonalizationJob` with a source and a print.**
 
 ```java
 Configuration config = new Configuration();
@@ -499,7 +519,7 @@ Nothing in this task consumes event time yet.
 untyped string keys, and `setString` may be deprecated. Find the current form
 once here, then use it for every config key in Tasks 7 and 8.
 
-- [ ] **Step 7: Add the `run` task and execute.**
+- [x] **Step 7: Add the `run` task and execute.**
 
 ```bash
 apps/gradlew -p apps :generator:run          # terminal 1, leave it producing
@@ -517,7 +537,28 @@ Three distinct failures and what each means:
 | Throws at startup naming a field type | A Kryo fallback. Expected if `Instant` is not first-class. Fix with `pipeline.serialization-config` |
 | Runs, prints nothing, no error | Reaching Kafka but reading nothing. Check the topic name and that the generator is running |
 
-- [ ] **Step 8: Record the `Instant` answer.**
+**Observed 2026-08-23.** Clicks printed at the expected rate, 10 distinct
+shoppers matching `Catalog.SHOPPER_IDS`. Three findings this step produced:
+
+1. **`java.time.Instant` is a first-class Flink type. The open question is
+   closed.** With `pipeline.generic-types: false` set, a Kryo fallback would
+   have thrown at graph construction naming the field. It did not throw, and
+   nothing logged a fallback. No `pipeline.serialization-config` entry is
+   needed and the domain records stay untouched.
+2. **`flink-connector-base` is required and nothing pulls it in.** The Kafka
+   connector does not depend on it transitively, and Flink's docs note it "has
+   been bundled in flink-dist since FLINK-30400", so a real cluster has it and
+   MiniCluster run from Gradle does not. It fails at job construction, not at
+   compile time: `NoClassDefFoundError:
+   org/apache/flink/connector/base/source/reader/RecordEmitter`. Added with the
+   same provided-style scope as the other runtime modules.
+3. **`OffsetsInitializer.earliest()` replays the whole backlog.** The 75-second
+   run printed 2.9 million Clicks with event times from a week earlier. Correct,
+   and load-bearing for Task 9, but it means Task 4 computes session windows
+   over a week of history before reaching live data. See Task 4's note on
+   `--starting-offsets`.
+
+- [x] **Step 8: Record the `Instant` answer.**
 
 The spec says the first run answers whether `Instant` is a first-class Flink
 type. Write the answer into the spec's Sources section, replacing the "Not
@@ -552,18 +593,20 @@ idle partition freezes the watermark, no window ever fires, and the job looks
 dead while behaving correctly. If nothing prints, check this before anything
 else. `withIdleness(...)` is the lever.
 
-- [ ] **Step 1: Add `--watermark-bound-seconds` (5) and `--session-gap-seconds` (6) to `PipelineConfig`.**
+- [x] **Step 1: Add `--watermark-bound-seconds` (5) and `--session-gap-seconds` (6) to `PipelineConfig`.**
+Also added `--start-from-earliest` (default `true`), not in the original plan:
+`earliest` replays the whole backlog, so a rate check needs a way to start live.
 
 Both are derived values, not preferences. The spec's arithmetic: at 10 Shoppers
 and 5 Clicks per second, a 6 second gap closes a Browsing Session about every 4
 seconds, and a 30 second gap closes one about never.
 
-- [ ] **Step 2: Write `SessionSignal` in `:domain`.**
+- [x] **Step 2: Write `SessionSignal` in `:domain`.**
 
 A Signal by the `CONTEXT.md` definition, so it is domain vocabulary. It has no
 dependencies, so it does not break the `:domain` rule.
 
-- [ ] **Step 3: Replace `noWatermarks()`.**
+- [x] **Step 3: Replace `noWatermarks()`.**
 
 ```java
 WatermarkStrategy.<Click>forBoundedOutOfOrderness(Duration.ofSeconds(bound))
@@ -575,7 +618,32 @@ The assigner reads the event time embedded in the `Click`, not the Kafka record
 timestamp. Those differ by exactly the skew the generator injects, which is the
 whole point of Phase 2's delayed-publish mechanism.
 
-- [ ] **Step 4: Key and window.**
+- [x] **Step 4: Key and window.**
+
+**`WindowedStream` has no `print()`**, and the compile error names it exactly:
+`symbol: method print() location: class WindowedStream<Click,String,TimeWindow>`.
+`.window(...)` returns a `WindowedStream`, not a `DataStream`, and it offers
+only `reduce`, `aggregate`, `process`, and `apply`. A window is a grouping that
+has not been collapsed yet, so the API refuses to go downstream until you say
+how each window becomes a single value. Only those four return a `DataStream`,
+and only then does `print()` exist.
+
+**`WindowedStream` has no `print()`.** `.window(...)` returns a
+`WindowedStream`, not a `DataStream`, and it offers only `reduce`, `aggregate`,
+`process`, and `apply`. A window is a grouping that has not been collapsed yet,
+so the API refuses to go downstream until you say how each window becomes a
+single value. The compile error names it exactly:
+`symbol: method print() location: class WindowedStream<Click,String,TimeWindow>`.
+
+The plan's throwaway `.reduce((a, b) -> b)` diagnostic was skipped; step 5's
+`SessionAggregator` is the terminal, so the rate check happens in step 6 with
+the real aggregator in place.
+
+Also wired here: `--start-from-earliest`, which `PipelineConfig` parsed while
+`setStartingOffsets` stayed hardcoded to `earliest()`. A flag that is accepted
+and ignored is worse than one that does not exist: an unknown flag throws, an
+ignored one silently replays the whole backlog and makes step 6's rate check
+look like a windowing bug.
 
 ```java
 .keyBy(Click::shopperId)
@@ -585,20 +653,24 @@ whole point of Phase 2's delayed-publish mechanism.
 `Duration`, not `Time`. `Time` was removed in the Flink 2.0 line, and every
 example written before 2025 uses it.
 
-- [ ] **Step 5: Write `SessionAggregator`.**
+- [x] **Step 5: Write `SessionAggregator`.**
 
 A `ProcessWindowFunction` receives every Click in the window plus the window
 metadata. Compute the most-clicked Product. **Break ties by lowest `productId`**,
 so the result never depends on iteration order. A tie broken by iteration order
 makes Task 9's Drill fail intermittently, and that is a miserable thing to debug.
 
-- [ ] **Step 6: Print `SessionSignal` and check the rate against the prediction.**
+- [x] **Step 6: Print `SessionSignal` and check the rate against the prediction.**
 
-Run the generator at its defaults and the job. Expected: `SessionSignal` lines
-at roughly **one every 4 seconds**.
+```bash
+apps/gradlew -p apps :generator:run                                       # terminal 1
+apps/gradlew -p apps :pipeline:run --args="--start-from-earliest=false"   # terminal 2
+```
 
-This is a real check, not a formality. Far fewer means the watermark is stalling
-on an idle partition. None at all, over a minute, means it is stalled outright.
+Expected: `SessionSignal` lines at roughly **one every 4 seconds**, after an
+initial quiet period of about 50 seconds. A session spans ~40s of event time,
+and the watermark trails the newest event time by the 5s bound while the window
+extends 6s past the last Click.
 
 ---
 

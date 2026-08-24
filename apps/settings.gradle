@@ -12,3 +12,4 @@ rootProject.name = 'flink-k8s-personalization-lab'
 
 include 'domain'
 include 'generator'
+include 'pipeline'

@@ -1,0 +1,144 @@
+// Phase 3's Flink job. Runs on MiniCluster against the Kafka and MinIO already
+// in the kind cluster, per ADR 0001; the first real FlinkDeployment is Phase 5.
+//
+// This module reintroduces a split that generator/build.gradle deliberately
+// REMOVED when it stopped being a Flink program. That comment there is still
+// correct for the generator: nothing in it runs inside a Flink runtime, so it
+// bundles everything. The opposite is true here. Flink's own docs are explicit
+// (see configuration/overview, linked below): API and runtime modules are
+// provided by Flink and must not be included in the job uber jar, while
+// connectors, formats, and third-party libraries should be.
+//
+// Gradle has no `provided` scope. The equivalent is compileOnly + runtimeOnly
+// on the same artifact: on the classpath when you compile and when you `run`
+// locally, absent from whatever jar Phase 5 ships.
+//
+// Docs consulted:
+//   scopes/packaging  https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/overview.md
+//   rocksdb backend   https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/ops/state/state_backends.md
+//   kafka connector   https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/maven.md
+plugins {
+    id 'java'
+    id 'application'
+    // No com.gradleup.shadow here yet, unlike :generator. Nothing needs a fat
+    // jar until Phase 5 builds a container image. Adding it now would be a
+    // plugin with no consumer.
+}
+
+group = 'lab.personalization'
+version = '0.1'
+
+ext {
+    javaVersion = '21'
+    flinkVersion = '2.2.0'
+    // NOT flinkVersion. The Kafka connector has its own version line, in the
+    // form <connector>-<flink-minor>. 5.0.0-2.2 is the build against Flink
+    // 2.2; 4.0.1-2.0 is the Flink 2.0 line and 3.4.0-1.20 the last 1.x line.
+    // Confirmed against Maven Central:
+    //   https://search.maven.org/solrsearch/select?q=g:org.apache.flink+AND+a:flink-connector-kafka&core=gav
+    kafkaConnectorVersion = '5.0.0-2.2'
+    log4jVersion = '2.26.1'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(javaVersion.toInteger())
+    }
+}
+
+application {
+    mainClass = 'lab.personalization.pipeline.PersonalizationJob'
+
+    // Preemptive, and worth deleting if it turns out to be unnecessary.
+    // A Flink distribution sets these itself in its own start scripts. Running
+    // MiniCluster straight from Gradle on a modern JDK bypasses that, and
+    // Flink's internals reflect into java.base. Without them the symptom is an
+    // InaccessibleObjectException at job startup, which reads like a code bug
+    // rather than a JVM module-access problem.
+    applicationDefaultJvmArgs = [
+            '--add-opens=java.base/java.util=ALL-UNNAMED',
+            '--add-opens=java.base/java.lang=ALL-UNNAMED',
+            '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+            '--add-opens=java.base/java.time=ALL-UNNAMED'
+    ]
+}
+
+repositories {
+    mavenCentral()
+}
+
+// Flink 2.2 and the Kafka connector disagree about which lz4 artifact they are
+// on, and Gradle refuses to guess.
+//
+//   org.lz4:lz4-java:1.8.0        <- flink-runtime:2.2.0
+//   at.yawk.lz4:lz4-java:1.10.1   <- kafka-clients:4.2.0, via the connector
+//
+// at.yawk.lz4 is the maintained republish of the abandoned org.lz4 artifact,
+// and its module metadata declares that it PROVIDES the org.lz4:lz4-java
+// capability. Two providers of one capability is a hard error, not a version
+// conflict Gradle can resolve by picking the higher number, so both fail and
+// the whole runtime classpath is unresolvable. The symptom is a `dependencies`
+// report that still says BUILD SUCCESSFUL, because that task only prints; the
+// real failure surfaces the first time something actually needs the classpath.
+//
+// Pick the maintained fork explicitly. Kafka 4.2 moved to it deliberately, and
+// it is the newer of the two.
+configurations.all {
+    resolutionStrategy.capabilitiesResolution.withCapability('org.lz4:lz4-java') {
+        def maintained = candidates.find { it.id.group == 'at.yawk.lz4' }
+        if (maintained != null) {
+            select(maintained)
+        } else {
+            selectHighestVersion()
+        }
+        because 'flink-runtime 2.2.0 and kafka-clients 4.2.0 pull different lz4 modules declaring the same capability'
+    }
+}
+
+dependencies {
+    // The shared records and JsonCodec. This module owns every Flink-shaped
+    // adapter around them (DeserializationSchema and friends); :domain itself
+    // stays dependency-free so the records cannot acquire a Flink type.
+    implementation project(':domain')
+
+    // Provided by a real Flink cluster in Phase 5, needed locally now.
+    compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
+    runtimeOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
+
+    // Required to run a job by executing its main class.
+    compileOnly "org.apache.flink:flink-clients:${flinkVersion}"
+    runtimeOnly "org.apache.flink:flink-clients:${flinkVersion}"
+
+    // Documented as NOT on the default classpath, even though the runtime
+    // ships it. Needed from Task 7, declared here so the scope split is
+    // written once.
+    compileOnly "org.apache.flink:flink-statebackend-rocksdb:${flinkVersion}"
+    runtimeOnly "org.apache.flink:flink-statebackend-rocksdb:${flinkVersion}"
+
+    // A connector, so it is bundled rather than provided.
+    implementation "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
+
+    // flink-connector-base. NOT optional, and not obvious: the Kafka connector
+    // does not pull it transitively, and Flink's own docs note it "has been
+    // bundled in flink-dist since FLINK-30400". So a real cluster already has
+    // it and MiniCluster run from Gradle does not. Same provided-style scope as
+    // the other runtime modules for exactly that reason.
+    // Symptom without it, at job construction, not at compile time:
+    //   NoClassDefFoundError: org/apache/flink/connector/base/source/reader/RecordEmitter
+    compileOnly "org.apache.flink:flink-connector-base:${flinkVersion}"
+    runtimeOnly "org.apache.flink:flink-connector-base:${flinkVersion}"
+
+    // flink-s3-fs-hadoop is deliberately NOT here yet. Nothing before Task 7
+    // writes a checkpoint, and it drags in a large Hadoop tree that can pull a
+    // second SLF4J binding onto the classpath. Task 3's whole job is to make
+    // three failure signatures distinguishable, so an unused heavy dependency
+    // works against it. Add it in Task 7, where the first thing it does is
+    // either work or produce an UnsupportedFileSystemSchemeException.
+
+    // Flink logs through SLF4J and provides no binding here, because
+    // flink-streaming-java is not bundled. Without a binding the job runs and
+    // prints nothing, which makes every other problem in this task invisible.
+    runtimeOnly "org.apache.logging.log4j:log4j-slf4j-impl:${log4jVersion}"
+    runtimeOnly "org.apache.logging.log4j:log4j-api:${log4jVersion}"
+    runtimeOnly "org.apache.logging.log4j:log4j-core:${log4jVersion}"
+}

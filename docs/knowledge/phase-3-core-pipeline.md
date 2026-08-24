@@ -117,3 +117,107 @@ The MinIO pods are in `minio-tenant` because `manifests/minio/tenant.yaml` sets
 that namespace on the `Tenant`. So the Service has to be there too. This is
 mechanical, not a preference.
 
+## Why `setStartingOffsets(OffsetsInitializer.earliest())` is set explicitly
+
+Came up in Task 4, and the answer matters for Task 9's Drill rather than for
+anything visible now.
+
+**The problem.** Without that line, a second run of the job behaves differently
+from the first, and nothing tells you. Task 9's Drill compares a clean run
+against a crashed-and-restarted run, and its entire premise is that both read
+identical input.
+
+**Who remembers where you were.** A Kafka topic is an append-only log and every
+record has a position, its offset. A consumer starting up answers one question,
+and there are only three possible answers:
+
+```java
+// Where do we start reading?
+int start = 0;                     // earliest: from the beginning
+int start = log.size();            // latest: only what arrives from now on
+int start = bookmark.get(reader);  // committed: where this reader stopped last time
+```
+
+`KafkaSource`'s **default is the third**: the consumer group's committed
+offsets, falling back to earliest only if the group has never committed. Flink
+commits offsets back to Kafka on each checkpoint, so the bookmark does get
+written.
+
+**The worked example.** Consumer group `personalization-phase-3`, `clickstream`
+holding 1600 records.
+
+Without the line, using the default:
+
+| | Bookmark at start | Reads | Bookmark after |
+|---|---|---|---|
+| Run 1 | none yet | 0 to 1600 | 1600 |
+| Run 2 | 1600 | **nothing** | 1600 |
+
+Run 2 connects, reports no error, and prints nothing forever. That is the "it
+worked yesterday and today the job is broken" mystery, and it is not a bug.
+
+With `earliest` set explicitly, both runs read 0 to 1600, so any difference
+between their outputs can only have been caused by the crash.
+
+**Why this does not fight `--restore-from`.** Offsets held in a restored
+checkpoint take priority over the initializer, which applies only to a fresh
+start with no state to restore:
+
+```
+run 2, fresh start    -> initializer applies      -> offset 0
+   killed at ~800, last checkpoint held offset 700
+run 2, --restore-from -> checkpoint state applies -> offset 700, not 0
+```
+
+If the checkpoint did not win, recovery would restart from the beginning and
+reprocess everything, which is exactly the duplication the exactly-once sink
+exists to prevent. That priority **is** the recovery mechanism.
+
+**The cost.** `earliest` replays the whole backlog. Task 3's 75-second run
+printed 2.9 million Clicks with event times from a week earlier. Correct for the
+Drill, useless for watching live behaviour, which is why `--start-from-earliest`
+exists and defaults to `true`: the Drill's requirement is the one you get by
+accident rather than the one you have to remember.
+
+
+## Why the session window ends in a `ProcessWindowFunction`, not `reduce`
+
+Came up in Task 4. There are four ways to terminate a windowed stream in Flink
+and they are not interchangeable.
+
+**`reduce` structurally cannot do this job**, for two independent reasons.
+
+*The type.* `ReduceFunction<T>` is `(T, T) -> T`: input and output types are the
+same by definition. What is needed is `Iterable<Click> -> SessionSignal`, and a
+`SessionSignal` is not a `Click`. No version of `reduce` changes the type.
+
+*The window metadata.* `SessionSignal` carries `windowStart` and `windowEnd`,
+which come from `context.window().getStart()` and `getEnd()`. **Only
+`ProcessWindowFunction` receives a `Context`.** `ReduceFunction` and
+`AggregateFunction` see elements and accumulators, never the window they belong
+to.
+
+That second point is load-bearing beyond tidiness. Task 6 uses `windowEnd` as
+the Recommendation's `generatedAt` precisely so nothing in the output derives
+from wall-clock time. Without window metadata the only available timestamp is
+`Instant.now()`, and Task 9's Drill, which compares a clean run against a
+replayed one line for line, would fail permanently for a reason unrelated to
+checkpointing.
+
+A third, smaller reason: most-clicked Product needs a `Map<String, Integer>`
+accumulator, and `reduce`'s accumulator *is* the element type, so there is
+nowhere to put one. `AggregateFunction` solves this half, since its `ACC` is
+free.
+
+| Option | Type change | Window metadata | State held while the window is open |
+|---|---|---|---|
+| `reduce(ReduceFunction)` | no | no | 1 `Click` |
+| `aggregate(AggregateFunction)` | yes | **no** | the accumulator |
+| `process(ProcessWindowFunction)` | yes | yes | **every `Click` in the window** |
+| `aggregate(AggregateFunction, ProcessWindowFunction)` | yes | yes | the accumulator |
+
+**The fourth row is the production-grade form**, and this project does not use
+it. It folds incrementally and then hands the result to a
+`ProcessWindowFunction` at fire time purely to attach the window metadata.
+
+

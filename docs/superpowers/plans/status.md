@@ -92,11 +92,26 @@ tasks; check its Progress table for the live position.
   Gate passed: `kcat` against `clickstream`, `product-change`, and `promo-rule`
   all returned their expected records after the restructure, not just a
   successful compile.
-- 🟡 Task 2: MinIO S3 API on NodePort 30014. Next up. `MiniCluster` runs on the
-  host and `svc/minio` is cluster-internal, so `s3a://` checkpoint writes cannot
-  reach it. Ports 30014 and 30015 were already reserved for MinIO in
-  `clusters/kind/kind-cluster.yaml` at Phase 0, so no cluster recreation.
-- ⬜ Tasks 3 to 10
+- ✅ Task 2: MinIO S3 API exposed on NodePort 30014 as `minio-s3-api`
+  (`manifests/minio/`, picked up by the existing `minio-tenant` Application).
+  Ports 30014 and 30015 were already reserved at Phase 0, so no cluster
+  recreation. Verified from outside the cluster, not from Synced/Healthy:
+  endpoints `10.244.3.14:9000` and `curl http://localhost:30014/minio/health/live`
+  returning `200 OK`.
+- ✅ Task 3: `:pipeline` module reads Clicks from `clickstream` on
+  `MiniCluster`. Three findings: `java.time.Instant` **is** a first-class Flink
+  type, so the open question from the design is closed and the records need no
+  change; `flink-connector-base` is required and nothing pulls it in, since
+  Flink bundles it in `flink-dist`; and Flink 2.2's runtime and its own Kafka
+  connector pull two different lz4 modules declaring the same Gradle
+  capability, which is a hard error needing `capabilitiesResolution`.
+- ✅ Task 4: watermarks, session windows, `SessionSignal`. Cost a real
+  debugging detour: windows never fired because default parallelism (16) far
+  exceeds the partition count (3), so 13 source subtasks held the watermark at
+  `Long.MIN_VALUE`. Fixed with `.withIdleness(...)`, not by pinning parallelism,
+  since Phase 6 varies parallelism deliberately.
+- 🟡 Task 5: Late Click side output and Drill B. Next up.
+- ⬜ Tasks 6 to 10
 
 Two decisions worth knowing without reading the whole design. Phase 3 publishes
 a real `Recommendation` to the existing `recommendation` topic rather than

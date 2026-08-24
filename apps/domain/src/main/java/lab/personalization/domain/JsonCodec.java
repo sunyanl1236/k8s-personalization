@@ -1,6 +1,9 @@
 package lab.personalization.domain;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 // Hand-written, not a library: the schemas are small and flat enough that
 // reflection-based JSON mapping isn't worth the dependency (and Java
@@ -37,6 +40,48 @@ public final class JsonCodec {
                 {"ruleId":"%s","description":"%s","discountPercent":%s}\
                 """.formatted(rule.ruleId(), rule.description(), rule.discountPercent());
         return json.getBytes(StandardCharsets.UTF_8);
+    }
+
+    // The reverse direction, added in Phase 3: the pipeline reads what the
+    // generator writes. Regex rather than index arithmetic, so field order and
+    // incidental whitespace do not matter. That tolerance is not decoration:
+    // Drill B injects a hand-typed Click with kcat, and a parser that depended
+    // on exact byte layout would reject it for the wrong reason and make the
+    // Drill look like a lateness failure.
+    // Four fields, four patterns, compiled once at class load. The earlier
+    // version compiled a fresh Pattern per field per record; at 5 Clicks a
+    // second that is 20 regex compilations a second doing identical work.
+    private static final Pattern SHOPPER_ID = stringField("shopperId");
+    private static final Pattern PRODUCT_ID = stringField("productId");
+    private static final Pattern EVENT_TIME = stringField("eventTime");
+    private static final Pattern ACTION_TYPE = stringField("actionType");
+
+    private static Pattern stringField(String name) {
+        return Pattern.compile("\"" + name + "\"\\s*:\\s*\"([^\"]*)\"");
+    }
+
+    // Throws rather than returning null. This is a pure function, so it does
+    // not get to decide policy: it reports that the bytes are not a Click and
+    // lets the caller choose. ClickDeserializationSchema is where the
+    // fail-fast-vs-skip decision actually lives, with its reasoning.
+    public static Click fromJson(byte[] bytes) {
+        String json = new String(bytes, StandardCharsets.UTF_8);
+        return new Click(
+                required(json, SHOPPER_ID, "shopperId"),
+                required(json, PRODUCT_ID, "productId"),
+                Instant.parse(required(json, EVENT_TIME, "eventTime")),
+                ActionType.valueOf(required(json, ACTION_TYPE, "actionType")));
+    }
+
+    private static String required(String json, Pattern pattern, String name) {
+        Matcher m = pattern.matcher(json);
+        if (!m.find()) {
+            // The payload is included on purpose. A parse failure you cannot
+            // see the input for is nearly impossible to diagnose from a log.
+            throw new IllegalArgumentException(
+                    "Missing string field '" + name + "' in: " + json);
+        }
+        return m.group(1);
     }
 
     private JsonCodec() {}
