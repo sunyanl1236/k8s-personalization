@@ -48,9 +48,6 @@ public final class JsonCodec {
     // Drill B injects a hand-typed Click with kcat, and a parser that depended
     // on exact byte layout would reject it for the wrong reason and make the
     // Drill look like a lateness failure.
-    // Four fields, four patterns, compiled once at class load. The earlier
-    // version compiled a fresh Pattern per field per record; at 5 Clicks a
-    // second that is 20 regex compilations a second doing identical work.
     private static final Pattern SHOPPER_ID = stringField("shopperId");
     private static final Pattern PRODUCT_ID = stringField("productId");
     private static final Pattern EVENT_TIME = stringField("eventTime");
@@ -60,10 +57,6 @@ public final class JsonCodec {
         return Pattern.compile("\"" + name + "\"\\s*:\\s*\"([^\"]*)\"");
     }
 
-    // Throws rather than returning null. This is a pure function, so it does
-    // not get to decide policy: it reports that the bytes are not a Click and
-    // lets the caller choose. ClickDeserializationSchema is where the
-    // fail-fast-vs-skip decision actually lives, with its reasoning.
     public static Click fromJson(byte[] bytes) {
         String json = new String(bytes, StandardCharsets.UTF_8);
         return new Click(
@@ -76,8 +69,6 @@ public final class JsonCodec {
     private static String required(String json, Pattern pattern, String name) {
         Matcher m = pattern.matcher(json);
         if (!m.find()) {
-            // The payload is included on purpose. A parse failure you cannot
-            // see the input for is nearly impossible to diagnose from a log.
             throw new IllegalArgumentException(
                     "Missing string field '" + name + "' in: " + json);
         }

@@ -1,15 +1,3 @@
-// The domain module: the four records, plus JsonCodec, shared by :generator
-// and :pipeline.
-//
-// There is deliberately NO dependencies block. Not kafka-clients, not Flink.
-// That emptiness is the design constraint, not an omission: Flink 2.x treats
-// these records as POJO types only while they stay plain public records with a
-// canonical constructor. With no Flink on this module's classpath, a stray
-// annotation or TypeInformation field in Click becomes a compile error rather
-// than a code-review argument. See
-// docs/superpowers/specs/2026-08-23-core-pipeline-design.md.
-//
-// Layout matches :generator exactly: src/main/java/lab/personalization/domain.
 plugins {
     id 'java'
 }
