@@ -8,6 +8,7 @@ record PipelineConfig(
         String inputTopic,
         Duration watermarkBound,
         Duration sessionGap,
+        Duration cooldown,
         Duration watermarkIdleness,
         boolean startFromEarliest
 ) {
@@ -17,6 +18,7 @@ record PipelineConfig(
         String inputTopic = "clickstream";
         Duration watermarkBound = Duration.ofSeconds(5);
         Duration sessionGap = Duration.ofSeconds(6);
+        Duration cooldown = Duration.ofSeconds(60);
         Duration watermarkIdleness = Duration.ofSeconds(5);
         boolean startFromEarliest = true;
 
@@ -33,6 +35,7 @@ record PipelineConfig(
                 case "input-topic" -> inputTopic = value;
                 case "watermark-bound-seconds" -> watermarkBound = Duration.ofSeconds(Long.parseLong(value));
                 case "session-gap-seconds" -> sessionGap = Duration.ofSeconds(Long.parseLong(value));
+                case "cooldown-seconds" -> cooldown = Duration.ofSeconds(Long.parseLong(value));
                 case "watermark-idleness-seconds" -> watermarkIdleness = Duration.ofSeconds(Long.parseLong(value));
                 case "start-from-earliest" -> startFromEarliest = parseBoolean(value);
                 default -> throw new IllegalArgumentException("Unknown option: --" + key);
@@ -40,7 +43,7 @@ record PipelineConfig(
         }
 
         return new PipelineConfig(bootstrapServers, consumerGroup, inputTopic,
-                watermarkBound, sessionGap, watermarkIdleness, startFromEarliest);
+                watermarkBound, sessionGap, cooldown, watermarkIdleness, startFromEarliest);
     }
 
     private static boolean parseBoolean(String value) {

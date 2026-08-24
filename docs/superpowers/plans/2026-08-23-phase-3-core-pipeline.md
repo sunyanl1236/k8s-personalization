@@ -11,7 +11,7 @@ Clicks to a side output, and decides a Recommendation in a
 `KeyedProcessFunction` whose keyed state outlives any single window.
 
 **Tech Stack:** Flink 2.2 (DataStream API), `flink-connector-kafka`,
-`flink-statebackend-rocksdb`, `flink-s3-fs-hadoop`, Gradle multi-project,
+`flink-statebackend-rocksdb`, `flink-s3-fs-native`, Gradle multi-project,
 Java 21 records, Strimzi Kafka, MinIO.
 
 **Spec:** [core pipeline design](../specs/2026-08-23-core-pipeline-design.md)
@@ -50,9 +50,9 @@ file.
 | 2 | Expose MinIO's S3 API on NodePort 30014 | done 2026-08-23, `curl` returned 200 |
 | 3 | `:pipeline` module reading Clicks from Kafka | done 2026-08-23, Clicks printing, Instant confirmed |
 | 4 | Watermarks, session windows, and `SessionSignal` | done 2026-08-23, after a watermark stall |
-| 5 | Late Click side output, and Drill B | **next** |
-| 6 | `RecommendationDecider` | not started |
-| 7 | RocksDB and checkpoints to MinIO | not started |
+| 5 | Late Click side output, and Drill B | done 2026-08-24, `LATE` line observed |
+| 6 | `RecommendationDecider` | done 2026-08-24, suppression observed |
+| 7 | RocksDB and checkpoints to MinIO | **next** |
 | 8 | Exactly-once Kafka sink | not started |
 | 9 | Bounded mode, restore, and Drill A | not started |
 | 10 | Knowledge doc, README, and status | not started |
@@ -305,7 +305,7 @@ It is now `apps/gradlew -p apps :generator:run` from the repo root.
 - Modify: `README.md`
 
 **The concept.** `MiniCluster` runs on your host. `svc/minio` is a `ClusterIP`
-Service, reachable only from inside the cluster, so `s3a://` writes cannot get
+Service, reachable only from inside the cluster, so `s3://` writes cannot get
 to it. A `NodePort` Service opens a port on every node, and
 `clusters/kind/kind-cluster.yaml` already forwards host port 30014 to the
 `zone-a` worker.
@@ -430,7 +430,7 @@ dependencies {
 
     // Connectors and filesystems: bundled
     implementation "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
-    implementation "org.apache.flink:flink-s3-fs-hadoop:${flinkVersion}"
+    implementation "org.apache.flink:flink-s3-fs-native:${flinkVersion}"
 }
 ```
 
@@ -440,7 +440,7 @@ versions are the Flink 2.0 line and `3.4.0-1.20` the last 1.x line.
 
 **Two deviations from this step as originally written, both deliberate.**
 
-`flink-s3-fs-hadoop` was left out. Nothing before Task 7 writes a checkpoint,
+`flink-s3-fs-native` was left out. Nothing before Task 7 writes a checkpoint,
 and it drags in a large Hadoop tree that can pull a second SLF4J binding onto
 the classpath. This task exists to keep three failure signatures
 distinguishable, so an unused heavy dependency works against it. Add it in Task
@@ -694,7 +694,7 @@ the `WindowedStream`, before the window function. Called elsewhere it either
 does not compile or silently tags nothing, and Late Clicks return to Flink's
 default of being dropped without trace.
 
-- [ ] **Step 1: Declare the `OutputTag`.**
+- [x] **Step 1: Declare the `OutputTag`.**
 
 ```java
 static final OutputTag<Click> LATE_CLICKS =
@@ -704,7 +704,7 @@ static final OutputTag<Click> LATE_CLICKS =
 The trailing `{}` is not a typo. It creates an anonymous subclass so the generic
 type survives erasure. Without it Flink cannot recover the type at runtime.
 
-- [ ] **Step 2: Attach it to the window and print the side output.**
+- [x] **Step 2: Attach it to the window and print the side output.**
 
 ```java
 SingleOutputStreamOperator<SessionSignal> signals = clicks
@@ -716,7 +716,7 @@ SingleOutputStreamOperator<SessionSignal> signals = clicks
 signals.getSideOutput(LATE_CLICKS).print("LATE");
 ```
 
-- [ ] **Step 3: Run Drill B.**
+- [x] **Step 3: Run Drill B.**
 
 `shopper-99` is used because `Catalog.SHOPPER_IDS` holds only `shopper-1`
 through `shopper-10`. The generator can never produce that id, so anything
@@ -730,7 +730,7 @@ echo '{"shopperId":"shopper-99","productId":"P1","eventTime":"'"$(date -u -d '60
   | kcat -P -b localhost:30016 -t clickstream
 ```
 
-- [ ] **Step 4: Check both halves.**
+- [x] **Step 4: Check both halves.**
 
 | Check | Expectation |
 |---|---|
@@ -741,7 +741,7 @@ The second half is what proves it. A `LATE` line alone shows the side output
 fired. The absence of a signal shows the Click did not also reach a window. Only
 both together distinguish routed-to-side-output from processed-normally.
 
-- [ ] **Step 5: Write the runbook, with real pasted output.**
+- [x] **Step 5: Write the runbook, with real pasted output.**
 
 `docs/runbooks/phase-3-late-click-drill.md`, following the shape of
 `phase-0-control-plane-drill.md`: rationale per command, then an "Observed
@@ -779,9 +779,9 @@ different set of Recommendations than the original. The outputs genuinely
 differ, and no amount of correct checkpointing fixes it. **Event-time timers
 only.**
 
-- [ ] **Step 1: Add `--cooldown-seconds` (60) to `PipelineConfig`.**
+- [x] **Step 1: Add `--cooldown-seconds` (60) to `PipelineConfig`.**
 
-- [ ] **Step 2: Declare the state in `open`.**
+- [x] **Step 2: Declare the state in `open`.**
 
 ```java
 private transient ValueState<String> lastRecommendedProduct;
@@ -800,7 +800,7 @@ skeleton above.
 `transient` matters. The state handle is created per subtask at runtime and must
 not be captured when the function object is serialized and shipped.
 
-- [ ] **Step 3: Implement the decision.**
+- [x] **Step 3: Implement the decision.**
 
 ```
 processElement(signal, ctx, out):
@@ -826,7 +826,7 @@ The emitted record, from the spec:
 `generatedAt` is the one that would fail Task 9 silently. Wall-clock stamps make
 run 1 and run 2 differ on every line.
 
-- [ ] **Step 4: Wire it in and observe suppression.**
+- [x] **Step 4: Wire it in and observe suppression.**
 
 ```java
 signals.keyBy(SessionSignal::shopperId)
@@ -854,7 +854,7 @@ plus the source offsets that produced it. RocksDB keeps state on local disk
 rather than on the JVM heap, so state can exceed memory. The snapshot goes to
 durable storage, which here is the MinIO bucket from Phase 1.
 
-**The failure mode to watch for.** `s3.path.style.access` is the one that
+**The failure mode to watch for.** `s3.path-style-access` is the one that
 produces the most confusing error when wrong. Without it the client addresses
 the bucket as `http://checkpoints.localhost:30014`, which does not resolve, and
 the failure mentions DNS rather than S3. You will chase a networking problem
@@ -875,10 +875,22 @@ Fill the "Doc" column of the spec's configuration table with the URLs you
 actually open. Rows currently read "not yet located", and that distinction is
 the point of the column.
 
-- [ ] **Step 2: Add the flags to `PipelineConfig`.**
+- [ ] **Step 2: Write `apps/pipeline/conf/config.yaml`, and add one flag.**
 
-`--s3-endpoint` (`http://localhost:30014`), `--checkpoint-dir`
-(`s3a://checkpoints/phase-3`), `--checkpoint-interval-seconds` (10).
+Revised 2026-08-24. The original three flags (`--s3-endpoint`,
+`--checkpoint-dir`, `--checkpoint-interval-seconds`) are gone. Flink settings are
+data in a `config.yaml`, loaded with
+`GlobalConfiguration.loadConfiguration(dir)`, because that is what production
+does: the Flink Kubernetes Operator renders `spec.flinkConfiguration` into
+`config.yaml` inside the pod, and the jar carries no environment knowledge. See
+the spec's Configuration section for the verification against the 2.2.0 jar and
+for the file's contents.
+
+The one flag that replaces them is `--flink-conf-dir`, defaulting to
+`apps/pipeline/conf`. Explicit rather than relying on `FLINK_CONF_DIR`, so an
+unset variable cannot silently fall back.
+
+Not under `src/main/resources`. Anything there is baked into the jar.
 
 - [ ] **Step 3: Read credentials from the environment.**
 
@@ -892,10 +904,17 @@ Fetch the values with the command in `README.md`'s MinIO section.
 output to every process on the machine. Same no-durable-secrets reasoning the
 README already applies.
 
-- [ ] **Step 4: Build the `Configuration`.**
+- [ ] **Step 4: Load the `Configuration`, then add what the file cannot hold.**
 
-Keys and values from the spec's configuration table, including the three you
-just located. `state.backend.type` is `rocksdb`.
+Load `config.yaml` with `GlobalConfiguration.loadConfiguration(dir)`, then set
+the two credentials from the environment onto the result, then apply the two
+programmatic setters on `env.getCheckpointConfig()`: consistency mode and
+externalized retention. Neither has a confirmed config key, so neither belongs in
+the file.
+
+**Assert one known key is present after loading.** A missing `config.yaml` that
+yields an empty `Configuration` gives you a heap state backend and no
+checkpointing, and the job looks healthy while doing neither.
 
 - [ ] **Step 5: Prove checkpoints actually land in MinIO.**
 
@@ -1084,7 +1103,7 @@ The job log names it. The MinIO console under `checkpoints/phase-3` confirms it.
 - [ ] **Step 6: Resume.**
 
 ```bash
-apps/gradlew -p apps :pipeline:run --args="--bounded --output-topic=drill-a --restore-from=s3a://checkpoints/phase-3/<job-id>/chk-N"
+apps/gradlew -p apps :pipeline:run --args="--bounded --output-topic=drill-a --restore-from=s3://checkpoints/phase-3/<job-id>/chk-N"
 ```
 
 - [ ] **Step 7: The check.**

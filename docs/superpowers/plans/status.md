@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
@@ -110,8 +110,56 @@ tasks; check its Progress table for the live position.
   exceeds the partition count (3), so 13 source subtasks held the watermark at
   `Long.MIN_VALUE`. Fixed with `.withIdleness(...)`, not by pinning parallelism,
   since Phase 6 varies parallelism deliberately.
-- 🟡 Task 5: Late Click side output and Drill B. Next up.
-- ⬜ Tasks 6 to 10
+- ✅ Task 5: Late Click side output and Drill B. `OutputTag<Click>` attached to
+  the `WindowedStream` via `.sideOutputLateData(...)`, printed with the `LATE`
+  prefix. Drill B injected a hand-written Click for `shopper-99`, an id
+  `Catalog.SHOPPER_IDS` cannot produce, with an `eventTime` 60 seconds back.
+  Confirmed on both halves: one `LATE` line appeared, and no `SessionSignal`
+  ever carried `shopper-99`. The absence is what proves the routing, since a
+  `LATE` line alone does not rule out the Click also reaching a window.
+  The mechanism is written up in
+  [the knowledge doc](../../knowledge/phase-3-core-pipeline.md), section "Why a
+  Click behind the watermark is not automatically a Late Click": lateness is
+  judged on the *merged* window's end, not on the element's own timestamp, so
+  with bound 5s and gap 6s a Click is late only past `maxSeen - 11`, not
+  `maxSeen - 5`.
+  **Known gap, same shape as the Phase 0 one:**
+  [the Drill B runbook](../../runbooks/phase-3-late-click-drill.md) carries the
+  real `LATE` line but its "Observed result" section still has two TODO
+  placeholders, the baseline `SessionSignal` sample and the `grep 'shopper-99'`
+  output. Both were confirmed live, neither was pasted in.
+- ✅ Task 6: `RecommendationDecider`, a `KeyedProcessFunction` keyed by
+  `shopperId` holding two `ValueState` handles, `last-recommended-product` and
+  `pending-timer`. It exists because a window's state dies when the window
+  fires, and "do not recommend the same Product two Browsing Sessions running"
+  must outlive that.
+  The stale-timer problem was the real content of this task. `registerEventTimeTimer`
+  inserts a row, it does not replace one, so a Shopper who switches Product
+  leaves an older timer that later clears the *newer* state. Resolved with
+  `deleteEventTimeTimer` plus a second `ValueState<Long>` holding the exact
+  registered timestamp, since the old timestamp is not derivable and a delete
+  against a wrong value is a silent no-op. The rejected alternative was a
+  staleness check inside `onTimer`, which costs the same state but lets dead
+  timer rows accumulate into every checkpoint.
+  Verified from real output, not from a clean compile: `generatedAt` equals
+  `windowEnd` to the millisecond on every pair, `shopperId` carries a Shopper id
+  rather than a Product id, and each Shopper lands on the same subtask index in
+  both the window operator and the decider. Suppression itself needed a longer
+  run, since with 10 Products only about one consecutive session pair in ten
+  collides.
+  Two write-ups landed in
+  [the knowledge doc](../../knowledge/phase-3-core-pipeline.md): why `transient`
+  belongs on a `ValueState` field but not on the `Duration cooldown`, and how
+  `deleteEventTimeTimer` works.
+  **Semantic worth knowing before Phase 4 rewrites this class.**
+  `lastRecommendedProduct` is a *single slot*, so the cooldown only blocks an
+  immediate repeat. An observed run had `shopper-1` receive P7, then P2, then P7
+  again within 22 seconds, all inside the 60 second cooldown. That matches the
+  spec's wording, "not two Browsing Sessions running". A rule of "not the same
+  Product twice within 60 seconds regardless of what came between" would need
+  `MapState<String, Long>` of Product to expiry instead.
+- 🟡 Task 7: RocksDB and checkpoints to MinIO. Next up.
+- ⬜ Tasks 8 to 10
 
 Two decisions worth knowing without reading the whole design. Phase 3 publishes
 a real `Recommendation` to the existing `recommendation` topic rather than

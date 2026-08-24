@@ -216,7 +216,7 @@ must budget for it.
 ### MinIO gets a NodePort Service, tracked in git
 
 `MiniCluster` runs on the host. `svc/minio`, the S3 API, is cluster-internal
-only, so `s3a://` checkpoint writes cannot reach it. `README.md` predicted this
+only, so `s3://` checkpoint writes cannot reach it. `README.md` predicted this
 exact moment and named the path to take.
 
 `clusters/kind/kind-cluster.yaml` already maps host ports 30014 and 30015,
@@ -339,7 +339,7 @@ dependencies, so it does not break the `:domain` rule.
 | `flink-clients` | `compileOnly` + `runtimeOnly` | Required to run from a `main()` | [configuration/overview][d-overview] |
 | `flink-statebackend-rocksdb` | `compileOnly` + `runtimeOnly` | Documented as not on the default classpath | [state_backends][d-backends] |
 | `flink-connector-kafka` | `implementation` | A connector. Bundled into the fat jar | [configuration/maven][d-maven] |
-| `flink-s3-fs-hadoop` | `implementation` | An ordinary dependency under `MiniCluster`. ADR 0001 warns this becomes a plugin directory in Phase 5 | none fetched, reasoning from ADR 0001 |
+| `flink-s3-fs-native` | `implementation` | An ordinary dependency under `MiniCluster`. ADR 0001 warns this becomes a plugin directory in Phase 5 | none fetched, reasoning from ADR 0001 |
 | `project(':domain')` | `implementation` | | |
 
 The packaging rule that produces the `compileOnly` plus `runtimeOnly` split is
@@ -391,16 +391,91 @@ consumes the count.
 
 ## Configuration
 
+Two surfaces, split the way production splits them. **Flink settings are data in
+a `config.yaml`. Job settings are `--key=value` flags. Credentials are
+environment variables and appear in neither.**
+
+### Why Flink settings are not flags
+
+Revised 2026-08-24, replacing an earlier decision to carry `--s3-endpoint`,
+`--checkpoint-dir` and `--checkpoint-interval-seconds` as flags.
+
+Production Flink on Kubernetes puts every Flink configuration key on the
+`FlinkDeployment` CR under `spec.flinkConfiguration`, and the Flink Kubernetes
+Operator renders that map into `config.yaml` inside the pod. The job jar carries
+no environment knowledge. The same jar runs in dev and in production, and only
+the data changes.
+
+Phase 3 does the same thing one layer down:
+
+```
+Phase 3                              Phase 5
+-------                              -------
+apps/pipeline/conf/config.yaml       spec.flinkConfiguration: (identical keys)
+        |                                    |
+        v                                    v
+GlobalConfiguration                  operator renders config.yaml
+   .loadConfiguration(dir)                   |
+        |                                    v
+        v                            Flink process loads it
+getExecutionEnvironment(config)      getExecutionEnvironment()
+```
+
+The keys are identical in both columns. Phase 5 copies the YAML body into
+`spec.flinkConfiguration`, deletes the local file, and changes no Java.
+
+**Verified against the 2.2.0 jar on 2026-08-24**, because the documentation does
+not cover this use. `javap -p` on
+`org/apache/flink/configuration/GlobalConfiguration.class` from
+`flink-core-2.2.0.jar` shows `public static Configuration loadConfiguration()`,
+`loadConfiguration(String)`, and `loadConfiguration(String, Configuration)`,
+with a private `loadYAMLResource(File)` behind them. The class's string
+constants are `config.yaml` and `FLINK_CONF_DIR`. So a `MiniCluster` run reads
+the same filename, from the same environment variable, with the same parser as a
+real Flink process. Nested YAML is flattened into dotted keys, and `isSensitive`
+masks credentials when the loaded config is logged.
+
+A second reason, independent of fidelity to production. A `Configuration` passed
+to `getExecutionEnvironment(...)` is job level and **takes precedence over
+cluster config**. Hardcoding `s3.endpoint` in Java would silently override
+whatever Phase 5 sets in `spec.flinkConfiguration`, and the CR would appear to be
+ignored.
+
+### `apps/pipeline/conf/config.yaml`
+
+Not under `src/main/resources`. Anything in `resources` is baked into the jar,
+and the whole point is that the jar knows nothing about the environment.
+
+```yaml
+state.backend.type: rocksdb
+execution.checkpointing.interval: 10s
+execution.checkpointing.dir: s3://checkpoints/phase-3
+pipeline.generic-types: false
+
+s3.endpoint: http://localhost:30014
+s3.path-style-access: true
+s3.region: us-east-1
+s3.checksum-validation.enabled: false
+```
+
+Three things are absent on purpose. **Credentials**, which arrive from
+`MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY` and are set onto the loaded
+`Configuration` in code. **Checkpoint consistency mode** and **externalized
+retention**, which have no confirmed config key and use the programmatic setters
+on `env.getCheckpointConfig()` instead. `pipeline.generic-types` moves here out
+of `PersonalizationJob`, because it is a Flink setting and belongs with the
+Flink settings.
+
+### Job flags
+
 `PipelineConfig` parses `--key=value` arguments with defaults for everything and
 no CLI library, mirroring `GeneratorConfig` so both programs are driven the same
-way.
+way. What remains are job settings and per-run switches, not Flink settings.
 
 | Flag | Default | Notes |
 |---|---|---|
 | `--bootstrap-servers` | `localhost:30016` | The same external listener the generator uses |
-| `--s3-endpoint` | `http://localhost:30014` | Becomes the in-cluster address in Phase 5 |
-| `--checkpoint-dir` | `s3a://checkpoints/phase-3` | The bucket from Phase 1 |
-| `--checkpoint-interval-seconds` | `10` | Also sets how long each Kafka transaction stays open |
+| `--flink-conf-dir` | `apps/pipeline/conf` | Directory holding `config.yaml`. Explicit rather than relying on `FLINK_CONF_DIR`, so an unset variable cannot silently fall back |
 | `--watermark-bound-seconds` | `5` | Above the generator's 2s default skew |
 | `--session-gap-seconds` | `6` | Derived above, not chosen |
 | `--cooldown-seconds` | `60` | Event time, not wall clock |
@@ -408,7 +483,7 @@ way.
 | `--transactional-id-prefix` | `personalization-phase-3` | Must be stable across restarts |
 | `--output-topic` | `recommendation` | A throwaway topic makes Drill A repeatable |
 | `--bounded` | `false` | Drill mode. Pins the end offset at job start |
-| `--restore-from` | none | A checkpoint path. Absent means start fresh |
+| `--restore-from` | none | A checkpoint path. Absent means start fresh. Written onto the loaded `Configuration` as `execution.state-recovery.path`, which is what `spec.job.initialSavepointPath` becomes at Phase 5 |
 
 ### Credentials come from the environment, never from a flag
 
@@ -434,30 +509,56 @@ advancing past it. A `kcat` capture then appears to hang.
 | Key | Value | Confidence | Doc |
 |---|---|---|---|
 | `state.backend.type` | `rocksdb` | confident | [state_backends][d-backends] |
-| `execution.checkpointing.interval` | `10s` | confident | locate in the 2.2 checkpointing page before writing |
+| `execution.checkpointing.interval` | `10s` | **confirmed 2026-08-24**, checkpointing is enabled by setting this above 0 | [config][d-cfg22] |
 | `execution.checkpointing.mode` | `EXACTLY_ONCE` | confident | locate in the 2.2 checkpointing page before writing |
 | `pipeline.generic-types` | `false` | confident | [types_serialization][d-types22] |
-| `execution.checkpointing.dir` | `s3a://checkpoints/phase-3` | **verify**, renamed from `state.checkpoints.dir` in the 2.0 line | not yet located |
-| externalized checkpoint retention | retain on cancellation | **verify the key name**, the old enum API was replaced by a config option | not yet located |
-| state recovery path | value of `--restore-from` | **verify**, `execution.savepoint.path` was renamed in the 2.0 line | not yet located |
-| `s3.endpoint` | from `--s3-endpoint` | confident | not yet located, see the S3 filesystem page |
-| `s3.path.style.access` | `true` | confident, MinIO needs path style | not yet located, see the S3 filesystem page |
-| `s3.access-key` / `s3.secret-key` | from the environment | confident | not yet located, see the S3 filesystem page |
+| `execution.checkpointing.dir` | `s3://checkpoints/phase-3` | **confirmed 2026-08-24**. `CheckpointingOptions.CHECKPOINTS_DIRECTORY`, which keeps `state.checkpoints.dir` and `state.backend.fs.checkpointdir` as deprecated keys | [CheckpointingOptions.java][d-ckopts] |
+| externalized checkpoint retention | retain on cancellation | **API confirmed 2026-08-24, key name still open.** The enum is now `ExternalizedCheckpointRetention` and is set with `CheckpointConfig.setExternalizedCheckpointRetention(...)`. `ExternalizedCheckpointCleanup` is gone. No `Configuration`-key equivalent was found, so use the programmatic setter | [checkpoints][d-ckdoc] |
+| `execution.state-recovery.path` | value of `--restore-from` | **confirmed 2026-08-24**, this is the 2.x replacement for `execution.savepoint.path`. Source is the SQL client page, which is where the key is documented, not a DataStream page | [sql-client][d-recovery] |
+| `s3.endpoint` | from `--s3-endpoint` | **confirmed 2026-08-24** | [s3][d-s3] |
+| `s3.path-style-access` | `true` | **confirmed 2026-08-24**, hyphens not dots. MinIO is reached by IP and port, so virtual-host addressing cannot work | [s3][d-s3] |
+| `s3.access-key` / `s3.secret-key` | from the environment | **confirmed 2026-08-24** | [flink-s3-fs-native README][d-s3native] |
+| `s3.region` | `us-east-1` | **confirmed 2026-08-24**, the native plugin wants a region even when the server ignores it | [s3][d-s3] |
+| `s3.checksum-validation.enabled` | `false` | **confirmed 2026-08-24**, AWS SDK v2 sends checksum headers that S3-compatible servers often reject, and the failure does not mention checksums | [s3][d-s3] |
 
 Rows reading "not yet located" are ones this design states from reasoning, not
 from a page that was actually opened. Open the page before writing the key.
 That distinction is the whole point of the column.
 
-Three keys are marked **verify** rather than guessed. The 2.0 line renamed a
-group of these, and `CLAUDE.md` requires checking rather than asserting on
-exactly this kind of claim.
+All rows were checked on 2026-08-24. Two settings have **no confirmed config
+key** and therefore never appear in `config.yaml`: checkpoint consistency mode
+uses `CheckpointConfig.setCheckpointingConsistencyMode(...)`, and externalized
+retention uses `setExternalizedCheckpointRetention(...)`. Note that
+`setCheckpointingMode` is deprecated, and that the replacement takes
+`org.apache.flink.core.execution.CheckpointingMode`, not the identically named
+`org.apache.flink.streaming.api.CheckpointingMode`.
 
-`s3.path.style.access` produces the most confusing failure when wrong. Without
+`s3.path-style-access` produces the most confusing failure when wrong. Without
 it the client addresses the bucket as `http://checkpoints.localhost:30014`,
 which does not resolve, and the error mentions DNS rather than S3.
 
 Retention on cancellation is not a nicety. Under the wrong policy a graceful
 stop deletes the checkpoint that `--restore-from` was going to point at.
+
+### Two questions only a run can answer
+
+Neither is settled by documentation, and both were left open deliberately rather
+than asserted.
+
+**Does `loadConfiguration(dir)` throw or return empty when `config.yaml` is
+missing?** An empty `Configuration` is the dangerous outcome, because the job
+would then run on a heap state backend with no checkpointing while looking
+healthy. Assert that one known key is present after loading, rather than trusting
+the call.
+
+**Does `flink-s3-fs-native` register from the classpath?** The plugins page warns
+that S3 filesystems must be used as plugins in a distribution, because relocations
+were removed and `lib/` placement fails. A `MiniCluster` run has neither `lib/`
+nor `plugins/`, just one flat classpath, so there is nothing to conflict with, but
+no document confirms it. The symptom if it does not is
+`UnsupportedFileSystemSchemeException: Could not find a file system implementation
+for scheme 's3'`. That message means the plugin did not load. It does not mean the
+endpoint or the credentials are wrong.
 
 ## Verifying the done-when criterion
 
@@ -529,7 +630,7 @@ pkill -9 -f lab.personalization.pipeline
 #    console under checkpoints/phase-3 confirms it.
 
 # 6. Resume.
-apps/gradlew -p apps :pipeline:run --args="--bounded --restore-from=s3a://checkpoints/phase-3/<job-id>/chk-N"
+apps/gradlew -p apps :pipeline:run --args="--bounded --restore-from=s3://checkpoints/phase-3/<job-id>/chk-N"
 
 # 7. The check.
 kcat -C -b localhost:30016 -t recommendation -o beginning -e \
@@ -664,6 +765,12 @@ these are reasoning, and are marked as such in place.
 
 [d-types22]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/datastream/fault-tolerance/serialization/types_serialization.md
 [d-backends]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/ops/state/state_backends.md
+[d-s3]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/deployment/filesystems/s3.md
+[d-s3native]: https://github.com/apache/flink/blob/release-2.2.0/flink-filesystems/flink-s3-fs-native/README.md
+[d-cfg22]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/deployment/config.md
+[d-ckopts]: https://github.com/apache/flink/blob/release-2.2.0/flink-core/src/main/java/org/apache/flink/configuration/CheckpointingOptions.java
+[d-ckdoc]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/ops/state/checkpoints.md
+[d-recovery]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/sql/interfaces/sql-client.md
 [d-maven]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/maven.md
 [d-overview]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/overview.md
 [d-typesmaster]: https://nightlies.apache.org/flink/flink-docs-master/docs/dev/datastream/fault-tolerance/serialization/types_serialization

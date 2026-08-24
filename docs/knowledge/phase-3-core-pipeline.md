@@ -221,3 +221,384 @@ it. It folds incrementally and then hands the result to a
 `ProcessWindowFunction` at fire time purely to attach the window metadata.
 
 
+## Why a Click behind the watermark is not automatically a Late Click
+
+Came up in Task 5. This is the single easiest thing to get wrong in the whole
+phase, because the obvious reading is wrong: "the watermark has passed this
+Click, so the Click is late" does not hold.
+
+**The watermark fires windows. Windows accept or refuse Clicks.** The watermark
+never refuses a Click directly.
+
+### What "late" actually means
+
+Not "older than the watermark". It means this:
+
+> The `SessionSignal` that this Click should have influenced was already
+> published, and it cannot be taken back.
+
+That is the only real damage. A `SessionSignal` leaves the operator carrying
+`clickCount: 4`. Then a fifth Click arrives. The 4 is already downstream and is
+now wrong forever.
+
+If nothing has been published yet, a Click arriving behind the watermark costs
+nothing. It joins the pile still sitting in window state, and the window
+publishes the correct number later.
+
+### Session windows work in two phases
+
+The window assigner is stateless and knows nothing about existing windows, so
+it does the only thing it can. It gives **every** Click its own fresh window
+`[t, t + gap)`. That is the entire body of
+`EventTimeSessionWindows.assignWindows`:
+
+```java
+return Collections.singletonList(new TimeWindow(timestamp, timestamp + sessionTimeout));
+```
+
+The window operator holds the state, so merging happens there, one step later.
+`MergingWindowSet.addWindow` unions the fresh window with every existing window
+it overlaps.
+
+A union can only move the end later, never earlier. So:
+
+**Merging can only rescue a Click from lateness. It can never cause it.**
+
+### One worked trace
+
+Watermark bound 5s, session gap 6s, one Shopper. The watermark is always
+`maxSeen - 5`, where `maxSeen` is the newest `eventTime` the source has read.
+
+| # | Click | maxSeen | watermark | its window | verdict |
+|---|---|---|---|---|---|
+| 1 | A at t=20 | 20 | 15 | `[20, 26)` | opens a window |
+| 2 | B at t=30 | 30 | 25 | `[30, 36)` | opens a window. A's window ends at 26 and the watermark is 25, so A is still open |
+| 3 | C at t=22 | 30 | 25 | `[22, 28)`, merged into `[20, 28)` | **accepted**, though it sits 3s behind the watermark |
+| 4 | D at t=10 | 30 | 25 | `[10, 16)` | **Late Click** |
+
+Row 3 is the one that surprises people. C is assigned `[22, 28)`, which then
+merges with A's `[20, 26)` into `[20, 28)`. Note the end moved out to 28. C did
+not just join A's window, it **extended** it, which is exactly what "session"
+means.
+
+State at watermark 25, which is what makes rows 3 and 4 differ:
+
+```
+[20, 26)  A     STILL OPEN.  end 26 > 25. Nothing published. C can join.
+[30, 36)  B     STILL OPEN.  end 36 > 25.
+[10, 16)  ...   GONE.        Fired when the watermark passed 16, state deleted.
+                             D has no pile left to join.
+```
+
+### The two conditions, and why both are needed
+
+Simplified from `WindowOperator.processElement`:
+
+```java
+boolean isSkippedElement = true;
+
+for (W window : elementWindows) {
+    W actualWindow = mergingWindows.addWindow(window, mergeFunction);
+    if (isWindowLate(actualWindow)) {          // 1. did the window already fire?
+        mergingWindows.retireWindow(actualWindow);
+        continue;
+    }
+    isSkippedElement = false;                  // a window took it
+    ...
+}
+
+if (isSkippedElement && isElementLate(element)) {   // 2. behind the watermark?
+    sideOutput(element);
+}
+```
+
+| Helper | Test |
+|---|---|
+| `isWindowLate(w)` | `w.maxTimestamp() + allowedLateness <= currentWatermark` |
+| `isElementLate(e)` | `e.getTimestamp() + allowedLateness <= currentWatermark` |
+
+Two points that matter. The check runs on `actualWindow`, the **merged** window,
+not the freshly assigned one. And the guard is an `&&`.
+
+| | window end | `isWindowLate` | `isSkippedElement` | `isElementLate` | side output |
+|---|---|---|---|---|---|
+| **C** at t=22 | 28 (merged) | `27.999 <= 25` → **false** | **false**, a window took it | `22 <= 25` → **true** | **no**, the `&&` fails on the first term |
+| **D** at t=10 | 16 | `15.999 <= 25` → **true** | **true**, no window took it | `10 <= 25` → **true** | **yes**, both terms hold |
+
+C's `isElementLate` is **true**. Being behind the watermark is real, and Flink
+computes it. It is simply not sufficient. `isElementLate` is only consulted
+after every candidate window has already refused the element, and it answers a
+narrower question: this element found no home, was that because it was late or
+for some other reason?
+
+### The two lines, 6 seconds apart
+
+```
+   event time ------------------------------------------------->
+
+        t=10        t=19        t=22       t=25       t=30
+          |           |           |          |          |
+          D       LATENESS        C      WATERMARK   maxSeen
+                    LINE                  (maxSeen-5)
+                 (maxSeen-11)
+
+     <-- late -->|<---- behind the watermark, but still accepted ---->
+```
+
+Crossing the watermark line means nothing on its own. Crossing the lateness line
+means the window already closed. The distance between them is exactly the
+session gap:
+
+```
+a window closes when    watermark   >  t + 6
+substitute watermark:   maxSeen - 5 >  t + 6
+rearrange:              t           <  maxSeen - 11
+```
+
+So with this project's settings a Click is late only when its `eventTime` is
+more than **11 seconds** behind the newest `eventTime` seen. Not 5 seconds. The
+session gap buys 6 extra seconds of protection past the Click's own timestamp.
+
+`allowedLateness` stays at its default of zero here. Setting it shifts both
+helpers by exactly that amount, and the 11 second figure moves with it.
+
+### Why Drill B uses `shopper-99`
+
+`Catalog.SHOPPER_IDS` holds only `shopper-1` through `shopper-10`, so the
+generator can never produce `shopper-99`. That id has no open Browsing Session,
+so phase 2 finds nothing to merge with and no rescue is possible. The Drill sets
+`eventTime` to 60 seconds ago, far past the 11 second lateness line. The verdict
+cannot be ambiguous.
+
+
+
+## Why `transient` on a `ValueState` field
+
+Came up in Task 6, on `RecommendationDecider`. Appended verbatim from the
+explanation given at the time. Only the heading depth was changed, so the
+section nests under this document.
+
+### The problem, in one sentence
+
+Your `RecommendationDecider` object is built on one machine and has to run on a
+different one. Some things can survive that trip. A live connection cannot.
+
+### Simplest same-kind example, no Flink in it
+
+Plain Java. Forget streaming entirely.
+
+```java
+class Printer implements Serializable {
+    String name = "office-printer";
+    Socket connection;              // a live TCP connection to a machine on THIS network
+}
+```
+
+Now you want to send this `Printer` object to a colleague in another building.
+Java serialization walks **every** field and turns it into bytes.
+
+- `name` is a `String`. It converts to bytes fine. `"office-printer"` means the
+  same thing in the other building.
+- `connection` is a live socket. There is nothing sensible to write down. A
+  socket is a file descriptor plus a TCP session with a machine that the other
+  building cannot even reach. Java refuses, because `Socket` is not
+  `Serializable`, and you get a `NotSerializableException`.
+
+The fix:
+
+```java
+transient Socket connection;
+```
+
+`transient` means: **skip this field when writing bytes.** The mail now carries
+only the name.
+
+And here is the part that matters most. On arrival, the object is rebuilt from
+those bytes. Transient fields are not restored, and their initializers do not
+run either. `connection` comes back as **`null`**. The receiver has to open its
+own socket, using its own network.
+
+That is the whole pattern:
+
+```
+things that describe    -> travel as bytes
+things that connect     -> transient, rebuilt on arrival
+```
+
+### Now map it back
+
+**Why Flink serializes your function at all.** You create
+`new RecommendationDecider(cooldown)` inside `main()`. That code runs on the
+JobManager. But `processElement` runs inside TaskManager JVMs, which are
+different processes, often on different machines. Flink cannot pass the object
+by reference across a network. It serializes the object and ships the bytes.
+
+```
+JobManager                              TaskManager, subtask 7
+-----------                             ----------------------
+new RecommendationDecider(cooldown)
+   cooldown           = 60s
+   lastRecommendedProduct = null
+
+serialize  ------------ bytes ------->  deserialize
+                                           cooldown = 60s      (travelled)
+                                           lastRecommendedProduct = null
+
+                                        open(OpenContext) runs HERE, once
+                                           lastRecommendedProduct =
+                                               getRuntimeContext().getState(...)
+```
+
+`cooldown` is a `Duration`. It describes something, so it travels.
+
+`lastRecommendedProduct` is a handle into RocksDB, wired to a state backend, a
+key group assignment, and a checkpoint. **None of that exists on the
+JobManager.** There is no state backend there to point at. It is the `Socket` of
+this example.
+
+**Which is exactly why `open` exists.** It is not a constructor. A constructor
+runs before the trip. `open` runs once per subtask **after** the object has
+arrived, at the one moment when `getRuntimeContext()` finally has a real state
+backend behind it. That is the only place the handle can be created.
+
+### One honest correction to what I said
+
+I said `transient` "keeps it out of the shipped bytes", and implied you would
+otherwise get an error. In this exact case you would not. The field is still
+`null` when the object is serialized, and Java writes a null field without
+complaint no matter what its declared type is. Dropping `transient` here would
+compile and run today.
+
+Write it anyway, for two reasons:
+
+1. **It documents the lifecycle.** The keyword tells the next reader that this
+   field is filled in at runtime, not at construction. That is real information
+   about when the field is safe to touch.
+2. **It protects the refactor.** The moment anyone assigns a non-serializable
+   value to a field before shipping, a `KafkaProducer`, a JDBC connection, a
+   cached client, the job fails at submission with `NotSerializableException`.
+   That is the common version of this bug in production code, and the habit is
+   what prevents it.
+
+
+## How `deleteEventTimeTimer` works, and why a timer needs deleting at all
+
+Came up in Task 6, on `RecommendationDecider`'s cooldown. Appended verbatim from
+the explanation given at the time. Only the heading depth was changed, so the
+section nests under this document.
+
+### The problem: `register` never replaces, it adds
+
+The mental model that causes the bug is thinking of a timer like setting an
+alarm clock on your phone. You set it for 16:00, then change your mind and set
+it for 18:00, and there is one alarm.
+
+Flink is not like that. **Registering a second timer leaves the first one
+there.** Both fire.
+
+### What a timer actually is
+
+Not a thread. Not a wall clock alarm. It is a **row in a sorted set** held by
+the operator, and each row is a pair:
+
+```
+(key, timestamp)
+```
+
+The watermark drives it. When the watermark advances to `W`, Flink walks the set
+from the lowest timestamp upward, and for every row with `timestamp <= W` it
+sets the current key to that row's key, calls your `onTimer`, and removes the
+row.
+
+So:
+
+- `registerEventTimeTimer(t)` = **insert** a row `(currentKey, t)`.
+- `deleteEventTimeTimer(t)` = **remove** the row `(currentKey, t)`.
+
+Identity is the timestamp. Registering `160` twice for the same key inserts one
+row, not two, because the set deduplicates. Registering `160` and then `180`
+inserts **two independent rows**, and that is exactly the bug.
+
+### The same trace, both ways
+
+`shopper-3`, cooldown 60s. Watch the timer set for that key.
+
+**Without delete:**
+
+```
+t=100   emit P7,  state="P7",  register 160        set = {160}
+t=120   emit P2,  state="P2",  register 180        set = {160, 180}   <-- two rows
+t=160   watermark passes 160 -> onTimer fires      set = {180}
+        onTimer clears state.  But state held "P2", not "P7".
+t=170   P2 arrives again, state is null -> P2 emitted a second time.  WRONG.
+```
+
+The row for `160` had no idea it had been superseded. It did its job faithfully
+and wiped the wrong thing.
+
+**With delete:**
+
+```
+t=100   emit P7,  state="P7",  register 160        set = {160}
+                  remember 160
+t=120   emit P2,  delete 160                       set = {}
+                  register 180                     set = {180}        <-- one row
+                  state="P2", remember 180
+t=180   watermark passes 180 -> onTimer fires      set = {}
+        clears state.  P2's cooldown ran its full 60 seconds.  CORRECT.
+```
+
+### Three things about the call itself
+
+**1. It is keyed, exactly like `ValueState`.**
+
+```java
+ctx.timerService().deleteEventTimeTimer(160_000L);
+```
+
+You never pass a Shopper id. Flink already set the current key before calling
+`processElement`, and the delete applies to that key alone. `shopper-4`'s timer
+at the same timestamp is untouched.
+
+**2. It takes epoch milliseconds, and a wrong value is a silent no-op.**
+
+The argument is a `long`, the same unit as `windowEnd().toEpochMilli()`. If you
+pass a timestamp that does not match a registered row, nothing is deleted and
+**nothing is reported**. No exception, no log line. So you must delete the
+*exact* value you registered, not a recomputed one.
+
+This is the reason the delete approach forces a second piece of state. You have
+to remember the exact timestamp you registered:
+
+```java
+private transient ValueState<Long> pendingTimer;
+```
+
+And it must be `ValueState`, not a plain `long` field. A plain field would be
+shared across every Shopper this subtask handles, so `shopper-4` would overwrite
+`shopper-3`'s remembered timestamp. Same lesson as `lastRecommendedProduct`.
+
+**3. You cannot delete a timer that already fired.** Once the watermark passes
+it, the row is gone. `delete` on it is another silent no-op. In practice this is
+fine here, because you only ever delete a timer that is still in the future
+relative to the signal you are processing.
+
+### What this costs you, versus the other option
+
+| | delete-and-reregister | stale-check in `onTimer` |
+|---|---|---|
+| Extra state | `ValueState<Long>` for the pending timestamp | `ValueState<Long>` for the live timestamp |
+| Timer rows alive per Shopper | always 1 | grows until each fires |
+| `onTimer` body | clear both states | compare `timestamp` against stored value, return early if they differ |
+
+Both need the same second `ValueState`, so the storage cost is a wash. The real
+difference is how many timer rows exist. Delete keeps exactly one per Shopper.
+The stale-check approach lets dead rows pile up until their watermark arrives,
+and every one of them is checkpointed.
+
+One more point in delete's favour for this project: timers are part of
+checkpointed state. Task 9 restores from a checkpoint and compares the replayed
+run against the original. Fewer rows in the checkpoint means fewer things that
+can differ.
+
+Pick one and tell me which, then write `processElement` and `onTimer`.
