@@ -876,3 +876,351 @@ so it now sits with the other Flink settings, and it travels to
 That move is also the second reason the assert after loading matters. If
 `config.yaml` fails to load, you lose this line too, and the Kryo fallback
 becomes silent again exactly when you are least likely to look for it.
+
+
+## Why `FileSystem.initialize(flinkConfig, null)` is required, and how it fails without it
+
+Came up in Task 7, and it is the finding most likely to bite again, because the
+error names something that does not exist on this machine.
+
+### The failure
+
+Credentials were set on the `Configuration` handed to
+`getExecutionEnvironment(...)`. The job still died at startup:
+
+```
+java.nio.file.AccessDeniedException: s3://checkpoints/phase-3/<job-id>/shared:
+  org.apache.hadoop.fs.s3a.auth.NoAuthWithAWSException: No AWS Credentials
+  provided by DynamicTemporaryAWSCredentialsProvider
+  TemporaryAWSCredentialsProvider SimpleAWSCredentialsProvider
+  EnvironmentVariableCredentialsProvider IAMInstanceCredentialsProvider :
+  Unable to load AWS credentials from environment variables
+  (AWS_ACCESS_KEY_ID (or AWS_ACCESS_KEY) and AWS_SECRET_KEY ...)
+```
+
+Read that literally and the fix is `export AWS_ACCESS_KEY_ID`. That does work,
+and it is the wrong fix. It leaves the config-driven design half broken, and it
+puts credentials in a second place nobody is looking.
+
+### Why it happens
+
+Two configuration surfaces exist, and they are not connected.
+
+```
+Configuration flinkConfig
+        │
+        ├──> getExecutionEnvironment(flinkConfig)
+        │       the JOB's config: state backend, checkpoint interval,
+        │       checkpoint directory, generic types
+        │
+        └──> FileSystem.initialize(flinkConfig, null)
+                the PROCESS-WIDE static registry: which factory handles
+                which scheme, and how that factory is configured
+```
+
+`org.apache.flink.core.fs.FileSystem` holds a **static** map of scheme to
+filesystem, populated once and shared by everything in the JVM. The job's
+`Configuration` never reaches it. So `s3.access-key` was being set on an object
+the S3 factory does not read.
+
+With no credentials from Flink, `S3AFileSystem.bindAWSClient` fell back to
+Hadoop's default provider chain, and every provider in that chain reported
+nothing. The chain's last resort is EC2 instance metadata, which is why AWS
+appears in an error on a laptop with no AWS account.
+
+Trace it in the stack, bottom-up:
+
+```
+CheckpointCoordinator.<init>
+  FsCheckpointStorageAccess.<init>
+    Path.getFileSystem
+      FileSystem.get                     <- the static registry
+        AbstractS3FileSystemFactory.create
+          S3AFileSystem.initialize
+            bindAWSClient                <- no credentials here
+```
+
+### The fix, and where it goes
+
+```java
+flinkConfig.setString("s3.access-key", Env.require("MINIO_ACCESS_KEY"));
+flinkConfig.setString("s3.secret-key", Env.require("MINIO_SECRET_KEY"));
+
+FileSystem.initialize(flinkConfig, null);
+```
+
+After the credentials are on the `Configuration`, and before anything touches an
+S3 path.
+
+**Pass the `PluginManager`, even as `null`.** Both overloads are public in
+`flink-core-2.2.0.jar`, but `initialize(Configuration)` is **deprecated**, and
+javac only says so under `-Xlint:deprecation`. Gradle's default output is the
+unhelpful `uses or overrides a deprecated API`, naming no line. A `null`
+plugin manager means "no plugin isolation", which is exactly right under
+`MiniCluster`, where there is no plugins directory to isolate from.
+
+### The Phase 5 caveat
+
+This is a `MiniCluster` requirement, not a universal one. A real Flink cluster's
+entrypoint initializes the filesystems itself, from the `config.yaml` the
+operator rendered, before any user code runs. Whether this call should be
+guarded or removed when running under the Flink Kubernetes Operator is an open
+Phase 5 question.
+
+### The general shape worth remembering
+
+Anything reached through a **static registry** cannot be configured by an object
+you pass to something else. Flink's `FileSystem` is the example here. The
+symptom is always the same: a component falls back to its own defaults and
+reports a failure in the vocabulary of those defaults, not of your
+configuration.
+
+
+## Why the transactional id prefix exists, and why it must be stable
+
+Came up in Task 8, from the question "I don't understand why we need
+transactional-id-prefix". Appended verbatim from the explanation given at the
+time. Only the heading depth was changed.
+
+### The problem, before any mechanism
+
+Your job crashes at 18 seconds, halfway through writing a batch of
+Recommendations.
+
+Kafka does not know it crashed. From the broker's side a producer that stops
+talking is indistinguishable from a producer that is slow. So the transaction it
+opened stays **open**.
+
+Those records are already physically in the log. They are just marked as
+belonging to an uncommitted transaction.
+
+Now a `read_committed` consumer arrives. It cannot skip past those records and
+read the ones after them, because the open transaction might still commit, and
+committed records must appear in offset order. So the consumer stops at the
+**Last Stable Offset**, the offset of the earliest still-open transaction, and
+waits.
+
+That is the hang. Nothing is broken. The consumer is correctly refusing to guess.
+
+### So somebody has to declare the crashed producer dead
+
+Two ways that can happen:
+
+1. **The timeout expires.** After `transaction.timeout.ms`, the coordinator
+   aborts it on its own. Your value is 300,000, so that is five minutes of stall.
+2. **A producer claims the same identity and cleans up.** Instant, if it can
+   prove it is the same logical producer.
+
+Option 2 needs a name that survives process death. A TCP connection cannot be it.
+A process id cannot be it. It has to be a string you choose.
+
+**That string is the transactional id.** When a producer calls
+`initTransactions()` with a transactional id, the coordinator looks up that id,
+bumps its **producer epoch**, and aborts anything the previous epoch left open.
+The old producer, if it is somehow still alive, gets `ProducerFencedException` on
+its next write and dies. That is fencing.
+
+### Worked example, with your numbers
+
+Three partitions, `transaction.timeout.ms=300000`, checkpoint interval 10s.
+
+```
+t=0s     job starts. Sink subtask 0 uses transactional id
+         "personalization-phase-3-0-0", calls initTransactions()
+
+t=10s    checkpoint 1 completes -> transaction commits -> records visible
+
+t=15s    8 Recommendations written into a new transaction,
+         landing at offsets 40..47, uncommitted
+
+t=18s    kill -9
+
+         kcat -X isolation.level=read_committed
+         reads offsets ..39, then STOPS. Last Stable Offset = 40.
+```
+
+Now branch on the prefix.
+
+**Stable prefix**, which is what you have:
+
+```
+t=25s    restart. Subtask 0 recomputes the SAME id
+         "personalization-phase-3-0-0"
+         initTransactions() -> coordinator bumps the epoch,
+                               aborts the transaction at offsets 40..47
+         LSO jumps past 47. kcat resumes immediately.
+```
+
+**Prefix with a UUID or timestamp in it:**
+
+```
+t=25s    restart. Subtask 0 computes
+         "personalization-phase-3-9f3a1c-0-0"
+         initTransactions() -> coordinator has never seen this id.
+                               Nothing to fence. Nothing aborted.
+
+         The orphan at offsets 40..47 stays open.
+         LSO stays at 40.
+
+t=318s   timeout finally expires (18s + 300s). Coordinator aborts it.
+         kcat resumes, five minutes late.
+```
+
+Same job, same code, same data. The only difference is whether the id was
+reproducible.
+
+### Why a *prefix* rather than an id
+
+Because the sink runs at parallelism 16, not 1. If all 16 subtasks shared one
+transactional id, each `initTransactions()` would bump the epoch and fence the
+other 15. The job would fence itself to death on startup.
+
+So each subtask needs its own id, and Flink builds them:
+
+```
+personalization-phase-3 - 0 - 0
+└─ your prefix ───────┘  │   └─ counter
+                         └─ subtask index
+```
+
+You own the prefix. Flink appends the parts it can derive **deterministically**
+from the subtask index. Determinism is the whole trick: after a restart, subtask
+0 is still subtask 0, so it recomputes the same id and reclaims its own orphans,
+not somebody else's.
+
+### Why you supply it instead of Flink defaulting
+
+The prefix has two requirements that pull in opposite directions:
+
+| Requirement | Rules out |
+|---|---|
+| Identical across restarts of **this** job | anything random or time-based |
+| Different from every other job on this cluster | a fixed library default |
+
+Flink cannot satisfy the second on your behalf. If two jobs shared a default
+prefix, job B's subtask 0 would fence job A's subtask 0, and job A would die with
+`ProducerFencedException` for no visible reason.
+
+So it is a namespace you own. Pick one name per job, write it down, and never
+generate it.
+
+### The connection back to `transaction.timeout.ms`
+
+These two settings are the same failure seen from two ends. Fencing is the fast
+path out of a stall, and the timeout is the slow path. Five minutes was a
+reasonable ceiling **because** fencing normally makes it irrelevant. If you ever
+find yourself waiting out that timeout, the first thing to check is whether the
+prefix changed between runs.
+
+
+## Enabling transactions in Kafka: four layers, not one
+
+Came up in Task 8, from the question "how to enable transactions in kafka?
+through setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)". Appended verbatim
+from the explanation given at the time. Only the heading depth was changed.
+
+`setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)` is the switch that makes
+Flink *use* transactions. It is necessary and not sufficient.
+
+```
+4. Flink sink        setDeliveryGuarantee(EXACTLY_ONCE)
+                     setTransactionalIdPrefix(...)
+                            │
+3. Flink job         checkpointing enabled, in EXACTLY_ONCE mode
+                            │   (what drives begin/commit)
+                            │
+2. Kafka producer    transactional.id  -> implies idempotence
+                            │
+1. Kafka broker      transaction coordinator + __transaction_state topic
+```
+
+### Layer 1: the broker
+
+Nothing to enable. The transaction coordinator has been built in since Kafka
+0.11, and it keeps its state in an internal topic, `__transaction_state`.
+
+What you *do* configure is that topic's durability, and your cluster already
+does, in `spec.kafka.config`:
+
+```yaml
+transaction.state.log.replication.factor: 3
+transaction.state.log.min.isr: 2
+```
+
+Those two lines are the broker-side "enabling" in practice. Leave them at a
+replication factor of 1 and a broker loss takes the transaction log with it, so
+fencing and commit state are gone.
+
+### Layer 2: the producer
+
+A plain Kafka client enables transactions by setting `transactional.id` and then
+driving the lifecycle by hand:
+
+```java
+producer.initTransactions();     // claim the id, fence the previous epoch
+producer.beginTransaction();
+producer.send(...);
+producer.commitTransaction();    // or abortTransaction()
+```
+
+Setting `transactional.id` also **implies idempotence**. The client turns on
+`enable.idempotence=true`, forces `acks=all`, and caps in-flight requests,
+because transactions cannot be correct without them.
+
+You never write any of this. Flink does it for you, which is the point of layer
+4.
+
+### Layer 3: checkpointing
+
+This is the one people forget, and it is the reason the sink cannot be enabled in
+isolation.
+
+**Flink commits a transaction when a checkpoint completes.** That is the only
+commit trigger. With checkpointing disabled there is nothing to commit on, and
+records stay invisible to `read_committed` consumers forever.
+
+You have this from Task 7:
+
+```yaml
+execution.checkpointing.interval: 10s
+```
+```java
+env.getCheckpointConfig().setCheckpointingConsistencyMode(CheckpointingMode.EXACTLY_ONCE);
+```
+
+Both matter. An exactly-once sink over at-least-once checkpointing is not
+exactly-once, because the checkpoint barrier alignment that makes the snapshot
+consistent is what the commit is anchored to.
+
+### Layer 4: the two Flink sink calls
+
+`setDeliveryGuarantee` alone is rejected. From the builder's own bytecode:
+
+```
+"EXACTLY_ONCE delivery guarantee requires a transactionalIdPrefix to be set
+ to provide unique transaction names across multiple KafkaSinks..."
+```
+
+So the builder fails fast rather than silently degrading, which is the good
+design. The other validations it carries:
+
+| Check | Message |
+|---|---|
+| prefix present | the one above |
+| prefix length | "The configured prefix is too long and the resulting transactionalIdPrefix might exceed Kafka's ... size" |
+| producer config | "Overwriting the '{}' is not recommended" for keys Flink manages itself |
+
+That last one is why you set `transaction.timeout.ms` through `setProperty` and
+**not** `key.serializer` or `value.serializer`. Flink owns the serializers,
+because your `RecommendationSerializationSchema` already produces `byte[]`.
+
+### The short answer
+
+```java
+.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)   // use transactions
+.setTransactionalIdPrefix(prefix)                       // required, or build() throws
+.setProperty("transaction.timeout.ms", "300000")        // required here, broker caps at 900000
+```
+
+plus checkpointing enabled in `EXACTLY_ONCE` mode, which you already have. Three
+of those four you wrote in Step 5. The fourth was Task 7.

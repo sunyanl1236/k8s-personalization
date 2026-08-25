@@ -53,8 +53,8 @@ file.
 | 5 | Late Click side output, and Drill B | done 2026-08-24, `LATE` line observed |
 | 6 | `RecommendationDecider` | done 2026-08-24, suppression observed |
 | 7 | RocksDB and checkpoints to MinIO | done 2026-08-24, chk-N incrementing in MinIO |
-| 8 | Exactly-once Kafka sink | **next** |
-| 9 | Bounded mode, restore, and Drill A | not started |
+| 8 | Exactly-once Kafka sink | done 2026-08-24, control records observed |
+| 9 | Bounded mode, restore, and Drill A | **next** |
 | 10 | Knowledge doc, README, and status | not started |
 
 ## Global constraints
@@ -918,15 +918,70 @@ checkpointing, and the job looks healthy while doing neither.
 
 - [x] **Step 5: Prove checkpoints actually land in MinIO.**
 
-A running job is not proof. The job logs a completed checkpoint whether or not
-the bytes arrived where you think.
+A running job is not proof. Neither is a bucket with objects in it. Four
+observations, in order, and each one is evidence the previous one is not.
+
+Run these now rather than at Task 9. A failure here is one config line. The same
+failure found inside Drill A looks like a restore bug.
+
+Setup is two terminals. The job in one, left running. The MinIO Console in the
+other, via the port-forward `README.md` documents:
 
 ```bash
 kubectl port-forward svc/personalization-console -n minio-tenant 9090:9090
 ```
 
-Open `http://localhost:9090` and confirm objects exist under
-`checkpoints/phase-3/<job-id>/chk-N`, with N increasing about every 10 seconds.
+Open `http://localhost:9090`. Console credentials are the same two strings
+`scripts/minio-env.sh` exports. Navigate to bucket `checkpoints`, then
+`phase-3/`, which holds one directory per job id.
+
+**1. A checkpoint completed, rather than merely started.** Open the newest job
+id, then its `chk-N` directory, and look for `_metadata`.
+
+That file is written **last**, by the checkpoint coordinator, and only after
+every subtask has acknowledged its own state. A `chk-N` folder full of
+UUID-named blobs with no `_metadata` is a checkpoint that began and died.
+Objects in a bucket are not evidence on their own.
+
+**2. N advances, and the previous directory disappears.** Note N, wait about 30
+seconds, refresh.
+
+The deletion is the real signal, not the increment.
+`execution.checkpointing.num-retained` defaults to `1`, and the coordinator
+deletes the previous checkpoint only **after** the next one completes. A number
+that climbs while the old directory vanishes is the coordinator reporting
+success every cycle. Directories piling up instead means checkpoints are being
+created and never confirmed. At a 10 second interval, expect about three
+increments in 30 seconds.
+
+**3. Retention survives the job dying.** `Ctrl+C` the job, refresh, and confirm
+the last `chk-N` is still there.
+
+That is `setExternalizedCheckpointRetention(RETAIN_ON_CANCELLATION)`. Under
+`DELETE_ON_CANCELLATION` the directory goes on shutdown and Task 9 has nothing
+to point `--restore-from` at.
+
+**4. Prove the check can fail.** A check that cannot fail proves nothing.
+Temporarily set `execution.checkpointing.dir` to a bucket that does not exist,
+and confirm the job refuses to start, failing inside
+`CheckpointCoordinator.<init>`. Then change it back.
+
+Same reasoning Phase 1 applied to the Kafka external listener: confirm with a
+real client, and confirm the negative case too.
+
+**What these four cannot tell you.** They prove a checkpoint was written and
+completed. They prove nothing about whether the state can be **read back**.
+Kafka offsets can restore correctly while a keyed operator returns empty, and
+the job looks healthy until a duplicate Recommendation appears. That is Drill A
+in Task 9, which is why these four are a precondition rather than a substitute.
+
+**Observed 2026-08-24.** `chk-5` → `chk-6` → `chk-15` under
+`phase-3/05161845b5f0a74f1b785fb3209622d6/`, each carrying `_metadata`, one
+retained per job at a time, and four dead jobs' final checkpoints still present.
+Verified with a signed `ListObjectsV2` request rather than from the absence of
+errors, because `:pipeline` has no `log4j2.xml` and log4j2 with no configuration
+defaults to `ERROR`, so Flink's own `Completed checkpoint N` lines are
+discarded.
 
 ---
 
@@ -959,7 +1014,7 @@ the checkpoint interval and **below** the broker's `transaction.max.timeout.ms`.
 Too low and transactions abort during normal running, silently discarding work.
 Above the broker maximum and the producer refuses to start.
 
-- [ ] **Step 1: Read the broker's limit.**
+- [x] **Step 1: Read the broker's limit.**
 
 ```bash
 kubectl get kafka personalization -n kafka -o yaml
@@ -968,17 +1023,17 @@ kubectl get kafka personalization -n kafka -o yaml
 Look for `transaction.max.timeout.ms` in `spec.kafka.config`. If it is absent,
 the broker default applies. Find that default before choosing the Flink value.
 
-- [ ] **Step 2: Add `toJson(Recommendation)` to `JsonCodec`.**
+- [x] **Step 2: Add `toJson(Recommendation)` to `JsonCodec`.**
 
 Same hand-written style as its siblings. `Instant.toString()` gives ISO-8601 UTC
 directly.
 
-- [ ] **Step 3: Write `RecommendationSerializationSchema`.**
+- [x] **Step 3: Write `RecommendationSerializationSchema`.**
 
 Returns a `ProducerRecord`. **Key it by `shopperId`**, so one Shopper's
 Recommendations keep their relative order within a partition.
 
-- [ ] **Step 4: Add `--output-topic` (`recommendation`) and `--transactional-id-prefix` (`personalization-phase-3`).**
+- [x] **Step 4: Add `--output-topic` (`recommendation`) and `--transactional-id-prefix` (`personalization-phase-3`).**
 
 The prefix has a stable default on purpose. Recovery fences the dead producer's
 orphaned transaction **by transactional id**. Vary the prefix between runs and
@@ -986,7 +1041,7 @@ the new producer fences nothing, the orphan stays open until it times out, and
 `read_committed` consumers cannot advance past it. Your `kcat` capture appears
 to hang.
 
-- [ ] **Step 5: Build the sink and replace `.print("REC")`.**
+- [x] **Step 5: Build the sink and replace `.print("REC")`.**
 
 ```java
 KafkaSink<Recommendation> sink = KafkaSink.<Recommendation>builder()
@@ -1000,7 +1055,7 @@ KafkaSink<Recommendation> sink = KafkaSink.<Recommendation>builder()
 
 Checkpointing mode must also be `EXACTLY_ONCE`, set in Task 7.
 
-- [ ] **Step 6: Observe both behaviours deliberately.**
+- [x] **Step 6: Observe both behaviours deliberately.**
 
 ```bash
 kcat -C -b localhost:30016 -t recommendation -X isolation.level=read_committed

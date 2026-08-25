@@ -106,7 +106,7 @@ verified with a signed `ListObjectsV2` request rather than from the absence of
 errors.
 
 One separate requirement, unrelated to plugin choice, is recorded in the spec:
-`FileSystem.initialize(flinkConfig)` must be called, because the filesystem
+`FileSystem.initialize(flinkConfig, null)` must be called, because the filesystem
 registry is a process-wide static that the job's `Configuration` does not reach.
 
 ## Consequences

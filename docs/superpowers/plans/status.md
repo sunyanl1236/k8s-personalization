@@ -158,8 +158,85 @@ tasks; check its Progress table for the live position.
   spec's wording, "not two Browsing Sessions running". A rule of "not the same
   Product twice within 60 seconds regardless of what came between" would need
   `MapState<String, Long>` of Product to expiry instead.
-- 🟡 Task 7: RocksDB and checkpoints to MinIO. Next up.
-- ⬜ Tasks 8 to 10
+- ✅ Task 7: RocksDB and checkpoints to MinIO. Verified against the bucket with a
+  signed `ListObjectsV2` request, not from the absence of errors:
+  `chk-5` → `chk-6` → `chk-15` under `phase-3/<job-id>/`, each carrying
+  `_metadata`, one retained per job at a time.
+  **Flink settings moved out of Java and into `apps/pipeline/conf/config.yaml`**,
+  loaded with `GlobalConfiguration.loadConfiguration(dir)`. That is what
+  production does: the Flink Kubernetes Operator renders `spec.flinkConfiguration`
+  into `config.yaml` inside the pod, and the jar carries no environment knowledge.
+  Phase 5 copies the YAML body into the CR and changes no Java. The three flags
+  the plan originally specified (`--s3-endpoint`, `--checkpoint-dir`,
+  `--checkpoint-interval-seconds`) are gone, replaced by `--flink-conf-dir`
+  (default `conf`, since Gradle's `run` starts in the subproject directory).
+  Credentials stay out of the file and come from `scripts/minio-env.sh`.
+  Three findings, none of them in any documentation:
+  1. **`flink-s3-fs-native` is not published to Maven Central at any version.**
+     It ships only inside a Flink distribution's `opt/`, so it cannot be a Gradle
+     dependency. Recorded in
+     [ADR 0007](../../adr/0007-s3-filesystem-plugin.md), with what the detour
+     bought. `flink-s3-fs-hadoop` it is, `runtimeOnly`.
+  2. **`FileSystem.initialize(flinkConfig, null)` is required.** Flink's filesystem
+     registry is a process-wide static that the job's `Configuration` never
+     reaches, so `s3.access-key` was being set on an object the S3 factory does
+     not read. It fails as `NoAuthWithAWSException` naming `AWS_ACCESS_KEY_ID`,
+     which invites the wrong fix on a machine with no AWS account.
+  3. **The S3 filesystem does register from a plain classpath** under
+     `MiniCluster`, despite the plugins page's warning about `lib/` placement in
+     a distribution.
+  Two API traps, both verified with `javap` against the 2.2.0 jars rather than
+  asserted: `ExternalizedCheckpointRetention` lives in
+  `org.apache.flink.configuration`, while `CheckpointingMode` lives in
+  `org.apache.flink.core.execution` and has a deprecated same-named twin in
+  `org.apache.flink.streaming.api`.
+  The spec now carries a four-step **checkpoint verification procedure** as a
+  precondition for Drill A, deliberately including a negative control, since a
+  check that cannot fail proves nothing.
+  **Known gap:** `:pipeline` has no `log4j2.xml`, and log4j2 with no
+  configuration defaults to `ERROR`. Every INFO line Flink emits, including
+  `Completed checkpoint N`, is discarded. Verification therefore has to query S3
+  rather than read logs. Worth closing before Task 9's Drill.
+- ✅ Task 8: Exactly-once Kafka sink. `KafkaSink` with
+  `DeliveryGuarantee.EXACTLY_ONCE`, keyed by `shopperId`, publishing to
+  `recommendation`. Three flags added: `--output-topic`,
+  `--transactional-id-prefix`, `--transaction-timeout-ms`.
+  **`transaction.timeout.ms = 300000`, and the number is forced, not chosen.**
+  The broker reports `transaction.max.timeout.ms=900000` with synonym
+  `DEFAULT_CONFIG`, so nothing overrides Kafka's default of 15 minutes. Flink's
+  `KafkaSinkBuilder.DEFAULT_KAFKA_TRANSACTION_TIMEOUT` is `Duration.ofHours(1)`,
+  verified by `javap`, which is **four times the broker ceiling**. Leaving it
+  unset is not a neutral choice: the producer refuses to start. The floor is not
+  the checkpoint interval either, it is checkpoint interval plus the longest
+  outage you expect to recover from, because a transaction whose checkpoint
+  completed is committed by the *restarted* job, and a coordinator timeout
+  aborts it first and loses those records.
+  **Verified from real output, and the proof is in the offsets.** Every partition
+  advanced by **2** per single record printed, because a committed transaction
+  writes a control record into each partition it touched. A non-transactional
+  producer advances by exactly the record count, so the by-two pattern is direct
+  evidence `EXACTLY_ONCE` engaged rather than silently falling back.
+  Per-Shopper ordering held across both captures, confirming the `shopperId`
+  message key: `shopper-10` P10 at `01:17:30.626` then P9 at `01:17:57.626`.
+  Timestamps are unordered *across* Shoppers, which is correct, since Kafka
+  orders within a partition only.
+  **Worth knowing before Task 9.** Running `kcat` with and without
+  `isolation.level=read_committed` produced **identical payloads**. On a healthy
+  run the two isolation levels are indistinguishable, because there are no
+  aborted transactions to hide. The difference only appears during a failure,
+  which is precisely Drill A, and is why capturing Drill A without
+  `read_committed` would surface records the restart is meant to abort.
+  Two API notes. `setProperty` takes a `String`, so a `Duration` needs
+  `String.valueOf(...toMillis())`. And `FileSystem.initialize(Configuration)`
+  from Task 7 turned out to be **deprecated**; the current form takes a
+  `PluginManager`, and `null` is correct under `MiniCluster`. Gradle's default
+  output says only "uses or overrides a deprecated API" with no line number, so
+  `-Xlint:deprecation` was needed to find it.
+  The transactional id prefix mechanism, including why it must be stable and why
+  it is a prefix rather than an id, is written up in
+  [the knowledge doc](../../knowledge/phase-3-core-pipeline.md).
+- 🟡 Task 9: Bounded mode, restore, and Drill A. Next up.
+- ⬜ Task 10
 
 Two decisions worth knowing without reading the whole design. Phase 3 publishes
 a real `Recommendation` to the existing `recommendation` topic rather than

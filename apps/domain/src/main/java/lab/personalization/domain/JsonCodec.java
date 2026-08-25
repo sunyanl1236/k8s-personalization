@@ -42,6 +42,14 @@ public final class JsonCodec {
         return json.getBytes(StandardCharsets.UTF_8);
     }
 
+    public static byte[] toJson(Recommendation recommendation) {
+        String json = """
+                {"shopperId":"%s","productId":"%s","discountPercent":%s,"reason":"%s","generatedAt":"%s"}\
+                """.formatted(recommendation.shopperId(), recommendation.productId(),
+                recommendation.discountPercent(), recommendation.reason(), recommendation.generatedAt());
+        return json.getBytes(StandardCharsets.UTF_8);
+    }
+
     // The reverse direction, added in Phase 3: the pipeline reads what the
     // generator writes. Regex rather than index arithmetic, so field order and
     // incidental whitespace do not matter. That tolerance is not decoration:
