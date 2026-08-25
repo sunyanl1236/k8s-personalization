@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
@@ -69,7 +69,7 @@ Status legend: ✅ done · 🟡 in progress · ⬜ not started
   topics, `clickstream`, `product-change`, `promo-rule`, real messages
   observed at the expected cadence, not just a running-process log line.
 
-## Phase 3: Core pipeline — 🟡 in progress
+## Phase 3: Core pipeline — ✅ done
 
 Design and plan both written and approved:
 [design](../specs/2026-08-23-core-pipeline-design.md),
@@ -185,11 +185,26 @@ tasks; check its Progress table for the live position.
   3. **The S3 filesystem does register from a plain classpath** under
      `MiniCluster`, despite the plugins page's warning about `lib/` placement in
      a distribution.
-  Two API traps, both verified with `javap` against the 2.2.0 jars rather than
-  asserted: `ExternalizedCheckpointRetention` lives in
-  `org.apache.flink.configuration`, while `CheckpointingMode` lives in
-  `org.apache.flink.core.execution` and has a deprecated same-named twin in
-  `org.apache.flink.streaming.api`.
+  **Corrected 2026-08-25.** Checkpoint consistency mode and externalized
+  retention were briefly held as programmatic setters on
+  `env.getCheckpointConfig()`, on the claim that no config key existed. That
+  claim came from a documentation search returning nothing, which is not the same
+  as absence. `javap` on `CheckpointingOptions` shows
+  `CHECKPOINTING_CONSISTENCY_MODE` → `execution.checkpointing.mode` and
+  `EXTERNALIZED_CHECKPOINT_RETENTION` →
+  `execution.checkpointing.externalized-checkpoint-retention`. Both now live in
+  `config.yaml`, so **no Flink setting is configured in Java at all**. Verified
+  with a negative control: an invalid value fails with
+  `Could not parse value 'NONSENSE' for key 'execution.checkpointing.mode'.
+  Expected one of: [[EXACTLY_ONCE, AT_LEAST_ONCE]]`.
+  The lesson generalises past this one setting: for anything version-specific,
+  the jar is the authority and Context7 returning nothing is not evidence.
+  The equivalent Java setters still exist and carry two traps worth knowing when
+  reading other code: `setCheckpointingMode` is deprecated in favour of
+  `setCheckpointingConsistencyMode`, and the enums sit in different packages,
+  `CheckpointingMode` in `org.apache.flink.core.execution` with a deprecated
+  same-named twin in `org.apache.flink.streaming.api`, and
+  `ExternalizedCheckpointRetention` in `org.apache.flink.configuration`.
   The spec now carries a four-step **checkpoint verification procedure** as a
   precondition for Drill A, deliberately including a negative control, since a
   check that cannot fail proves nothing.
@@ -235,8 +250,66 @@ tasks; check its Progress table for the live position.
   The transactional id prefix mechanism, including why it must be stable and why
   it is a prefix rather than an id, is written up in
   [the knowledge doc](../../knowledge/phase-3-core-pipeline.md).
-- 🟡 Task 9: Bounded mode, restore, and Drill A. Next up.
-- ⬜ Task 10
+- ✅ Task 9: Bounded mode, restore, and Drill A. `--bounded` and `--restore-from`
+  added. `--bounded=true` calls `setBounded(OffsetsInitializer.latest())`, which
+  ends the job at the end offsets, rather than `setUnbounded`, which stops
+  emitting but leaves the job running. `--restore-from` writes
+  `StateRecoveryOptions.SAVEPOINT_PATH` onto the loaded `Configuration`, guarded
+  so an unset flag never sets an empty path.
+  Note `--bounded` must be passed as `--bounded=true`. `PipelineConfig.parse`
+  requires `--key=value` for every flag and rejects a bare switch. The plan's
+  command examples said `--bounded` and were corrected.
+  Two supporting changes landed here because Drill A needed them.
+  `apps/pipeline/src/main/resources/log4j2.xml`, scoped so
+  `Completed checkpoint N` is visible without burying the `SIGNAL`, `RECOMMEND`
+  and `LATE` prints. Root stays at `WARN`; opening `org.apache.flink` wholesale
+  produced 395 INFO lines in 80 seconds, of which 337 were per-subtask chatter
+  from `StateBackendLoader` and `FlinkKafkaInternalProducer`. And
+  `execution.checkpointing.num-retained: 3`, up from the default of 1, so the
+  checkpoint noted from the log cannot be deleted between reading it and
+  restoring from it.
+  **`_metadata` is what makes a checkpoint restorable, and this was observed
+  rather than reasoned.** Restoring from `chk-16` of an earlier job failed with
+  `FileNotFoundException: Cannot find meta data file '_metadata' in directory`.
+  That job had been killed while checkpoint 16 was in flight: state files
+  uploaded, coordinator never got all 16 acknowledgements, metadata never
+  written. `chk-15` of the same job was fine. **Pick the checkpoint from the
+  log's `Completed checkpoint N` line, never from the highest number in the
+  bucket**, because a directory listing cannot tell the two apart. That is the
+  concrete payoff of adding `log4j2.xml` before the Drill rather than after.
+  The restore path itself was confirmed reaching Flink:
+  `Starting job 39da64ab... from savepoint s3://checkpoints/phase-3/.../chk-16`.
+  **Evidence state, recorded plainly.** Bounded mode completes: an earlier
+  bounded run left 133,844 records in `drill-a`, and a later run against a fresh
+  topic produced 60,777 Recommendations with checkpoints completing at 12MB then
+  24MB, the growth confirming incremental checkpointing accumulating shared
+  state. The full Drill A sequence, kill after a completed checkpoint, restore
+  from it, and the `sort | uniq -c | awk '$1 != 2'` comparison, was **not run to
+  completion**, and `docs/runbooks/phase-3-checkpoint-restart-drill.md` was not
+  written. Marked done on the user's explicit instruction on 2026-08-25.
+- ✅ Task 10: Knowledge doc, README, and status.
+  [The knowledge doc](../../knowledge/phase-3-core-pipeline.md) runs 14 sections
+  and 1319 lines, written **as each finding surfaced** rather than reconstructed
+  at the end, which is what Task 10 asked for. It covers the NodePort path, the
+  `earliest` offsets decision, `ProcessWindowFunction` versus `reduce`, why a
+  Click behind the watermark is not a Late Click, `transient` on `ValueState`,
+  `deleteEventTimeTimer`, what `s3://checkpoints/phase-3` means,
+  `pipeline.generic-types: false`, `FileSystem.initialize`, the transactional id
+  prefix, the four layers of enabling Kafka transactions, the watermark stall,
+  and a table of facts the spec could not know in advance.
+  `README.md` gained a **Running the pipeline** section covering the required
+  `source scripts/minio-env.sh`, the config split between `config.yaml` and
+  flags, drill mode, and the exactly-once sawtooth, since ten seconds of silence
+  on `kcat` reads as a broken job otherwise. Its MinIO entry was also corrected:
+  it still claimed no external NodePort existed, which Task 2 made false.
+
+**Observed end-to-end on 2026-08-25**, one bounded run over a backlog of about
+3 million Clicks: 1m 47s wall clock, 125,893 Browsing Sessions closed, 111,988
+Recommendations published, 13,905 suppressed by the cooldown, 0 Late Clicks, 5
+checkpoints completed, the last at 49.5MB. A `read_committed` consumer counted
+**exactly 111,988** records on the output topic, matching the job's own emitted
+count. Checkpoint sizes grew 12MB, 24MB, 49MB across the run, which is
+incremental checkpointing accumulating shared state.
 
 Two decisions worth knowing without reading the whole design. Phase 3 publishes
 a real `Recommendation` to the existing `recommendation` topic rather than
@@ -251,6 +324,13 @@ sealed interface, which is not a Flink POJO. Phase 3 sets
 `pipeline.generic-types: false`, so it cannot silently fall back to Kryo either.
 Phase 4 hits this the moment it reads `product-change`, and needs either a
 custom `TypeInformation` or a split into two typed branches. Budget for it.
+
+**Deferred out of Phase 3, both deliberately.** Drill A's full sequence, kill
+after a completed checkpoint then restore and compare, was not run to
+completion, and `docs/runbooks/phase-3-checkpoint-restart-drill.md` was never
+written. Drill B's runbook exists but its "Observed result" section still holds
+two TODO placeholders. Phase 5's HA Drill leans on exactly the same recovery
+path, so it inherits the unproven part.
 
 ## Phase 4: Advanced Flink — ⬜ not started
 

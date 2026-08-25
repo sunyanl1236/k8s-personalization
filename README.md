@@ -76,11 +76,13 @@ project's.
 
 **MinIO**
 
-- No external NodePort configured, reachable only from inside the cluster.
-  Flink's checkpoint traffic never needs host access; add a NodePort listener
-  the same way Kafka's external one works (see
-  [phase-1-data-platform.md](docs/knowledge/phase-1-data-platform.md)) if
-  that ever changes.
+- S3 API on **NodePort 30014**, added in Phase 3 Task 2 as the `minio-s3-api`
+  Service. The Phase 3 pipeline runs on `MiniCluster` on your host, so it is an
+  external client and needs host access; `s3.endpoint: http://localhost:30014`
+  in `apps/pipeline/conf/config.yaml`. Verified with
+  `curl http://localhost:30014/minio/health/live` returning 200, not from the
+  Service looking healthy. At Phase 5 the job moves into the cluster and uses the
+  in-cluster Service instead.
 - Root credentials: created out of band by `scripts/bootstrap-minio-secret.sh`,
   never committed. Fetch with:
   `kubectl get secret storage-configuration -n minio-tenant -o jsonpath='{.data.config\.env}' | base64 -d`
@@ -147,6 +149,99 @@ What to check: `clickstream` should show a new JSON line roughly every
 line has a `"type"` field, `"PRICE"` or `"STOCK"`, matching whichever
 value fields are actually present, the sealed interface distinction that
 doesn't survive serialization on its own.
+
+## Running the pipeline
+
+Phase 3's Flink job, `apps/pipeline/`, running on `MiniCluster` (see
+[ADR 0001](docs/adr/0001-minicluster-first-dev-loop.md)) against the Kafka and
+MinIO already in the cluster. It reads `Click` events from `clickstream`, groups
+them into Browsing Sessions, and publishes a `Recommendation` per closed Session
+to `recommendation`, checkpointing RocksDB state to MinIO.
+
+```bash
+source scripts/minio-env.sh
+apps/gradlew -p apps :pipeline:run
+```
+
+**The `source` is not optional.** `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY` are
+required, and the job fails fast with `MINIO_ACCESS_KEY is not set` rather than
+producing a confusing S3 error. Source it in the *same terminal* that runs
+Gradle: the forked JVM inherits that shell's environment and no other.
+
+### Where the configuration lives
+
+Two surfaces, split the way production splits them.
+
+**Flink settings are data**, in `apps/pipeline/conf/config.yaml`, loaded with
+`GlobalConfiguration.loadConfiguration(...)`. State backend, checkpoint interval
+and mode, checkpoint directory, S3 endpoint. Nothing Flink-related is configured
+in Java. At Phase 5 that file's contents move verbatim into
+`spec.flinkConfiguration` on a `FlinkDeployment`, and the operator renders it
+back into a `config.yaml` inside the pod. The jar carries no environment
+knowledge either way.
+
+**Job settings are flags**, `--key=value`, same style as `GeneratorConfig`. See
+`PipelineConfig.parse` for the full list. Bootstrap servers, topics, consumer
+group, watermark bound, session gap, cooldown, transactional id prefix.
+
+Every flag needs its value. `--bounded` alone is rejected with
+`Expected --key=value`; pass `--bounded=true`.
+
+### Verifying it, and the ten seconds of silence
+
+Same standard as everywhere else here: not "the log said it started".
+
+```bash
+kcat -C -b localhost:30016 -t recommendation -X isolation.level=read_committed
+```
+
+**Expect silence for about ten seconds, then a burst, repeating.** That is not a
+stall. The sink is exactly-once, so records become visible only when the
+checkpoint covering them commits the transaction, and the checkpoint interval is
+10s. The sawtooth *is* the mechanism working.
+
+`isolation.level=read_committed` matters. Without it a consumer sees records
+from transactions that were never committed, including the orphan a restart is
+meant to fence away.
+
+Two other things worth knowing when reading the output:
+
+- Offsets advance by **2** per record. Each committed transaction writes a
+  control record into every partition it touched. Those occupy an offset and are
+  never delivered to consumers, so a plain record count and the offset counter
+  disagree by design.
+- Timestamps are ordered **per Shopper**, not globally. Records are keyed by
+  `shopperId`, and Kafka orders within a partition only.
+
+To confirm checkpoints are landing, watch the job's own log, which reports the
+checkpoint id, size and duration:
+
+```
+Completed checkpoint 5 for job 66790bc4... (49554593 bytes, checkpointDuration=383 ms)
+```
+
+Or browse `checkpoints/phase-3/<job-id>/chk-N` in the MinIO Console, per
+[Accessing installed services](#accessing-installed-services). **A `chk-N`
+directory is only restorable if it contains `_metadata`**, which the coordinator
+writes last, after every subtask acknowledges. Pick a checkpoint from the log's
+`Completed checkpoint N` line, never from the highest number in the bucket.
+
+### Drill mode
+
+`--bounded=true` pins the topic's end offsets at job start and ends the job
+there, so two runs read an identical range and their outputs can be compared
+line for line. `--restore-from=s3://checkpoints/phase-3/<job-id>/chk-N` resumes
+from a checkpoint; offsets in the restored state take priority over
+`--start-from-earliest`, and that priority is the recovery mechanism.
+
+Use `--output-topic=` with a throwaway name when repeating a drill. Auto-creation
+is on. Do not delete and recreate `recommendation`; ArgoCD manages it.
+
+Observed on 2026-08-25, one bounded run over a backlog of about 3 million
+Clicks: **1m 47s**, 125,893 Browsing Sessions closed, 111,988 Recommendations
+published, 13,905 suppressed by the cooldown, 0 Late Clicks, 5 checkpoints
+completed. A `read_committed` consumer counted **exactly 111,988** records on the
+output topic, matching the job's own emitted count.
 
 ## Inspecting the cluster with k9s
 

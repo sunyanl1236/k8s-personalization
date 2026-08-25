@@ -1,5 +1,9 @@
 state.backend.type: rocksdb
 execution.checkpointing.interval: 10s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.incremental: true
+execution.checkpointing.num-retained: 3
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
 execution.checkpointing.dir: s3://checkpoints/phase-3
 pipeline.generic-types: false
 

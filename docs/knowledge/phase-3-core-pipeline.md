@@ -1183,9 +1183,7 @@ You have this from Task 7:
 
 ```yaml
 execution.checkpointing.interval: 10s
-```
-```java
-env.getCheckpointConfig().setCheckpointingConsistencyMode(CheckpointingMode.EXACTLY_ONCE);
+execution.checkpointing.mode: EXACTLY_ONCE
 ```
 
 Both matter. An exactly-once sink over at-least-once checkpointing is not
@@ -1224,3 +1222,98 @@ because your `RecommendationSerializationSchema` already produces `byte[]`.
 
 plus checkpointing enabled in `EXACTLY_ONCE` mode, which you already have. Three
 of those four you wrote in Step 5. The fourth was Task 7.
+
+
+## The watermark stall: why default parallelism made the job look dead
+
+Came up in Task 4, and it cost the longest single detour in the phase. It is the
+failure the plan warned about, arriving exactly as predicted and still taking
+time to recognise.
+
+### The symptom
+
+The job ran. Kafka records were consumed. No `SessionSignal` was ever emitted.
+Nothing errored, nothing warned, no window ever fired. A healthy-looking process
+producing nothing.
+
+### The mechanism
+
+Flink tracks a watermark **per split**, meaning per Kafka partition, and the
+watermark that reaches a downstream operator is the **minimum** across all of
+them.
+
+```
+clickstream has 3 partitions.
+Default parallelism is 16, so the source has 16 subtasks.
+
+subtask 0  -> partition 0  -> watermark advancing
+subtask 1  -> partition 1  -> watermark advancing
+subtask 2  -> partition 2  -> watermark advancing
+subtask 3  -> (no partition assigned)  -> watermark Long.MIN_VALUE
+...
+subtask 15 -> (no partition assigned)  -> watermark Long.MIN_VALUE
+
+effective watermark = min(all 16) = Long.MIN_VALUE, forever
+```
+
+Thirteen subtasks had no partition to read, so they never observed an event time,
+so they never emitted a watermark above `Long.MIN_VALUE`. The minimum never moved.
+Event-time windows fire when the watermark passes their end, so no window ever
+fired.
+
+Nothing about this is an error. Every component behaved correctly.
+
+### The fix, and the fix that was rejected
+
+```java
+.withIdleness(config.watermarkIdleness())
+```
+
+`withIdleness` marks a source subtask **idle** after a period with no records.
+An idle subtask is excluded from the minimum instead of pinning it, so the
+watermark advances on the three subtasks that actually have data.
+
+**Pinning parallelism to 3 would also have worked, and was rejected.** Phase 6
+varies parallelism deliberately as its whole subject. A fix that only holds while
+parallelism equals the partition count is a fix that Phase 6 removes.
+
+### The general shape
+
+Any time a job consumes fewer partitions than it has source subtasks, this is
+waiting. It applies to a topic with one partition and parallelism 2. The
+diagnostic question is always the same: **is the effective watermark being held
+by a subtask that has nothing to read?**
+
+If a windowed job emits nothing, check this before anything else. There is no
+error message pointing at it.
+
+
+## Facts the spec could not know in advance
+
+Collected for Task 10, from work done across Tasks 0 to 9. Each of these was
+either an open question in the design or something that cost real time.
+
+| Question the spec left open | Answer, and how it was established |
+|---|---|
+| Is `java.time.Instant` a first-class Flink type? | **Yes.** Confirmed in Task 3. The domain records need no change, and `Click` serialises as a POJO. This mattered only because `pipeline.generic-types: false` would have turned a negative answer into a loud build failure rather than a silent Kryo fallback |
+| Which `flink-connector-kafka` pairs with Flink 2.2? | **`5.0.0-2.2`.** The connector has its own version line, `<connector>-<flink-minor>`, separate from Flink's |
+| Flink 2.x checkpoint config key names | `execution.checkpointing.dir`, `execution.checkpointing.mode`, `execution.checkpointing.externalized-checkpoint-retention`, `execution.state-recovery.path`. All four verified with `javap` against `flink-core-2.2.0.jar`, after a documentation search wrongly suggested two of them did not exist |
+| Broker `transaction.max.timeout.ms` | **900000**, with synonym `DEFAULT_CONFIG`, so nothing overrides Kafka's 15 minute default. Flink's own default is `Duration.ofHours(1)`, four times that ceiling, so leaving `transaction.timeout.ms` unset makes the producer refuse to start. Chose **300000** |
+| Does the watermark stall on idle partitions? | **Yes**, see the section above |
+| Observed Browsing Session close rate | The spec predicted about one every 4 seconds at 10 Shoppers and 5 Clicks per second. Observed in Task 6: ten `SessionSignal` lines between `16:13:45.322` and `16:14:26.522`, which is 41.2 seconds, **4.12 seconds per Session**. The derivation held |
+
+### Things that cost more than fifteen minutes
+
+1. **The watermark stall.** Section above.
+2. **The lz4 capability clash.** Flink 2.2's runtime and its own Kafka connector
+   pull two different lz4 modules declaring the same Gradle capability. A hard
+   error, resolved with `capabilitiesResolution` in `build.gradle`.
+3. **`flink-connector-base` is not transitive.** Flink bundles it in
+   `flink-dist`, so nothing pulls it in for a `MiniCluster` run.
+4. **`flink-s3-fs-native` is not published to Maven Central at any version.** See
+   [ADR 0007](../adr/0007-s3-filesystem-plugin.md).
+5. **`FileSystem.initialize` is required and its failure names AWS.** See the
+   section above on the static registry.
+6. **A checkpoint directory without `_metadata` is not a checkpoint.** Restoring
+   from one fails with `FileNotFoundException`, and a bucket listing cannot
+   distinguish it from a good one. Read `Completed checkpoint N` from the log.

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level %logger{1} - %msg%n"/>
+        </Console>
+    </Appenders>
+    <Loggers>
+        <Logger name="org.apache.flink.runtime.checkpoint" level="INFO"/>
+        <Logger name="org.apache.flink.connector.kafka.sink.ExactlyOnceKafkaWriter" level="INFO"/>
+        <Logger name="org.apache.flink.connector.kafka.source.enumerator" level="INFO"/>
+        <Logger name="org.apache.flink.connector.kafka.sink.internal" level="WARN"/>
+        <Logger name="org.apache.flink.runtime.state" level="WARN"/>
+        <Logger name="org.apache.flink" level="WARN"/>
+        <Logger name="org.apache.kafka" level="WARN"/>
+        <Logger name="org.apache.hadoop" level="WARN"/>
+        <Root level="WARN">
+            <AppenderRef ref="Console"/>
+        </Root>
+    </Loggers>
+</Configuration>

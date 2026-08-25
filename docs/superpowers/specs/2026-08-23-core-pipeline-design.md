@@ -449,22 +449,69 @@ and the whole point is that the jar knows nothing about the environment.
 ```yaml
 state.backend.type: rocksdb
 execution.checkpointing.interval: 10s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.incremental: true
+execution.checkpointing.num-retained: 3
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
 execution.checkpointing.dir: s3://checkpoints/phase-3
 pipeline.generic-types: false
 
 s3.endpoint: http://localhost:30014
 s3.path.style.access: true
-s3.region: us-east-1
-s3.checksum-validation.enabled: false
 ```
 
-Three things are absent on purpose. **Credentials**, which arrive from
+Two of these override Flink defaults, and both were added on 2026-08-25.
+
+**`num-retained: 3`**, default `1`. With the default, the coordinator deletes
+`chk-N` the moment `chk-N+1` completes. Task 9 Step 4 kills the job while you are
+reading its log for a checkpoint number, so the default leaves a race: the number
+you noted can be gone before Step 6 uses it, and the resulting path error looks
+like a retention bug. Confirmed working, job `70c305...` retained
+`chk-6, chk-7, chk-8` where earlier runs retained one.
+
+**`incremental: true`**, default `false`. Uploads only changed SST files per
+checkpoint rather than the full state, which is the reason to run RocksDB at all.
+**Effect not yet demonstrated.** The verification run reported 917,783 bytes for
+checkpoints 1 through 4 unchanged, because it ran with no generator and a state
+that was not changing. The key parses; the benefit should appear under real load.
+
+### The line for what belongs here
+
+A setting belongs in `config.yaml` if it is a Flink runtime concern that would
+travel to `spec.flinkConfiguration` unchanged at Phase 5. What that rule keeps
+out:
+
+| Kept out | Why |
+|---|---|
+| `parallelism.default` | Phase 6 varies it on purpose. Task 4's watermark stall was fixed with `withIdleness` rather than by pinning parallelism, for this reason |
+| `--restore-from` | Already writes `execution.state-recovery.path`, but stays a flag because it is per-run. Phase 5 sets it per deploy via `spec.job.initialSavepointPath` |
+| bootstrap servers, topics, consumer group, transactional id prefix | Not Flink configuration keys at all. They are arguments to the Kafka source and sink builders |
+| watermark bound, session gap, cooldown | Domain parameters. The 6 second gap is *derived* from the generator's rate, and derived business values do not belong in a runtime config file |
+| `restart-strategy.type` | Tempting for Drill determinism, but Phase 5's whole subject is failure recovery. Deciding it here would pre-empt that phase |
+
+One thing is absent on purpose: **credentials**, which arrive from
 `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY` and are set onto the loaded
-`Configuration` in code. **Checkpoint consistency mode** and **externalized
-retention**, which have no confirmed config key and use the programmatic setters
-on `env.getCheckpointConfig()` instead. `pipeline.generic-types` moves here out
-of `PersonalizationJob`, because it is a Flink setting and belongs with the
-Flink settings.
+`Configuration` in code. Everything else Flink-related lives here.
+`pipeline.generic-types` moved out of `PersonalizationJob` for that reason, and
+so did checkpoint consistency mode and externalized retention.
+
+**Corrected 2026-08-24.** Those last two were briefly held as programmatic
+setters on `env.getCheckpointConfig()`, on the claim that no config key existed.
+That claim came from a documentation search returning nothing, which is not the
+same as absence. `javap` on `CheckpointingOptions` in `flink-core-2.2.0.jar`
+shows both:
+
+```
+CHECKPOINTING_CONSISTENCY_MODE     -> execution.checkpointing.mode
+EXTERNALIZED_CHECKPOINT_RETENTION  -> execution.checkpointing.externalized-checkpoint-retention
+```
+
+Both verified live with a negative control, a deliberately invalid value:
+
+```
+IllegalArgumentException: Could not parse value 'NONSENSE' for key
+  'execution.checkpointing.mode'. Expected one of: [[EXACTLY_ONCE, AT_LEAST_ONCE]]
+```
 
 ### Job flags
 
@@ -482,14 +529,14 @@ way. What remains are job settings and per-run switches, not Flink settings.
 | `--consumer-group` | `personalization-phase-3` | |
 | `--transactional-id-prefix` | `personalization-phase-3` | Must be stable across restarts |
 | `--output-topic` | `recommendation` | A throwaway topic makes Drill A repeatable |
-| `--bounded` | `false` | Drill mode. Pins the end offset at job start |
+| `--bounded` | `false` | Drill mode. Pins the end offset at job start. **Pass it as `--bounded=true`**: `PipelineConfig.parse` requires `--key=value` for every flag and rejects a bare switch with `Expected --key=value` |
 | `--restore-from` | none | A checkpoint path. Absent means start fresh. Written onto the loaded `Configuration` as `execution.state-recovery.path`, which is what `spec.job.initialSavepointPath` becomes at Phase 5 |
 
 ### Credentials come from the environment, never from a flag
 
 ```bash
 export MINIO_ACCESS_KEY=... MINIO_SECRET_KEY=...
-apps/gradlew -p apps :pipeline:run --args="--bounded"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true"
 ```
 
 A `--secret-key=...` argument lands in shell history and is visible in `ps`
@@ -513,7 +560,8 @@ advancing past it. A `kcat` capture then appears to hang.
 | `execution.checkpointing.mode` | `EXACTLY_ONCE` | confident | locate in the 2.2 checkpointing page before writing |
 | `pipeline.generic-types` | `false` | confident | [types_serialization][d-types22] |
 | `execution.checkpointing.dir` | `s3://checkpoints/phase-3` | **confirmed 2026-08-24**. `CheckpointingOptions.CHECKPOINTS_DIRECTORY`, which keeps `state.checkpoints.dir` and `state.backend.fs.checkpointdir` as deprecated keys | [CheckpointingOptions.java][d-ckopts] |
-| externalized checkpoint retention | retain on cancellation | **API confirmed 2026-08-24, key name still open.** The enum is now `ExternalizedCheckpointRetention` and is set with `CheckpointConfig.setExternalizedCheckpointRetention(...)`. `ExternalizedCheckpointCleanup` is gone. No `Configuration`-key equivalent was found, so use the programmatic setter | [checkpoints][d-ckdoc] |
+| `execution.checkpointing.externalized-checkpoint-retention` | `RETAIN_ON_CANCELLATION` | **confirmed 2026-08-24 from the jar**, `CheckpointingOptions.EXTERNALIZED_CHECKPOINT_RETENTION`. The enum is `ExternalizedCheckpointRetention` in `org.apache.flink.configuration`, replacing `ExternalizedCheckpointCleanup` | [checkpoints][d-ckdoc] |
+| `execution.checkpointing.mode` | `EXACTLY_ONCE` | **confirmed 2026-08-24 from the jar**, `CheckpointingOptions.CHECKPOINTING_CONSISTENCY_MODE`, typed as `org.apache.flink.core.execution.CheckpointingMode` | [checkpoints][d-ckdoc] |
 | `execution.state-recovery.path` | value of `--restore-from` | **confirmed 2026-08-24**, this is the 2.x replacement for `execution.savepoint.path`. Source is the SQL client page, which is where the key is documented, not a DataStream page | [sql-client][d-recovery] |
 | `s3.endpoint` | from `--s3-endpoint` | **confirmed 2026-08-24** | [s3][d-s3] |
 | `s3.path.style.access` | `true` | **confirmed 2026-08-24 from the jar.** `S3FileSystemFactory` mirrors both spellings, so `s3.path-style-access` is equally valid. MinIO is reached by IP and port, so virtual-host addressing cannot work | [ADR 0007](../../adr/0007-s3-filesystem-plugin.md) |
@@ -524,13 +572,18 @@ Rows reading "not yet located" are ones this design states from reasoning, not
 from a page that was actually opened. Open the page before writing the key.
 That distinction is the whole point of the column.
 
-All rows were checked on 2026-08-24. Two settings have **no confirmed config
-key** and therefore never appear in `config.yaml`: checkpoint consistency mode
-uses `CheckpointConfig.setCheckpointingConsistencyMode(...)`, and externalized
-retention uses `setExternalizedCheckpointRetention(...)`. Note that
-`setCheckpointingMode` is deprecated, and that the replacement takes
+All rows were checked on 2026-08-24, every one against the jar rather than the
+documentation. Every Flink setting lives in `config.yaml`. Nothing is configured
+programmatically.
+
+The equivalent Java setters exist and are worth knowing for reading other
+people's code: `CheckpointConfig.setCheckpointingConsistencyMode(...)` and
+`setExternalizedCheckpointRetention(...)`. Two traps there. `setCheckpointingMode`
+is deprecated in favour of the first. And the enum it takes is
 `org.apache.flink.core.execution.CheckpointingMode`, not the identically named
-`org.apache.flink.streaming.api.CheckpointingMode`.
+`org.apache.flink.streaming.api.CheckpointingMode`, while
+`ExternalizedCheckpointRetention` sits in `org.apache.flink.configuration`
+rather than alongside it.
 
 `s3.path.style.access` produces the most confusing failure when wrong. Without
 it the client addresses the bucket as `http://checkpoints.localhost:30014`,
@@ -620,18 +673,18 @@ apps/gradlew -p apps :generator:run --args="--click-rate=200"     # about 2 minu
 kcat -L -b localhost:30016 -t clickstream
 
 # 3. Run 1, clean, to completion.
-apps/gradlew -p apps :pipeline:run --args="--bounded"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true"
 
 # 4. Run 2. Watch the log for at least one COMPLETED checkpoint,
 #    then hard-kill. SIGKILL, not Ctrl-C.
-apps/gradlew -p apps :pipeline:run --args="--bounded"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true"
 pkill -9 -f lab.personalization.pipeline
 
 # 5. Find the retained checkpoint. The job log names it. The MinIO
 #    console under checkpoints/phase-3 confirms it.
 
 # 6. Resume.
-apps/gradlew -p apps :pipeline:run --args="--bounded --restore-from=s3://checkpoints/phase-3/<job-id>/chk-N"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true --restore-from=s3://checkpoints/phase-3/<job-id>/chk-N"
 
 # 7. The check.
 kcat -C -b localhost:30016 -t recommendation -o beginning -e \

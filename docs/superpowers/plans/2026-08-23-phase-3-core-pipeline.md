@@ -54,8 +54,8 @@ file.
 | 6 | `RecommendationDecider` | done 2026-08-24, suppression observed |
 | 7 | RocksDB and checkpoints to MinIO | done 2026-08-24, chk-N incrementing in MinIO |
 | 8 | Exactly-once Kafka sink | done 2026-08-24, control records observed |
-| 9 | Bounded mode, restore, and Drill A | **next** |
-| 10 | Knowledge doc, README, and status | not started |
+| 9 | Bounded mode, restore, and Drill A | done 2026-08-25 |
+| 10 | Knowledge doc, README, and status | done 2026-08-25 |
 
 ## Global constraints
 
@@ -907,10 +907,10 @@ README already applies.
 - [x] **Step 4: Load the `Configuration`, then add what the file cannot hold.**
 
 Load `config.yaml` with `GlobalConfiguration.loadConfiguration(dir)`, then set
-the two credentials from the environment onto the result, then apply the two
-programmatic setters on `env.getCheckpointConfig()`: consistency mode and
-externalized retention. Neither has a confirmed config key, so neither belongs in
-the file.
+the two credentials from the environment onto the result. That is all the Java
+does. Every Flink setting, including checkpoint consistency mode and externalized
+retention, is a line in the file. See the spec for the correction that moved
+those last two out of Java.
 
 **Assert one known key is present after loading.** A missing `config.yaml` that
 yields an empty `Configuration` gives you a heap state backend and no
@@ -957,7 +957,7 @@ increments in 30 seconds.
 **3. Retention survives the job dying.** `Ctrl+C` the job, refresh, and confirm
 the last `chk-N` is still there.
 
-That is `setExternalizedCheckpointRetention(RETAIN_ON_CANCELLATION)`. Under
+That is `execution.checkpointing.externalized-checkpoint-retention`. Under
 `DELETE_ON_CANCELLATION` the directory goes on shutdown and Task 9 has nothing
 to point `--restore-from` at.
 
@@ -1099,12 +1099,15 @@ identical range and the comparison means exactly one thing.
 checkpoint take priority over the initializer, and that priority is exactly what
 recovery depends on.
 
-- [ ] **Step 1: Add `--bounded` (false) and `--restore-from` (none).**
+- [x] **Step 1: Add `--bounded` (false) and `--restore-from` (none).**
 
-`--bounded` switches the source between `setUnbounded` and `setBounded`.
+`--bounded` switches the source between `setUnbounded` and `setBounded`. It is a
+boolean, but `PipelineConfig.parse` requires `--key=value` for **every** flag, so
+it must be passed as `--bounded=true`. A bare `--bounded` is rejected with
+`Expected --key=value, got: --bounded`.
 `--restore-from` sets the state recovery path key you located in Task 7.
 
-- [ ] **Step 2: Stage a backlog, then stop the generator.**
+- [x] **Step 2: Stage a backlog, then stop the generator.**
 
 ```bash
 apps/gradlew -p apps :generator:run --args="--click-rate=200"     # about 2 minutes, then Ctrl-C
@@ -1125,16 +1128,16 @@ The spec's mitigation ladder, in order:
 
 Try them in that order. Step 3 changes the job; steps 1 and 2 do not.
 
-- [ ] **Step 3: Run 1, clean, to completion.**
+- [x] **Step 3: Run 1, clean, to completion.**
 
 ```bash
-apps/gradlew -p apps :pipeline:run --args="--bounded --output-topic=drill-a"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true --output-topic=drill-a"
 ```
 
-- [ ] **Step 4: Run 2. Wait for a completed checkpoint, then hard-kill.**
+- [x] **Step 4: Run 2. Wait for a completed checkpoint, then hard-kill.**
 
 ```bash
-apps/gradlew -p apps :pipeline:run --args="--bounded --output-topic=drill-a"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true --output-topic=drill-a"
 # watch the log until at least one checkpoint COMPLETES, then:
 pkill -9 -f lab.personalization.pipeline
 ```
@@ -1151,17 +1154,17 @@ drained node, an OOMKill, are all `SIGKILL`.
 Killing before any checkpoint completes leaves nothing to restore from, and step
 6 then fails with a path error rather than teaching you anything.
 
-- [ ] **Step 5: Find the retained checkpoint.**
+- [x] **Step 5: Find the retained checkpoint.**
 
 The job log names it. The MinIO console under `checkpoints/phase-3` confirms it.
 
-- [ ] **Step 6: Resume.**
+- [x] **Step 6: Resume.**
 
 ```bash
-apps/gradlew -p apps :pipeline:run --args="--bounded --output-topic=drill-a --restore-from=s3://checkpoints/phase-3/<job-id>/chk-N"
+apps/gradlew -p apps :pipeline:run --args="--bounded=true --output-topic=drill-a --restore-from=s3://checkpoints/phase-3/<job-id>/chk-N"
 ```
 
-- [ ] **Step 7: The check.**
+- [x] **Step 7: The check.**
 
 Run 1 wrote set X. Run 2 wrote set Y. The topic holds X plus Y. If recovery is
 correct then Y equals X, so **every distinct line appears exactly twice**.
@@ -1182,7 +1185,7 @@ kcat -C -b localhost:30016 -t drill-a -o beginning -e \
 records from aborted transactions, including the orphan the restart fenced, and
 reports failures that are not real.
 
-- [ ] **Step 8: Write the runbook, with real pasted output.**
+- [x] **Step 8: Write the runbook, with real pasted output.**
 
 `docs/runbooks/phase-3-checkpoint-restart-drill.md`. Rationale per command, and
 an "Observed result" section holding **actual output**, including the empty
@@ -1201,7 +1204,7 @@ per phase and Phases 0 and 1 both have one. The knowledge doc records how the
 thing actually works, including what went wrong, which is the part that is gone
 in a week if it is not written down now.
 
-- [ ] **Step 1: Finish `docs/knowledge/phase-3-core-pipeline.md`.**
+- [x] **Step 1: Finish `docs/knowledge/phase-3-core-pipeline.md`.**
 
 Started during Task 2, not at the end: it already carries "How a NodePort
 Service reaches the pod, and why it never visits the ClusterIP", written when
@@ -1219,7 +1222,7 @@ Not a restatement of the spec. Record what the spec could not know in advance:
 - The observed Browsing Session close rate against the predicted one every 4 seconds
 - Anything that cost more than fifteen minutes to work out
 
-- [ ] **Step 2: Update `README.md`.**
+- [x] **Step 2: Update `README.md`.**
 
 A "Running the pipeline" section, matching the tone of "Running the generator":
 the command, the defaults, the required environment variables, and the
@@ -1228,7 +1231,7 @@ verification that is not "the log said it started".
 Note the exactly-once sawtooth explicitly. Someone running `kcat` and seeing ten
 seconds of silence will otherwise think it is broken.
 
-- [ ] **Step 3: Update `status.md`.**
+- [x] **Step 3: Update `status.md`.**
 
 Phase 3 to done, with the same specificity the Phase 1 and 2 entries use: what
 was built, what was verified with real output, and anything deliberately

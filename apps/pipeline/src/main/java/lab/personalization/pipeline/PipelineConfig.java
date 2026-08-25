@@ -14,7 +14,9 @@ record PipelineConfig(
         boolean startFromEarliest,
         String outputTopic,
         String transactionalIdPrefix,
-        Duration transactionTimeout
+        Duration transactionTimeout,
+        boolean bounded,
+        String restoreFrom
 ) {
     static PipelineConfig parse(String[] args) {
         String bootstrapServers = "localhost:30016";
@@ -29,6 +31,8 @@ record PipelineConfig(
         String outputTopic = "recommendation";
         String transactionalIdPrefix = "personalization-phase-3";
         Duration transactionTimeout = Duration.ofMillis(300_000);
+        boolean bounded = false;
+        String restoreFrom = null;
 
         for (String arg : args) {
             String[] parts = arg.replaceFirst("^--", "").split("=", 2);
@@ -50,13 +54,15 @@ record PipelineConfig(
                 case "output-topic" -> outputTopic = value;
                 case "transactional-id-prefix" -> transactionalIdPrefix = value;
                 case "transaction-timeout-ms" -> transactionTimeout = Duration.ofMillis(Long.parseLong(value));
+                case "bounded" -> bounded = parseBoolean(value);
+                case "restore-from" -> restoreFrom = value;
                 default -> throw new IllegalArgumentException("Unknown option: --" + key);
             }
         }
 
         return new PipelineConfig(bootstrapServers, consumerGroup, inputTopic, flinkConfDir,
                 watermarkBound, sessionGap, cooldown, watermarkIdleness, startFromEarliest,
-                outputTopic, transactionalIdPrefix, transactionTimeout);
+                outputTopic, transactionalIdPrefix, transactionTimeout, bounded, restoreFrom);
     }
 
     private static boolean parseBoolean(String value) {
