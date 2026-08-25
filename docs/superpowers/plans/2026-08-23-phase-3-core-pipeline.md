@@ -11,7 +11,7 @@ Clicks to a side output, and decides a Recommendation in a
 `KeyedProcessFunction` whose keyed state outlives any single window.
 
 **Tech Stack:** Flink 2.2 (DataStream API), `flink-connector-kafka`,
-`flink-statebackend-rocksdb`, `flink-s3-fs-native`, Gradle multi-project,
+`flink-statebackend-rocksdb`, `flink-s3-fs-hadoop`, Gradle multi-project,
 Java 21 records, Strimzi Kafka, MinIO.
 
 **Spec:** [core pipeline design](../specs/2026-08-23-core-pipeline-design.md)
@@ -52,8 +52,8 @@ file.
 | 4 | Watermarks, session windows, and `SessionSignal` | done 2026-08-23, after a watermark stall |
 | 5 | Late Click side output, and Drill B | done 2026-08-24, `LATE` line observed |
 | 6 | `RecommendationDecider` | done 2026-08-24, suppression observed |
-| 7 | RocksDB and checkpoints to MinIO | **next** |
-| 8 | Exactly-once Kafka sink | not started |
+| 7 | RocksDB and checkpoints to MinIO | done 2026-08-24, chk-N incrementing in MinIO |
+| 8 | Exactly-once Kafka sink | **next** |
 | 9 | Bounded mode, restore, and Drill A | not started |
 | 10 | Knowledge doc, README, and status | not started |
 
@@ -430,7 +430,7 @@ dependencies {
 
     // Connectors and filesystems: bundled
     implementation "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
-    implementation "org.apache.flink:flink-s3-fs-native:${flinkVersion}"
+    implementation "org.apache.flink:flink-s3-fs-hadoop:${flinkVersion}"
 }
 ```
 
@@ -440,7 +440,7 @@ versions are the Flink 2.0 line and `3.4.0-1.20` the last 1.x line.
 
 **Two deviations from this step as originally written, both deliberate.**
 
-`flink-s3-fs-native` was left out. Nothing before Task 7 writes a checkpoint,
+`flink-s3-fs-hadoop` was left out. Nothing before Task 7 writes a checkpoint,
 and it drags in a large Hadoop tree that can pull a second SLF4J binding onto
 the classpath. This task exists to keep three failure signatures
 distinguishable, so an unused heavy dependency works against it. Add it in Task
@@ -854,13 +854,13 @@ plus the source offsets that produced it. RocksDB keeps state on local disk
 rather than on the JVM heap, so state can exceed memory. The snapshot goes to
 durable storage, which here is the MinIO bucket from Phase 1.
 
-**The failure mode to watch for.** `s3.path-style-access` is the one that
+**The failure mode to watch for.** `s3.path.style.access` is the one that
 produces the most confusing error when wrong. Without it the client addresses
 the bucket as `http://checkpoints.localhost:30014`, which does not resolve, and
 the failure mentions DNS rather than S3. You will chase a networking problem
 that is really a one-line config problem.
 
-- [ ] **Step 1: Locate the three renamed config keys. Do not guess them.**
+- [x] **Step 1: Locate the three renamed config keys. Do not guess them.**
 
 The Flink 2.0 line renamed a group of checkpointing keys. The spec marks three
 as unverified:
@@ -875,7 +875,7 @@ Fill the "Doc" column of the spec's configuration table with the URLs you
 actually open. Rows currently read "not yet located", and that distinction is
 the point of the column.
 
-- [ ] **Step 2: Write `apps/pipeline/conf/config.yaml`, and add one flag.**
+- [x] **Step 2: Write `apps/pipeline/conf/config.yaml`, and add one flag.**
 
 Revised 2026-08-24. The original three flags (`--s3-endpoint`,
 `--checkpoint-dir`, `--checkpoint-interval-seconds`) are gone. Flink settings are
@@ -892,7 +892,7 @@ unset variable cannot silently fall back.
 
 Not under `src/main/resources`. Anything there is baked into the jar.
 
-- [ ] **Step 3: Read credentials from the environment.**
+- [x] **Step 3: Read credentials from the environment.**
 
 ```bash
 export MINIO_ACCESS_KEY=... MINIO_SECRET_KEY=...
@@ -904,7 +904,7 @@ Fetch the values with the command in `README.md`'s MinIO section.
 output to every process on the machine. Same no-durable-secrets reasoning the
 README already applies.
 
-- [ ] **Step 4: Load the `Configuration`, then add what the file cannot hold.**
+- [x] **Step 4: Load the `Configuration`, then add what the file cannot hold.**
 
 Load `config.yaml` with `GlobalConfiguration.loadConfiguration(dir)`, then set
 the two credentials from the environment onto the result, then apply the two
@@ -916,7 +916,7 @@ the file.
 yields an empty `Configuration` gives you a heap state backend and no
 checkpointing, and the job looks healthy while doing neither.
 
-- [ ] **Step 5: Prove checkpoints actually land in MinIO.**
+- [x] **Step 5: Prove checkpoints actually land in MinIO.**
 
 A running job is not proof. The job logs a completed checkpoint whether or not
 the bytes arrived where you think.

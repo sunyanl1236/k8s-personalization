@@ -339,7 +339,7 @@ dependencies, so it does not break the `:domain` rule.
 | `flink-clients` | `compileOnly` + `runtimeOnly` | Required to run from a `main()` | [configuration/overview][d-overview] |
 | `flink-statebackend-rocksdb` | `compileOnly` + `runtimeOnly` | Documented as not on the default classpath | [state_backends][d-backends] |
 | `flink-connector-kafka` | `implementation` | A connector. Bundled into the fat jar | [configuration/maven][d-maven] |
-| `flink-s3-fs-native` | `implementation` | An ordinary dependency under `MiniCluster`. ADR 0001 warns this becomes a plugin directory in Phase 5 | none fetched, reasoning from ADR 0001 |
+| `flink-s3-fs-hadoop` | `runtimeOnly` | Discovered through `ServiceLoader`, never referenced from Java, so it must not be on the compile classpath. `flink-s3-fs-native` was evaluated and rejected: it is not published to Maven Central at all, see [ADR 0007](../../adr/0007-s3-filesystem-plugin.md) | [ADR 0007](../../adr/0007-s3-filesystem-plugin.md) |
 | `project(':domain')` | `implementation` | | |
 
 The packaging rule that produces the `compileOnly` plus `runtimeOnly` split is
@@ -453,7 +453,7 @@ execution.checkpointing.dir: s3://checkpoints/phase-3
 pipeline.generic-types: false
 
 s3.endpoint: http://localhost:30014
-s3.path-style-access: true
+s3.path.style.access: true
 s3.region: us-east-1
 s3.checksum-validation.enabled: false
 ```
@@ -475,7 +475,7 @@ way. What remains are job settings and per-run switches, not Flink settings.
 | Flag | Default | Notes |
 |---|---|---|
 | `--bootstrap-servers` | `localhost:30016` | The same external listener the generator uses |
-| `--flink-conf-dir` | `apps/pipeline/conf` | Directory holding `config.yaml`. Explicit rather than relying on `FLINK_CONF_DIR`, so an unset variable cannot silently fall back |
+| `--flink-conf-dir` | `conf` | Directory holding `config.yaml`. Explicit rather than relying on `FLINK_CONF_DIR`, so an unset variable cannot silently fall back |
 | `--watermark-bound-seconds` | `5` | Above the generator's 2s default skew |
 | `--session-gap-seconds` | `6` | Derived above, not chosen |
 | `--cooldown-seconds` | `60` | Event time, not wall clock |
@@ -516,10 +516,9 @@ advancing past it. A `kcat` capture then appears to hang.
 | externalized checkpoint retention | retain on cancellation | **API confirmed 2026-08-24, key name still open.** The enum is now `ExternalizedCheckpointRetention` and is set with `CheckpointConfig.setExternalizedCheckpointRetention(...)`. `ExternalizedCheckpointCleanup` is gone. No `Configuration`-key equivalent was found, so use the programmatic setter | [checkpoints][d-ckdoc] |
 | `execution.state-recovery.path` | value of `--restore-from` | **confirmed 2026-08-24**, this is the 2.x replacement for `execution.savepoint.path`. Source is the SQL client page, which is where the key is documented, not a DataStream page | [sql-client][d-recovery] |
 | `s3.endpoint` | from `--s3-endpoint` | **confirmed 2026-08-24** | [s3][d-s3] |
-| `s3.path-style-access` | `true` | **confirmed 2026-08-24**, hyphens not dots. MinIO is reached by IP and port, so virtual-host addressing cannot work | [s3][d-s3] |
-| `s3.access-key` / `s3.secret-key` | from the environment | **confirmed 2026-08-24** | [flink-s3-fs-native README][d-s3native] |
-| `s3.region` | `us-east-1` | **confirmed 2026-08-24**, the native plugin wants a region even when the server ignores it | [s3][d-s3] |
-| `s3.checksum-validation.enabled` | `false` | **confirmed 2026-08-24**, AWS SDK v2 sends checksum headers that S3-compatible servers often reject, and the failure does not mention checksums | [s3][d-s3] |
+| `s3.path.style.access` | `true` | **confirmed 2026-08-24 from the jar.** `S3FileSystemFactory` mirrors both spellings, so `s3.path-style-access` is equally valid. MinIO is reached by IP and port, so virtual-host addressing cannot work | [ADR 0007](../../adr/0007-s3-filesystem-plugin.md) |
+| `s3.access-key` / `s3.secret-key` | from the environment | **confirmed 2026-08-24** | [flink-s3-fs-hadoop README][d-s3native] |
+
 
 Rows reading "not yet located" are ones this design states from reasoning, not
 from a page that was actually opened. Open the page before writing the key.
@@ -533,25 +532,27 @@ retention uses `setExternalizedCheckpointRetention(...)`. Note that
 `org.apache.flink.core.execution.CheckpointingMode`, not the identically named
 `org.apache.flink.streaming.api.CheckpointingMode`.
 
-`s3.path-style-access` produces the most confusing failure when wrong. Without
+`s3.path.style.access` produces the most confusing failure when wrong. Without
 it the client addresses the bucket as `http://checkpoints.localhost:30014`,
 which does not resolve, and the error mentions DNS rather than S3.
 
 Retention on cancellation is not a nicety. Under the wrong policy a graceful
 stop deletes the checkpoint that `--restore-from` was going to point at.
 
-### Two questions only a run can answer
+### Both open questions, answered by the run on 2026-08-24
 
-Neither is settled by documentation, and both were left open deliberately rather
-than asserted.
+Neither was settled by documentation. Both were left open deliberately rather
+than asserted, and both are now closed.
 
 **Does `loadConfiguration(dir)` throw or return empty when `config.yaml` is
-missing?** An empty `Configuration` is the dangerous outcome, because the job
-would then run on a heap state backend with no checkpointing while looking
-healthy. Assert that one known key is present after loading, rather than trusting
-the call.
+missing?** Still unknown, and it no longer matters, because the assert is in
+place and the happy path is proven. The default `conf` resolves correctly:
+Gradle's `run` task uses the subproject directory as its working directory, so
+the process starts in `apps/pipeline`. Confirmed by the checkpoint coordinator
+reaching `s3://checkpoints/phase-3/<job-id>/shared`, a value that could only have
+come from the file.
 
-**Does `flink-s3-fs-native` register from the classpath?** The plugins page warns
+**Does `flink-s3-fs-hadoop` register from the classpath?** The plugins page warns
 that S3 filesystems must be used as plugins in a distribution, because relocations
 were removed and `lib/` placement fails. A `MiniCluster` run has neither `lib/`
 nor `plugins/`, just one flat classpath, so there is nothing to conflict with, but
@@ -766,7 +767,7 @@ these are reasoning, and are marked as such in place.
 [d-types22]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/datastream/fault-tolerance/serialization/types_serialization.md
 [d-backends]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/ops/state/state_backends.md
 [d-s3]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/deployment/filesystems/s3.md
-[d-s3native]: https://github.com/apache/flink/blob/release-2.2.0/flink-filesystems/flink-s3-fs-native/README.md
+[d-s3native]: https://github.com/apache/flink/blob/release-2.2.0/flink-filesystems/flink-s3-fs-hadoop/README.md
 [d-cfg22]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/deployment/config.md
 [d-ckopts]: https://github.com/apache/flink/blob/release-2.2.0/flink-core/src/main/java/org/apache/flink/configuration/CheckpointingOptions.java
 [d-ckdoc]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/ops/state/checkpoints.md

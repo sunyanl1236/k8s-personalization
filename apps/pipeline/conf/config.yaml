@@ -1,0 +1,7 @@
+state.backend.type: rocksdb
+execution.checkpointing.interval: 10s
+execution.checkpointing.dir: s3://checkpoints/phase-3
+pipeline.generic-types: false
+
+s3.endpoint: http://localhost:30014
+s3.path.style.access: true

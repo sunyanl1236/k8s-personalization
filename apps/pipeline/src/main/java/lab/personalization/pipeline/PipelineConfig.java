@@ -6,6 +6,7 @@ record PipelineConfig(
         String bootstrapServers,
         String consumerGroup,
         String inputTopic,
+        String flinkConfDir,
         Duration watermarkBound,
         Duration sessionGap,
         Duration cooldown,
@@ -16,6 +17,7 @@ record PipelineConfig(
         String bootstrapServers = "localhost:30016";
         String consumerGroup = "personalization-phase-3";
         String inputTopic = "clickstream";
+        String flinkConfDir = "conf";
         Duration watermarkBound = Duration.ofSeconds(5);
         Duration sessionGap = Duration.ofSeconds(6);
         Duration cooldown = Duration.ofSeconds(60);
@@ -33,6 +35,7 @@ record PipelineConfig(
                 case "bootstrap-servers" -> bootstrapServers = value;
                 case "consumer-group" -> consumerGroup = value;
                 case "input-topic" -> inputTopic = value;
+                case "flink-conf-dir" -> flinkConfDir = value;
                 case "watermark-bound-seconds" -> watermarkBound = Duration.ofSeconds(Long.parseLong(value));
                 case "session-gap-seconds" -> sessionGap = Duration.ofSeconds(Long.parseLong(value));
                 case "cooldown-seconds" -> cooldown = Duration.ofSeconds(Long.parseLong(value));
@@ -42,7 +45,7 @@ record PipelineConfig(
             }
         }
 
-        return new PipelineConfig(bootstrapServers, consumerGroup, inputTopic,
+        return new PipelineConfig(bootstrapServers, consumerGroup, inputTopic, flinkConfDir,
                 watermarkBound, sessionGap, cooldown, watermarkIdleness, startFromEarliest);
     }
 

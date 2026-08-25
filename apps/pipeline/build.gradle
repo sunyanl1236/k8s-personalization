@@ -26,7 +26,9 @@ application {
             '--add-opens=java.base/java.util=ALL-UNNAMED',
             '--add-opens=java.base/java.lang=ALL-UNNAMED',
             '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
-            '--add-opens=java.base/java.time=ALL-UNNAMED'
+            '--add-opens=java.base/java.time=ALL-UNNAMED',
+            // flink-s3-fs-hadoop wraps Hadoop S3A, which uses AWS SDK 1.x, see ADR 0007
+            '-Daws.java.v1.disableDeprecationAnnouncement=true'
     ]
 }
 
@@ -59,6 +61,9 @@ dependencies {
     runtimeOnly "org.apache.flink:flink-statebackend-rocksdb:${flinkVersion}"
 
     implementation "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
+
+    // discovered at runtime through ServiceLoader, never referenced from Java
+    runtimeOnly "org.apache.flink:flink-s3-fs-hadoop:${flinkVersion}"
 
     // bundled in flink-dist, so not pulled transitively
     compileOnly "org.apache.flink:flink-connector-base:${flinkVersion}"

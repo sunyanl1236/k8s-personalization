@@ -602,3 +602,277 @@ run against the original. Fewer rows in the checkpoint means fewer things that
 can differ.
 
 Pick one and tell me which, then write `processElement` and `onTimer`.
+
+
+## What `s3://checkpoints/phase-3` actually means
+
+Came up in Task 7. Appended verbatim from the explanation given at the time.
+Only the heading depth was changed, so the section nests under this document.
+
+Three separate things are packed into that one string, and only one of them is a
+folder. None of them is AWS.
+
+### Decompose the URI
+
+```
+s3://checkpoints/phase-3
+│     │           │
+│     │           └── key prefix inside the bucket
+│     └────────────── BUCKET name, not a folder
+└──────────────────── scheme: which FileSystem implementation to use
+```
+
+**`s3://` is not a location.** It is a lookup key. Flink asks its registry "who
+handles the scheme `s3`?", and `flink-s3-fs-native` answers because it registered
+itself through `ServiceLoader`. That is the only job the scheme does. It says
+*speak the S3 protocol*, nothing about where.
+
+**`checkpoints` is the bucket.** In an S3 URI the first segment after `://` sits
+in the position a hostname occupies in an HTTP URL, and S3 puts the bucket there.
+It is not a directory. You created this bucket in Phase 1, declared in
+`Tenant.spec.buckets`, and confirmed it in the MinIO console.
+
+**`phase-3` is a key prefix.** And here is the part that surprises people: **S3
+has no folders at all.** A bucket holds a flat list of objects, each with a string
+key. The key `phase-3/a1b2c3/chk-7/_metadata` is one string. The `/` characters
+carry no meaning to the storage layer. Consoles draw folder icons by splitting on
+`/`, but nothing was ever created called `phase-3`. Delete every object under it
+and the "folder" vanishes, because it never existed.
+
+### So where is S3?
+
+There is no AWS in this project. This line is the answer:
+
+```yaml
+s3.endpoint: http://localhost:30014
+```
+
+That is the MinIO S3 API you exposed on NodePort 30014 in Task 2, the one you
+proved with `curl http://localhost:30014/minio/health/live` returning 200.
+
+```
+your job                       kind cluster
+--------                       ------------
+s3://checkpoints/phase-3
+   │
+   ├── scheme  -> flink-s3-fs-native
+   └── request -> http://localhost:30014  ──> NodePort 30014
+                  (s3.endpoint)                    │
+                                                   v
+                                            minio-s3-api Service
+                                                   │
+                                                   v
+                                            MinIO, bucket "checkpoints"
+```
+
+### Why `s3.path-style-access: true` belongs to this
+
+Now the two config lines connect. There are two ways an S3 client can turn a
+bucket name into an HTTP request.
+
+**Virtual-host style**, the AWS default. The bucket becomes a subdomain:
+
+```
+PUT http://checkpoints.localhost:30014/phase-3/a1b2c3/chk-7/_metadata
+        └──────────┘
+        bucket as subdomain -> DNS lookup for "checkpoints.localhost" -> fails
+```
+
+**Path style**, what you set:
+
+```
+PUT http://localhost:30014/checkpoints/phase-3/a1b2c3/chk-7/_metadata
+                          └──────────┘
+                          bucket as first path segment -> no DNS involved
+```
+
+MinIO here is reached by a host and port, not by a domain you control, so
+virtual-host style cannot work. Without that one line the failure says the
+hostname could not be resolved, and you go looking for a networking problem that
+is really a one-line config problem.
+
+### What you will actually see in the console
+
+After Step 5, browsing the `checkpoints` bucket:
+
+```
+checkpoints/                      <- the bucket (real)
+  phase-3/                        <- prefix (drawn, not real)
+    a1b2c3d4.../                  <- the job id (drawn)
+      chk-7/
+        _metadata
+        <state files>
+```
+
+`chk-N` increments about every 10 seconds, because
+`execution.checkpointing.interval: 10s`. A growing N is the proof that
+checkpointing is working, and it is what Task 9's `--restore-from` will point at.
+
+
+## Why the job reaches MinIO on `localhost:30014` and not an in-cluster address
+
+Came up in Task 7, from the question "I configured a NodePort, why is it still
+accessing from the external?". Appended verbatim. Only the heading depth was
+changed.
+
+Because **your Flink job is not in the cluster.** At Phase 3 it runs on your
+laptop, in a plain JVM.
+
+That is what a NodePort is for. It does not move anything inside. It opens a door
+from outside, and your job is outside.
+
+### Where the job actually runs
+
+```bash
+apps/gradlew -p apps :pipeline:run
+```
+
+That starts a `MiniCluster`, which is a whole Flink cluster (JobManager,
+TaskManagers, state backend) running as threads inside one ordinary JVM process
+on your host. There is no pod. `kubectl get pods` will never show it. This is
+ADR 0001's dev loop: fast iteration without a deploy.
+
+So the job is an external client of your `kind` cluster, exactly like `kcat` is.
+
+### The chain your request actually takes
+
+```
+your JVM                      docker            kind node container        Kubernetes
+--------                      ------            -------------------        ----------
+PUT http://localhost:30014/checkpoints/...
+      │
+      └─> host port 30014
+              │
+              └─> extraPortMappings          (clusters/kind/*.yaml:46)
+                     containerPort: 30014
+                        │
+                        └─> kube-proxy listening on 30014 on that node
+                               │
+                               └─> minio-s3-api Service (NodePort 30014)
+                                      │
+                                      └─> MinIO pod, 10.244.3.14:9000
+```
+
+Two hops are easy to miss:
+
+1. **`kind` nodes are Docker containers.** A NodePort alone is not reachable from
+   your host. It becomes reachable because `clusters/kind/` declares
+   `extraPortMappings` for 30014, publishing the container's port to your machine.
+   Without that line, `localhost:30014` would refuse the connection even with a
+   perfectly healthy Service.
+2. **kube-proxy never visits the ClusterIP.** It forwards straight to a pod
+   endpoint. That mechanism is already written up in the Phase 3 knowledge doc's
+   first section.
+
+### You already accepted this for Kafka
+
+```yaml
+bootstrap-servers: localhost:30016   # Kafka external listener
+s3.endpoint: http://localhost:30014  # MinIO S3 API
+```
+
+Identical reasoning, identical pattern. Both are NodePorts reserved at Phase 0,
+both reached from a process on your host.
+
+### What changes at Phase 5
+
+The job becomes pods, scheduled by the Flink Kubernetes Operator. Then it is
+**inside** the cluster, and it stops using the NodePort:
+
+| | Phase 3 | Phase 5 |
+|---|---|---|
+| Job runs as | a JVM on your host | pods in the cluster |
+| `s3.endpoint` | `http://localhost:30014` | the in-cluster Service, `http://minio.<namespace>.svc:80` style |
+| Path | host port to NodePort to Service to pod | Service to pod, no NodePort |
+
+The NodePort stays useful after Phase 5, but for you and for `kcat`, not for the
+job.
+
+**This is exactly why `s3.endpoint` is a line in `config.yaml` rather than a
+constant in Java.** It is the value that must differ between the two
+environments. At Phase 5 you copy the YAML into `spec.flinkConfiguration` and
+change this one line. No Java is touched, and the same jar runs in both places.
+
+
+## Why `pipeline.generic-types: false`
+
+Came up in Task 7. Appended verbatim from the explanation given at the time.
+Only the heading depth was changed, so the section nests under this document.
+
+### The problem it prevents
+
+Every record that crosses an operator boundary must become bytes. Shuffles across
+a `keyBy`, values written to keyed state, everything in a checkpoint. Flink
+chooses a serializer **per type**, once, while building the job graph.
+
+If Flink recognises the type, it generates a fast, schema-aware serializer. If it
+does not, it **silently falls back to Kryo**, a generic reflection-based
+serializer.
+
+Silently is the whole problem. There is no error. The job starts, runs, and
+produces correct output. You find out later, and "later" is expensive:
+
+| Cost | When you notice |
+|---|---|
+| Much slower serialization | when throughput does not match your parallelism |
+| State that cannot be evolved | when you add a field to a record and a restore fails |
+| Opaque checkpoint contents | when you try to read state with the State Processor API |
+
+Setting `pipeline.generic-types: false` removes the fallback. Flink throws
+instead:
+
+```
+UnsupportedOperationException: Generic types have been disabled in the
+ExecutionConfig and type <X> is treated as a generic type.
+```
+
+A loud failure at job-graph build time, before a single record moves.
+
+### Worked example with this project's own types
+
+**`Click` passes.** It is a record of `String`, `String`, `Instant`, and an enum.
+Flink recognises records as POJO types, and `java.time.Instant` is a first-class
+Flink type. That last fact was an open question in the design and was confirmed
+during Task 3. It only mattered *because* this flag is false. With the flag at
+its default, `Instant` would have gone quietly to Kryo and nobody would have
+checked.
+
+**`ProductChange` fails, on purpose.** It is a sealed interface over
+`PriceChange` and `StockChange`. An interface is not a POJO, so there is no
+schema to generate from.
+
+```
+default (generic-types: true)     ->  Kryo, silently. Job runs. Problem hidden.
+this project (false)              ->  build fails, naming ProductChange.
+```
+
+Phase 4 is the phase that reads `product-change`, so Phase 4 is where this fires.
+`status.md` already records it as budgeted work needing either a custom
+`TypeInformation` or a split into two typed branches. That entry exists
+**because** the flag is false. Otherwise Phase 4 would have shipped with Kryo and
+the problem would have surfaced in Phase 5's HA Drill instead.
+
+### Why it belongs to this project in particular
+
+`:domain` declares zero dependencies. Not Kafka, not Flink. `CLAUDE.md` says that
+emptiness "is what keeps them valid Flink POJO types".
+
+But a rule nobody enforces is a comment. `pipeline.generic-types: false` is the
+enforcement. It turns "please keep the records POJO-compatible" into a build
+failure the moment someone breaks it.
+
+It also protects Task 9 directly. That Drill compares an uninterrupted run
+against one restored from a checkpoint, line for line. Kryo-serialized state is
+the kind that fails or shifts across a restore, and the Drill would fail for a
+reason unrelated to checkpointing.
+
+### Why it moved into `config.yaml`
+
+It was in `PersonalizationJob` as
+`flinkConfig.set(PipelineOptions.GENERIC_TYPES, false)`. It is a Flink setting,
+so it now sits with the other Flink settings, and it travels to
+`spec.flinkConfiguration` at Phase 5 unchanged.
+
+That move is also the second reason the assert after loading matters. If
+`config.yaml` fails to load, you lose this line too, and the Kryo fallback
+becomes silent again exactly when you are least likely to look for it.
