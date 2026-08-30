@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-25
+Last updated: 2026-08-30
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
@@ -52,10 +52,14 @@ Status legend: ✅ done · 🟡 in progress · ⬜ not started
 
 ## Phase 2: Domain model and generator — ✅ done
 
-- ✅ Four domain schemas as Java records (`generator/src/main/java/lab/personalization/generator/domain/`):
-  `Click`, `ProductChange` (sealed interface over `PriceChange`/`StockChange`),
-  `PromoRule`, `Recommendation`. Design in
+- ✅ Four domain schemas as Java records (now `apps/domain/`):
+  `Click`, `ProductChange`, `PromoRule`, `Recommendation`. Design in
   [the domain schemas doc](2026-08-16-domain-schemas-design.md).
+  **`ProductChange` was redesigned on 2026-08-28**, see
+  [ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md): it was a
+  sealed interface over `PriceChange`/`StockChange`, and is now one record
+  carrying `price`, `previousPrice`, `stock`, `previousStock`. The two variants
+  are deleted and the wire format's `"type"` field is gone.
 - ✅ Synthetic generator (`generator/`), a plain Java `kafka-clients`
   producer, not a Flink program, per
   [the generator design doc](2026-08-16-generator-event-production-design.md).
@@ -175,7 +179,7 @@ tasks; check its Progress table for the live position.
   1. **`flink-s3-fs-native` is not published to Maven Central at any version.**
      It ships only inside a Flink distribution's `opt/`, so it cannot be a Gradle
      dependency. Recorded in
-     [ADR 0007](../../adr/0007-s3-filesystem-plugin.md), with what the detour
+     [ADR 0008](../../adr/0007-s3-filesystem-plugin.md), with what the detour
      bought. `flink-s3-fs-hadoop` it is, `runtimeOnly`.
   2. **`FileSystem.initialize(flinkConfig, null)` is required.** Flink's filesystem
      registry is a process-wide static that the job's `Configuration` never
@@ -319,11 +323,14 @@ generator's rate, not chosen: at 10 Shoppers and 5 Clicks per second a 30 second
 gap would close a Browsing Session about never, and the job would emit nothing
 while behaving correctly.
 
-**Surfaced for Phase 4, and nothing else records it.** `ProductChange` is a
-sealed interface, which is not a Flink POJO. Phase 3 sets
-`pipeline.generic-types: false`, so it cannot silently fall back to Kryo either.
-Phase 4 hits this the moment it reads `product-change`, and needs either a
-custom `TypeInformation` or a split into two typed branches. Budget for it.
+**~~Surfaced for Phase 4~~ Resolved 2026-08-28 by
+[ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md).**
+`ProductChange` was a sealed interface, which is not a Flink POJO, and
+`pipeline.generic-types: false` blocked a silent Kryo fallback. Neither of the
+two options predicted here was taken. Instead the sum type was removed: one
+record now carries the Product's full state plus the values it replaced. That
+also gave stock its first consumer, an out-of-stock suppression rule, and made
+"price drop" checkable for the first time.
 
 **Deferred out of Phase 3, both deliberately.** Drill A's full sequence, kill
 after a completed checkpoint then restore and compare, was not run to
@@ -332,7 +339,191 @@ written. Drill B's runbook exists but its "Observed result" section still holds
 two TODO placeholders. Phase 5's HA Drill leans on exactly the same recovery
 path, so it inherits the unproven part.
 
-## Phase 4: Advanced Flink — ⬜ not started
+## Phase 4: Advanced Flink — ✅ done
+
+Design and plan both written and approved:
+[design](../specs/2026-08-24-advanced-flink-design.md),
+[implementation plan](2026-08-24-phase-4-advanced-flink.md). The plan runs 10
+tasks; check its Progress table for the live position.
+
+Tasks 0 to 3 depend on nothing Phase 3 still has open, so they can run alongside
+Phase 3 Tasks 6 to 10. Task 4 rewrites `RecommendationDecider`, so it waits.
+
+- ✅ Task 0: `flink-cep` packaging confirmed. `lib/flink-cep-2.2.0.jar` is in the
+  `flink:2.2.0` image and loaded by default, and the advanced-configuration page
+  names CEP explicitly as a library that sits outside `flink-dist.jar` but ships
+  in `lib/`. Scope is `compileOnly` plus `runtimeOnly`, matching
+  `flink-streaming-java`. Checked first on purpose, the same reasoning that made
+  the Operator-version check Phase 3's Task 0.
+- ✅ Task 1: `Product Change` snapshot model, and its source. Redesigned
+  mid-task by [ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md),
+  which is the substantial event of this phase so far. `PriceChange` and
+  `StockChange` are deleted; one `ProductChange` record carries `price`,
+  `previousPrice`, `stock`, `previousStock`, and the wire format's `"type"`
+  field is gone. `ProductChangeFactory` is now stateful, keeping a ten-entry map
+  of each Product's last event, and emits `stock` of zero one time in ten so the
+  out-of-stock rule is observable.
+  Gate passed: the job read `product-change` end to end, at the expected rate
+  and with the expected `stock=0` share, not just a successful compile.
+  Three things were verified rather than assumed. The derived accessors
+  `priceDropped()` and `outOfStock()` do **not** confuse Flink's POJO
+  extraction: `TypeInformation.of(ProductChange.class)` gives `PojoTypeInfo`
+  with arity **6**, not 8, and a `PojoSerializer` round trip is exact. The
+  generator's measured distributions over 20,000 events are `stock == 0` at
+  9.6% and a price drop at 37.5%. And a first attempt at the numeric JSON
+  pattern, `(-?[0-9.eE+]+)`, was wrong: `-?` anchors only the start and the
+  character class holds no `-`, so `1.0E-4` matched as `1.0E` and threw
+  `NumberFormatException`.
+- ✅ Task 2: test infrastructure, the interval join, and `EnrichedClick`.
+  Five tests green, and the live `ENRICHED` rate confirmed against the predicted
+  one third of Clicks.
+  Three Gradle facts had to be settled before a single test could run:
+  `compileOnly` does not reach the test compile classpath (fixed with
+  `testImplementation.extendsFrom compileOnly`), `applicationDefaultJvmArgs`
+  applies to `run` and not `test`, and without `useJUnitPlatform()` Gradle finds
+  zero tests and **reports success**. Every test result in this phase is
+  therefore read from the XML report, not from `BUILD SUCCESSFUL`.
+  The harness artifact question the plan left open is closed:
+  `ProcessFunctionTestHarnesses` and the `*OperatorTestHarness` classes are in
+  the **tests classifier** of `flink-runtime`, which `flink-test-utils` does not
+  pull. It is declared explicitly and Task 4 needs it.
+  Two review findings on the first implementation. The Product-keyed branch had
+  been forked *below* `keyBy(shopperId)`, which compiles and costs a second full
+  shuffle, and is the exact shape ADR 0003 exists to forbid. And the join was
+  written with `ProductChange` on the left; with symmetric bounds that emits an
+  identical pair set, but it prevents job and test sharing one
+  `ProcessJoinFunction` and would invert silently if the bounds ever became
+  asymmetric. Both corrected; the join interval is now
+  `--join-lower-bound-seconds` / `--join-upper-bound-seconds` rather than
+  hardcoded.
+- ✅ Task 3: CEP abandoned cart, `ShopperSignal`, `SignalKind`. Five tests green
+  and the live `CART-ABANDONED` rate confirmed.
+  The pattern is VIEW, then ADD_TO_CART on the **same** Product, then no CHECKOUT
+  within 30s. It supersedes the design spec's "viewed a competitor, went idle",
+  which at the generator's real rates needs a 60s window spanning ten session
+  gaps. `ActionType`'s own comment in `:domain` had described this pattern since
+  Phase 2 and nothing else recorded it.
+  **One question the docs could not answer, settled by the test.** A pattern
+  ending in `notFollowedBy(...).within(...)` delivers a clean expiry through
+  `processMatch`, not `processTimedOutMatch`. So "viewed, carted, never checked
+  out" is a **match**, and the timed-out handler sees only genuinely incomplete
+  sequences such as a VIEW never carted. Had it been the other way the emission
+  would have had to move, and the two side outputs would have been tangled.
+  `SameProductAs` is an `IterativeCondition`, not a `SimpleCondition`, because
+  the Product is unknown at graph-construction time and is read per match from
+  `ctx.getEventsForPattern("view")`. It is a named static nested class so that
+  serialization ships only its two fields.
+  `--cep-within-seconds` added, so every timing value in the job is now a flag.
+- ✅ Task 4: the `connect` merge, `SignalMerger`, `UNMATCHED` and `OUT_OF_STOCK`.
+  Nine harness tests green. `RecommendationDecider` became `SignalMerger`, a
+  `KeyedCoProcessFunction` whose `processElement1` is Phase 3's old body.
+  Three decisions worth keeping. The two state maps have **different lifetimes**:
+  `matchesByProduct` clears on session close, while `abandonedCarts` expires on
+  its own 60s event-time timer, because a cart abandonment confirms 30s after the
+  VIEW and ~60% of them arrive after their own Browsing Session has closed. A
+  candidate with no trigger goes to `UNMATCHED` and is **not** published, which
+  narrows Phase 3's behaviour by roughly a fifth of output volume. And the request
+  is built from real facts before any branch, so a suppressed record still reports
+  why it would have been recommended.
+  **A config fix was needed before the live run, and it will matter again.** The
+  first attempt failed at deploy with `Insufficient number of network buffers:
+  required 17, but only 0 available` against the default 2048. Phase 4 grew the
+  graph to five `keyBy` shuffles, and `MiniCluster`'s default network memory does
+  not cover them at parallelism 16. Fixed in `apps/pipeline/conf/config.yaml` with
+  `taskmanager.memory.network.min` and `.max` both at `256mb`, which is 8192
+  buffers, plus `taskmanager.memory.process.size: 2gb` to afford it. Pinning
+  parallelism was rejected as the fix, for the same reason Phase 3 Task 4 rejected
+  it: Phase 6 varies parallelism deliberately.
+  After the fix, zero failed tasks and every output present: `REQUEST`,
+  `UNMATCHED`, `CART-ABANDONED`, `CEP-TIMEOUT`, `PRICE-DROP-MATCH`,
+  `MERGED-SIGNAL`, `SIGNAL`.
+  **Phase 5 inherits this.** These values move into `spec.flinkConfiguration` on
+  the `FlinkDeployment`, and a TaskManager container sized below 2gb will hit the
+  same wall.
+- ✅ Task 5: broadcast Promo Rules. Five harness tests green; the live check was
+  not run, so the task is signed off on tests alone.
+  `PromoRuleApplier` is a plain `BroadcastProcessFunction`, not a keyed one: the
+  discount is a stateless multiplication, so no second `keyBy` shuffle is needed.
+  The rule lives in broadcast state under **one fixed key**, so each new rule
+  replaces the last; keying by `ruleId` would hold 120 entries after an hour,
+  since the generator never stops emitting fresh ids.
+  Three bugs the harness caught, all of which compile cleanly: reading broadcast
+  state **before any rule has arrived** returns `null` and NPEs, which would crash
+  every run in its first 30 seconds; an `if` with no `else` **silently drops**
+  every cart-abandoned request whose Product never moved in price; and adding an
+  unconditional second `collect` **doubles** every matched request. The rule is
+  exactly one `collect` per input, with `priceDropMatched` deciding the discount
+  rather than whether the record survives.
+- ✅ Task 6: async I/O and the mocked recommendation service. Two tests green, and
+  verified live on the `recommendation` topic. `AsyncDataStream.orderedWait`, its own
+  operator downstream of the merge, feeding the sink; Phase 3's `RecommendationDecider`
+  is deleted. A `RecommendationClientFactory` travels to the TaskManagers rather than a
+  client, since a client owns an executor and is not serializable.
+  Live evidence: `discountPercent` of 18.0, 10.0 and 6.0 on the topic, where every
+  record before today read `0.0`; `reason` values of `price-drop` and `cart-abandoned`
+  and never `most-viewed-in-session`; and `cart-abandoned` appearing at both `10.0` and
+  `0.0`, which is the structural condition working.
+- ✅ Task 7: end-to-end test of the assembled graph. 27 tests green, three consecutive
+  fresh runs.
+  **The finding worth carrying forward:** a window fires when the **watermark** passes
+  its end, not when its last element arrives. A bounded fixture that stops too early
+  leaves the window and the CEP match both firing at `MAX_WATERMARK`, where their
+  arrival order at the merge is a race, and the test fails intermittently on `reason`.
+  The fix is a **watermark pusher**: one event from another key far in the future, so
+  the operator under test fires during the stream. Any bounded test whose assertion
+  depends on operator ordering needs one.
+- ✅ Task 8: Drill C, a Promo Rule changed mid-run and the topic changed with no
+  restart. All four claims confirmed.
+  The plan's second claim had to be corrected first: it checked that
+  `most-viewed-in-session` records stayed at `0.0`, but since Task 4 those go to
+  `UNMATCHED` and never reach the topic, so the check was unfalsifiable. The real
+  discriminator is a `cart-abandoned` record still reading `0.0` after the injection,
+  meaning its candidate had no price drop.
+  The [runbook](../../runbooks/phase-4-promo-rule-drill.md) carries a **real
+  transcript**, the first in this project to do so; the Phase 0 and Drill B runbooks
+  still have only their predicted-behaviour versions.
+  **Two findings from the recorded run.** A freshly started job knows **no rule at
+  all**: `--start-from-earliest=false` makes the broadcast source start at *latest*, so
+  a rule published before it subscribed is never read, and every discount is `0.0`
+  until the next rule arrives. `PromoRuleApplier`'s `rule != null` guard is what makes
+  that a zero rather than a crash. And the injection takes about **a minute** to show,
+  not one checkpoint interval: a Browsing Session must close *and* have a price-drop
+  match before any record can carry the new rule.
+- ✅ Task 9: documents. Most landed early, as the decisions were made rather than
+  retrofitted: ADR 0008, `CONTEXT.md`, the
+  [Phase 4 knowledge doc](../../knowledge/phase-4-advanced-flink.md), the walkthrough,
+  and supersession notes on the two Phase 2 specs. Finished on 2026-08-30 with
+  [ADR 0009](../../adr/0009-unmatched-click-moves-to-the-merge.md), a superseded-in-part
+  banner on ADR 0003, and the design spec's CEP coverage map corrected from "viewed a
+  competitor, went idle" to the abandoned cart.
+  The sweep for stale claims is clean: every remaining mention of the old wording is
+  inside a document explaining what it supersedes.
+
+**Surfaced for Phase 5 by Task 1, and nothing else records it.** The out-of-stock
+suppression rule means the `recommendation` topic legitimately has ~10% fewer
+records than there are closed Browsing Sessions. Phase 5's HA Drill requires "no
+gap in the recommendation topic", so that check must compare against emitted
+Recommendations, not against Browsing Sessions, or a correct suppression will
+read as a gap.
+
+Seven design decisions were settled before any code, and the two that a later
+phase would otherwise rediscover are these. The CEP pattern is **abandoned
+cart** (VIEW, ADD_TO_CART, no CHECKOUT within 30s), not the "viewed a competitor,
+went idle" pattern the design spec's coverage map still names, because at the
+generator's real rates that one needs a 60 second window spanning ten session
+gaps. And `ProductChange` never enters the job graph at all: the deserializer
+reads the `type` discriminator and collects only `PriceChange`, which closes the
+sealed-interface warning Phase 3 surfaced.
+
+**Surfaced for Phase 5 by Task 0, and nothing else records it.** `runtimeOnly`
+does not keep a jar out of a Shadow fat jar, because Shadow builds from the
+runtime classpath. Five dependencies now carry that scope
+(`flink-streaming-java`, `flink-clients`, `flink-statebackend-rocksdb`,
+`flink-connector-base`, `flink-cep`), and bundling any of them beside a
+distribution that already loads them is a duplicate-class failure. Phase 5 needs
+a dedicated configuration or an explicit exclusion set. Separately,
+`flink-s3-fs-hadoop` was confirmed to live in `opt/`, not `lib/`, which is the
+plugin-directory move ADR 0001 predicted.
 
 ## Phase 5: Operator and HA — ⬜ not started
 

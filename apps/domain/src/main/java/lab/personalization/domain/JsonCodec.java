@@ -7,9 +7,7 @@ import java.util.regex.Pattern;
 
 // Hand-written, not a library: the schemas are small and flat enough that
 // reflection-based JSON mapping isn't worth the dependency (and Java
-// records have their own caveats there). ProductChange's "type" field is
-// exactly what a sealed interface doesn't carry across serialization on
-// its own, see the design doc.
+// records have their own caveats there).
 //
 // Instant.toString() already returns ISO-8601 UTC, e.g.
 // "2026-08-16T10:00:01.123456Z", safe to embed directly, no separate
@@ -24,14 +22,10 @@ public final class JsonCodec {
     }
 
     public static byte[] toJson(ProductChange change) {
-        String json = switch (change) {
-            case PriceChange p -> """
-                    {"type":"PRICE","productId":"%s","eventTime":"%s","newPrice":%s}\
-                    """.formatted(p.productId(), p.eventTime(), p.newPrice());
-            case StockChange s -> """
-                    {"type":"STOCK","productId":"%s","eventTime":"%s","newStock":%d}\
-                    """.formatted(s.productId(), s.eventTime(), s.newStock());
-        };
+        String json = """
+                {"productId":"%s","eventTime":"%s","price":%s,"previousPrice":%s,"stock":%d,"previousStock":%d}\
+                """.formatted(change.productId(), change.eventTime(),
+                change.price(), change.previousPrice(), change.stock(), change.previousStock());
         return json.getBytes(StandardCharsets.UTF_8);
     }
 
@@ -60,12 +54,23 @@ public final class JsonCodec {
     private static final Pattern PRODUCT_ID = stringField("productId");
     private static final Pattern EVENT_TIME = stringField("eventTime");
     private static final Pattern ACTION_TYPE = stringField("actionType");
+    private static final Pattern PRICE = numberField("price");
+    private static final Pattern PREVIOUS_PRICE = numberField("previousPrice");
+    private static final Pattern STOCK = numberField("stock");
+    private static final Pattern PREVIOUS_STOCK = numberField("previousStock");
+    private static final Pattern RULE_ID = stringField("ruleId");
+    private static final Pattern DESCRIPTION = stringField("description");
+    private static final Pattern DISCOUNT_PERCENT = numberField("discountPercent");
 
     private static Pattern stringField(String name) {
         return Pattern.compile("\"" + name + "\"\\s*:\\s*\"([^\"]*)\"");
     }
 
-    public static Click fromJson(byte[] bytes) {
+    private static Pattern numberField(String name) {
+        return Pattern.compile("\"" + name + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)");
+    }
+
+    public static Click clickFromJson(byte[] bytes) {
         String json = new String(bytes, StandardCharsets.UTF_8);
         return new Click(
                 required(json, SHOPPER_ID, "shopperId"),
@@ -74,11 +79,30 @@ public final class JsonCodec {
                 ActionType.valueOf(required(json, ACTION_TYPE, "actionType")));
     }
 
+    public static ProductChange productChangeFromJson(byte[] bytes) {
+        String json = new String(bytes, StandardCharsets.UTF_8);
+        return new ProductChange(
+                required(json, PRODUCT_ID, "productId"),
+                Instant.parse(required(json, EVENT_TIME, "eventTime")),
+                Double.parseDouble(required(json, PRICE, "price")),
+                Double.parseDouble(required(json, PREVIOUS_PRICE, "previousPrice")),
+                Integer.parseInt(required(json, STOCK, "stock")),
+                Integer.parseInt(required(json, PREVIOUS_STOCK, "previousStock")));
+    }
+
+    public static PromoRule promoRuleFromJson(byte[] bytes) {
+        String json = new String(bytes, StandardCharsets.UTF_8);
+        return new PromoRule(
+                required(json, RULE_ID, "ruleId"),
+                required(json, DESCRIPTION, "description"),
+                Double.parseDouble(required(json, DISCOUNT_PERCENT, "discountPercent")));
+    }
+
     private static String required(String json, Pattern pattern, String name) {
         Matcher m = pattern.matcher(json);
         if (!m.find()) {
             throw new IllegalArgumentException(
-                    "Missing string field '" + name + "' in: " + json);
+                    "Missing field '" + name + "' in: " + json);
         }
         return m.group(1);
     }

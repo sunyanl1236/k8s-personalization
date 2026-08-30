@@ -9,3 +9,7 @@ pipeline.generic-types: false
 
 s3.endpoint: http://localhost:30014
 s3.path.style.access: true
+
+taskmanager.memory.process.size: 2gb
+taskmanager.memory.network.min: 256mb
+taskmanager.memory.network.max: 256mb

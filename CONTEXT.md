@@ -23,10 +23,13 @@ A single observed shopper action against a product, carrying an event time that
 may arrive out of order.
 _Avoid_: Event, interaction, click event, pageview
 
-**Price Change**:
-An observed change to a product's price or stock level. A fact about a Product,
-never about a Shopper.
-_Avoid_: Inventory event, stock update
+**Product Change**:
+A snapshot of one Product's price and stock at a point in time, carrying the
+values it replaced. A fact about a Product, never about a Shopper. A *price
+drop* is a Product Change whose `price` is below its `previousPrice`; it is a
+question you ask of the record, not a separate kind of record. See
+[ADR 0008](docs/adr/0008-product-change-as-a-state-snapshot.md).
+_Avoid_: Price Change, Stock Change, inventory event, stock update
 
 **Browsing Session**:
 A run of one Shopper's Clicks with no gap longer than the session gap. Always
@@ -51,9 +54,23 @@ things.
 _Avoid_: Offer, suggestion, personalization, result
 
 **Unmatched Click**:
-A Click that reached the price-change branch on time but found no Price Change
-inside the join interval. Distinct from a Late Click.
+A closed Browsing Session whose candidate Product found no Product Change inside
+the join interval, although its Clicks arrived on time. Distinct from a Late
+Click, which is a timing failure rather than a matching outcome. Counted per
+Browsing Session, not per Click, because `intervalJoin` is an inner join and
+never calls back for a Click that did not match.
 _Avoid_: Dropped click, miss
+
+**Cart Abandonment**:
+The Signal raised when a Shopper views a Product, adds that same Product to the
+cart, and does not check out within 30 seconds. Detected by CEP.
+_Avoid_: Abandoned basket, drop-off, lost sale
+
+**Out of Stock**:
+A candidate Product whose Product Change reports `stock` of zero. Its
+Recommendation is suppressed rather than emitted, and routed to its own side
+output so the suppression can be counted.
+_Avoid_: Sold out, unavailable
 
 **Late Click**:
 A Click whose event time fell behind the watermark and missed its window.

@@ -1,4 +1,4 @@
-package lab.personalization.pipeline;
+package lab.personalization.pipeline.serde;
 
 import lab.personalization.domain.Click;
 import lab.personalization.domain.JsonCodec;
@@ -10,7 +10,7 @@ public class ClickDeserializationSchema implements DeserializationSchema<Click> 
 
     @Override
     public Click deserialize(byte[] message) {
-        return JsonCodec.fromJson(message);
+        return JsonCodec.clickFromJson(message);
     }
 
     public boolean isEndOfStream(Click nextElement) {

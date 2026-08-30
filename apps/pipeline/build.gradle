@@ -12,6 +12,8 @@ ext {
     // own version line: <connector>-<flink-minor>
     kafkaConnectorVersion = '5.0.0-2.2'
     log4jVersion = '2.26.1'
+    junitVersion = '5.11.4'
+    assertjVersion = '3.27.3'
 }
 
 java {
@@ -34,6 +36,19 @@ application {
 
 repositories {
     mavenCentral()
+}
+
+configurations {
+    // Whatever a real cluster provides at runtime, a test JVM must provide for
+    // itself: compileOnly does not reach the test compile classpath on its own.
+    testImplementation.extendsFrom compileOnly
+}
+
+test {
+    useJUnitPlatform()
+    // applicationDefaultJvmArgs covers `run`, not `test`. Reused rather than
+    // copied so the two lists cannot drift.
+    jvmArgs application.applicationDefaultJvmArgs
 }
 
 configurations.all {
@@ -60,6 +75,11 @@ dependencies {
     compileOnly "org.apache.flink:flink-statebackend-rocksdb:${flinkVersion}"
     runtimeOnly "org.apache.flink:flink-statebackend-rocksdb:${flinkVersion}"
 
+    // Provided in the image's lib/ and loaded by default, so the job jar must not
+    // bundle it. Confirmed in Task 0 from flink:2.2.0 and the docs.
+    compileOnly "org.apache.flink:flink-cep:${flinkVersion}"
+    runtimeOnly "org.apache.flink:flink-cep:${flinkVersion}"
+
     implementation "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
 
     // discovered at runtime through ServiceLoader, never referenced from Java
@@ -72,4 +92,14 @@ dependencies {
     runtimeOnly "org.apache.logging.log4j:log4j-slf4j-impl:${log4jVersion}"
     runtimeOnly "org.apache.logging.log4j:log4j-api:${log4jVersion}"
     runtimeOnly "org.apache.logging.log4j:log4j-core:${log4jVersion}"
+
+    testImplementation "org.apache.flink:flink-test-utils:${flinkVersion}"
+    testImplementation "org.junit.jupiter:junit-jupiter:${junitVersion}"
+    testImplementation "org.assertj:assertj-core:${assertjVersion}"
+    // ProcessFunctionTestHarnesses and the *OperatorTestHarness classes live in
+    // the tests classifier of flink-runtime; flink-test-utils pulls only the
+    // plain artifact, so Task 4's harness tests need this declared.
+    testImplementation "org.apache.flink:flink-runtime:${flinkVersion}:tests"
+
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }

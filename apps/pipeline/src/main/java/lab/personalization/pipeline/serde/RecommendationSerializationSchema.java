@@ -1,4 +1,4 @@
-package lab.personalization.pipeline;
+package lab.personalization.pipeline.serde;
 
 import java.nio.charset.StandardCharsets;
 

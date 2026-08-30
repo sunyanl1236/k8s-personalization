@@ -1,7 +1,16 @@
 # ADR 0003: The interval join gets its own `keyBy(productId)` branch, and stays an inner join
 
 Date: 2026-08-10
-Status: accepted
+Status: accepted; the side-output half superseded 2026-08-30 by
+[ADR 0009](0009-unmatched-click-moves-to-the-merge.md)
+
+> **Superseded in part.** The diagram below shows `unmatched: side output`
+> leaving the interval join. That is not implementable: `intervalJoin` is an
+> inner join, so `ProcessJoinFunction` is never invoked for a Click that found
+> nothing and there is no callback in which to emit it. The population moves to
+> the merge operator and is counted per Browsing Session candidate rather than
+> per Click. Everything else here — the keying, the fork from the raw stream, the
+> `connect` merge — still holds.
 
 ## Context
 

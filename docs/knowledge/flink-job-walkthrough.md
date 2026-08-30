@@ -1,22 +1,17 @@
 # Flink job walkthrough: what the pipeline does, with one worked example
 
-Written ahead of Phase 2 through 4, not during them, unlike the other files in
-this folder. This captures the conceptual understanding built before any of
-that code exists, so it is a companion to
-[the phase plan](../superpowers/plans/2026-08-10-implementation-phases.md),
-not a record of a debugging session.
+How the whole job fits together, taught through one worked example whose numbers
+carry from the first section to the last.
 
-One running example is used in every section below, so the same numbers carry
-through the whole pipeline. Terminology note: `Product Change` is the correct
-term below, covering both price and stock moves. `CONTEXT.md`, the phase
-plan, and ADR 0003 still say `Price Change` as of this writing. That rename
-has not been applied to those files yet.
+Terminology follows [CONTEXT.md](../../CONTEXT.md). **Product Change** covers
+both price and stock moves; ADR 0003 still says "Price Change" and has not been
+reworded.
 
 ## The feature, in one sentence
 
-A live recommendation engine. It watches what a shopper does right now,
-checks that against what is happening in the catalogue right now, and pushes
-back a personalized recommendation while the shopper is still on the page.
+A live recommendation engine. It watches what a Shopper does right now, checks
+that against what is happening in the catalogue right now, and pushes back a
+personalized Recommendation while they are still on the page.
 
 ```
 Click ──────────┐
@@ -24,313 +19,392 @@ Product Change ─┼──>  [ Flink job ]  ──> Recommendation
 Promo Rule ─────┘
 ```
 
+## Why the job merges signals at all
+
+The product decides **who gets a discount, and why**. Discounts cost margin:
+
+- give one to a Shopper who would have bought anyway, and it is wasted
+- give one to somebody never interested, and it is wasted twice
+
+No single signal finds the Shoppers a small discount actually converts:
+
+| Signal alone | What it lets you say | Why that is weak |
+|---|---|---|
+| Browsing Session | "you looked at P1 a lot" | a reminder, not an offer |
+| Price drop | "P1 got cheaper" | that is a mass email |
+| Cart Abandonment | "you left P1 behind" | might be full price, might be unbuyable |
+
+Each branch answers a different question:
+
+| Branch | Question |
+|---|---|
+| Session window | what are they interested in **right now**? |
+| Interval join | is there a **reason to act now**? |
+| CEP | is there **hesitation**? |
+| Broadcast rule | what can marketing **afford today**? |
+| Stock | can we **actually sell it**? |
+
+Merged, they make one sentence no branch could produce alone:
+
+> You kept coming back to **P1** this visit, put it in your cart, and its price
+> just dropped. Here is an extra **10% off**. It is in stock.
+
+`reason` records which of those held, as a ladder of how strong the case is:
+
+| `reason` | Evidence | Reaches the sink? |
+|---|---|---|
+| `"cart-abandoned"` | focused, carted, did not buy, price moved | yes, with a discount |
+| `"price-drop"` | focused, price moved near their Click | yes, with a discount |
+| `"most-viewed-in-session"` | focused only, **no trigger** | no, routed to `UNMATCHED` |
+| *(candidate unbuyable)* | `stock == 0` | no, routed to `OUT_OF_STOCK` |
+
+- **A Recommendation is published only when a business event justifies it.**
+  Intent alone is not enough.
+- That narrows Phase 3, which published one per closed Browsing Session. The job
+  now stays quiet rather than sending an offer it cannot justify, costing roughly
+  a fifth of the output volume.
+- `reason` also earns its keep afterwards: it is what lets you measure conversion
+  per signal type, and find out whether the cart-abandonment path is worth the
+  margin it costs.
+
 ## The running example
 
-Two shoppers, two products, one promo rule.
+Two Shoppers, two Products, one Promo Rule. Every later section uses these
+numbers.
 
-Clicks, in the order they happen:
+| Event time | Shopper | Product | Action |
+|---|---|---|---|
+| 10:00:00 | 42 | P1 | VIEW |
+| 10:00:02 | 43 | P2 | VIEW |
+| 10:00:03 | 42 | P2 | VIEW |
+| 10:00:05 | 43 | P1 | VIEW |
+| 10:00:06 | 42 | P1 | ADD_TO_CART |
 
-| Event time | Shopper | Product |
-|---|---|---|
-| 10:00:00 | 42 | P1 |
-| 10:00:02 | 43 | P2 |
-| 10:00:03 | 42 | P2 |
-| 10:00:05 | 43 | P1 |
-
-Product changes:
-
-| Event time | Product | Change |
+| Event time | Product | What moved |
 |---|---|---|
 | 10:00:01 | P1 | price dropped |
 | 10:00:04 | P2 | price dropped |
 
-Promo rule, already loaded before any of this happens, broadcast to every
-parallel piece of the job at once: viewing a product within 2 seconds of its
-own price drop earns an extra 5 percent off.
+Promo Rule, broadcast to every worker before any of this: a Click within 2
+seconds of a price drop earns an extra 5 percent off.
 
-## Why the job forks into two branches
+## The whole job graph
 
-**The problem.** The job needs to answer two different questions about the
-same clicks, and each question needs the clicks grouped a different way.
+Every section below zooms into one part of this.
 
-- What has this one shopper been doing over the last few minutes? Needs every
-  click from one shopper sitting together, regardless of product.
-- Did this click happen near a change on the same product? Needs every click
-  about one product sitting together, regardless of shopper.
+```
+clickstream ──► clicks : DataStream<Click>
+                  │   watermarks assigned ONCE, here, before any fork
+                  │
+     ┌────────────┼────────────────────────┬──────────────────────┐
+     │            │                        │                      │
+ keyBy(shopperId) │                  keyBy(shopperId)       keyBy(productId)
+     │            │                        │                      │
+ session window   │                    CEP within 30s      intervalJoin(-2s,+2s)
+   gap 6s         │                        │                      │
+     │  └► LATE_CLICKS                     │ └► CEP_TIMED_OUT     │
+     │                                     │                      │
+ SessionSignal                             │                 EnrichedClick
+     │                                     │                      │
+   .map                                    │                keyBy(shopperId)
+     │                                     │                      │
+ ShopperSignal ◄──────── union ──────► ShopperSignal              │
+ (BROWSING_SESSION)                   (CART_ABANDONMENT)          │
+                    │                                             │
+               keyBy(shopperId)                                   │
+                    │                                             │
+                    └──────────── connect ◄───────────────────────┘
+                                    │
+                            SignalMerger
+                       processElement1: ShopperSignal
+                       processElement2: EnrichedClick
+                       holds the 60s event-time cooldown
+                                    │
+                     RecommendationRequest ──► UNMATCHED
+                                    │      └─► OUT_OF_STOCK
+                                    │
+                              connect ◄──────── promo-rule (broadcast)
+                                    │
+                            PromoRuleApplier
+                          fills discountPercent
+                                    │
+                     AsyncDataStream.orderedWait
+                       ──► recommendation service (mocked)
+                                    │
+                     Recommendation ──► KafkaSink ──► recommendation topic
+```
 
-One grouping cannot serve both. A `Product Change` has no shopper attached to
-it at all, `CONTEXT.md`'s own definition: a fact about a Product, never about
-a Shopper. There is no shopper key to join it against. Group by product
-instead, and one shopper's clicks scatter across many different product
-groups, so nothing is left in one place to reconstruct that shopper's
-session.
+Four side outputs leave that graph, carrying four different populations.
+Conflating them is the most common misreading of this job.
 
-So the job reads the raw `clickstream` once, then forks it into two
-independently keyed copies.
+| Side output | Leaves from | The question it answers |
+|---|---|---|
+| `LATE_CLICKS` | session window | did this Click arrive **before its window fired**? A *timing* failure |
+| `CEP_TIMED_OUT` | `TimedOutPartialMatchHandler` | was a VIEW **ever followed by a cart**? |
+| `UNMATCHED` | `SignalMerger` | did the candidate find **any nearby Product Change**? A *matching* outcome, not a failure |
+| `OUT_OF_STOCK` | `SignalMerger` | was the candidate unbuyable, so the Recommendation was suppressed? |
 
-**Branch one, `keyBy(shopperId)`:**
+`UNMATCHED` leaves the merge rather than the join, and that is forced:
+`intervalJoin` is an inner join, so `ProcessJoinFunction` is never called for a
+Click that found nothing and there is no callback in which to emit it. See
+[ADR 0009](../adr/0009-unmatched-click-moves-to-the-merge.md).
 
-| Shopper | Their clicks |
+## Why the job forks
+
+Two questions need the same Clicks grouped two different ways:
+
+- **What has this Shopper been doing?** Needs one Shopper's Clicks together,
+  regardless of Product.
+- **Did this Click happen near a change on the same Product?** Needs one
+  Product's Clicks together, regardless of Shopper.
+
+One grouping cannot serve both, and `CONTEXT.md` says why: a Product Change is
+**a fact about a Product, never about a Shopper**. It carries no `shopperId` to
+join on.
+
+**`keyBy(shopperId)`** answers the session question, and never sees Product
+Change data at all:
+
+| Shopper | Their Clicks |
 |---|---|
-| 42 | 10:00:00 on P1, 10:00:03 on P2 |
-| 43 | 10:00:02 on P2, 10:00:05 on P1 |
+| 42 | 10:00:00 P1, 10:00:03 P2, 10:00:06 P1 |
+| 43 | 10:00:02 P2, 10:00:05 P1 |
 
-Answers the session question. Cannot touch `Product Change` data at all.
-
-**Branch two, `keyBy(productId)`:**
+**`keyBy(productId)`** answers the matching question, and cannot reconstruct
+either Shopper's session:
 
 | Product | Clicks | Product Change |
 |---|---|---|
-| P1 | 10:00:00 by 42, 10:00:05 by 43 | 10:00:01, price dropped |
+| P1 | 10:00:00 by 42, 10:00:05 by 43, 10:00:06 by 42 | 10:00:01, price dropped |
 | P2 | 10:00:02 by 43, 10:00:03 by 42 | 10:00:04, price dropped |
-
-Answers the product-change question. Cannot reconstruct either shopper's
-session, since their clicks are split across product groups.
 
 ## Watermarks
 
-**The problem.** Clicks do not arrive in the order they happened, because of
-network delay. Working off arrival order instead of event time would give
-wrong answers, for example a session length that reflects network speed
-instead of shopper behavior. So the job works off the event time embedded in
-each click. That creates a second problem: the job can never be fully sure
-it has seen everything for a given moment, since a delayed click could always
-still show up. It needs a rule for when to stop waiting.
+**The problem:**
 
-**The rule.** The watermark is the job's own moving estimate of "how far back
-in event time have I safely seen everything." One example rule: watermark
-equals the largest event time seen so far, minus a 2 second bound.
+- Clicks do not arrive in the order they happened.
+- Working off arrival order would make a session's length reflect network speed
+  rather than Shopper behaviour, so the job uses the event time inside each Click.
+- But then the job can never be certain it has seen everything for a moment,
+  since a delayed Click could always still show up. It needs a rule for when to
+  stop waiting.
 
-Minus, not plus. The watermark is a claim, and the job cannot claim to have
-seen a point in time it has not reached yet.
+**The rule.** A watermark is the job's moving estimate of *how far back in event
+time it has safely seen everything*: here, the largest event time seen so far
+minus a 2 second bound.
 
-| Newest event time actually seen | Watermark rule | Resulting watermark | What it claims |
-|---|---|---|---|
-| 10:00:13 | minus 2s | 10:00:11 | safely seen through 10:00:11, held back 2s from the front |
-| 10:00:13 | plus 2s (wrong) | 10:00:15 | would falsely claim a point never reached |
+- **Minus, not plus.** A watermark is a claim, and the job cannot claim to have
+  seen a point in time it has not reached.
+- **One shared number**, not per Shopper and not per Product. Any Click from
+  anyone can push it forward, and it never moves backward.
 
-**It is one shared number, not per shopper, not per product.** Every click
-that arrives, from any shopper, can push it forward if that click's event
-time sets a new record. It never moves backward. A later click gets checked
-against whatever this shared number already was, built from every earlier
-click, not from anything about its own arrival time.
+| Step | Click | Event time | Watermark judging it | Late? |
+|---|---|---|---|---|
+| 1 | Shopper A | 10:00:05 | none yet | no |
+| 2 | Shopper B | 10:00:12 | 10:00:03 | no |
+| 3 | Shopper A | 10:00:08 | 10:00:10 | **yes** |
 
-| Step | Click | Event time | Largest event time seen, before this click | Watermark used to judge this click | Late? | Largest event time seen, after |
-|---|---|---|---|---|---|---|
-| 1 | Shopper A | 10:00:05 | none yet | none yet | No | 10:00:05 |
-| 2 | Shopper B | 10:00:12 | 10:00:05 | 10:00:03 | No | 10:00:12 |
-| 3 | Shopper A | 10:00:08 | 10:00:12 | 10:00:10 | Yes | stays 10:00:12 |
+Row 3 is judged late because of Shopper B's earlier Click, a different person,
+not because of anything Shopper A did.
 
-Row 3: Shopper A's own second click gets judged late because of Shopper B's
-earlier click, a different person, not because of anything Shopper A did.
+**Assigned once, before the fork.** Per-branch watermarks could disagree about
+what counts as recent, decided only by which branch ran faster, so the same Click
+would be on time in one branch and late in the other.
 
-**Assigned once, before the fork, not separately per branch.** If each
-branch computed its own watermark from its own copy of the clicks, they could
-disagree about what counts as recent enough, since they do not necessarily
-process at the same speed. The same click could be judged on time by one
-branch and late by the other, decided only by which branch happened to be
-faster at that instant. Sharing one watermark across both branches, computed
-before either one exists, removes that possibility.
+## Session windows, and what "late" actually means
 
-## Session windows
+A Browsing Session is a run of one Shopper's Clicks with no gap longer than the
+session gap. Nothing to do with a browser tab, cookie, or login.
 
-**Definition**, from `CONTEXT.md`: a run of one shopper's clicks with no gap
-longer than the session gap. Nothing to do with a web browser tab, a cookie,
-or a login session. Computed purely from `shopperId` and event timestamps in
-the click data.
+**The end boundary anchors to the most recent Click, not the first**, because the
+question is "how long since activity", not "how long since this started". With a
+6 second gap:
 
-**The window's end boundary anchors to the most recent click, not the
-first.** The session gap answers "how long since the most recent activity,"
-not "how long since this session started." Anchoring to the first click
-would ask a different question and cut real, unbroken sessions into pieces.
-
-Session gap 6 seconds. Shopper 42 clicks at 10:00:00, 10:00:03, 10:00:07,
-10:00:11, each gap under 6 seconds, so all four belong to one session.
-
-| Click, event time | Gap from previous | Boundary before | New boundary, most recent click plus 6s |
-|---|---|---|---|
-| 10:00:00 | first click | none yet | 10:00:06 |
-| 10:00:03 | 3s | 10:00:06 | 10:00:09 |
-| 10:00:07 | 4s | 10:00:09 | 10:00:13 |
-| 10:00:11 | 4s | 10:00:13 | 10:00:17 |
-
-Anchoring to the first click instead would fire the window at 10:00:06,
-before the 10:00:07 click ever arrives, wrongly splitting one session.
-
-## Being behind the watermark is not the same as being too late for a window
-
-**The distinction.** "Is this click behind the shared watermark" and "does
-this click still get counted" are two different checks. The first compares
-one number shared across the whole stream. The second compares the end
-boundary of the one window this specific click belongs to, whether that
-window already exists or is being created right now by this very click.
-
-Session gap 6s, bound 2s, continuing the trace from the watermark section.
-
-| Step | Click | Event time | Shared watermark before | This click's window, boundary | Boundary vs watermark | Outcome |
-|---|---|---|---|---|---|---|
-| 1 | Shopper A, 1st | 10:00:05 | none yet | new, 10:00:11 | not reached | accepted, opens |
-| 2 | Shopper B, 1st | 10:00:12 | 10:00:03 | new, 10:00:18 | not reached | accepted, opens |
-| 3 | Shopper D, 1st | 10:00:09 | 10:00:10 | new, 10:00:15 | not reached | accepted, opens |
-| 4 | Shopper A, 2nd | 10:00:08 | 10:00:10 | existing, extends to 10:00:14 | not reached | accepted, extends |
-| 5 | Shopper C, 1st | 10:00:05 | 10:00:20 (advanced by other clicks) | new, 10:00:11 | already passed | rejected, `Late Click` |
-
-Rows 3 and 4 both had a click behind the shared watermark by the same one
-second, and both were accepted, one opening a fresh window, one extending an
-existing one, because in both cases the click's own window boundary still
-sat ahead of the watermark. Row 5 had the same click's raw event time behind
-the watermark by much more, and even a freshly opened window for it would
-already sit behind the watermark before it could exist. Only row 5 is
-rejected.
-
-**What happens to a row 5 click.** It does not silently disappear. Flink's
-default is to drop an element like this if no side output is configured.
-This project's design, per the phase plan, routes it instead to a `Late
-Click` side output: `OutputTag<Click>`, attached with
-`.sideOutputLateData(...)`, pulled out downstream with `.getSideOutput(...)`.
-Not an error case. At real traffic volume some fraction of clicks always
-arrive too late for their own session, and Phase 8's dashboard uses this
-count as a pipeline health signal, whether the watermark bound is too tight.
-
-## The product-keyed branch: interval join and `Unmatched Click`
-
-Branch two joins each click against `Product Change` events on the same
-product, inside a time window, for example plus or minus 2 seconds.
-
-- Shopper 42's click on P1 at 10:00:00, 1 second before P1's price drop at
-  10:00:01. Inside the window. A match.
-- Shopper 42's click on P2 at 10:00:03, 1 second before P2's price drop at
-  10:00:04. Inside the window. A match.
-- Shopper 43's click on P1 at 10:00:05, 4 seconds after that same drop.
-  Outside the window. Becomes an `Unmatched Click`.
-
-`Unmatched Click` and `Late Click` are easy to conflate. They belong to two
-different branches and check two different things. `Late Click` is a timing
-question on the shopper-keyed branch: did this click arrive before its
-session window already fired. `Unmatched Click` is a matching question on
-the product-keyed branch: did this click, which arrived perfectly on time,
-find a nearby `Product Change` to pair with. Neither is dropped. Both are
-routed to their own side output, kept separate so Phase 8's dashboard can
-show pipeline lateness and business-relevant non-matches as two distinct
-signals.
-
-## Broadcast state: the promo rule
-
-Not grouped by shopper or product. Every parallel worker holds the full,
-current rule set in memory, and a rule change updates every worker at once,
-with no job restart. In the running example, both of shopper 42's clicks
-landed within 2 seconds of a price drop on the same product, so both qualify
-for the rule's extra 5 percent, checked directly against the broadcast state,
-no join required for this part.
-
-## CEP: the multi-step pattern
-
-Watches for one specific ordered sequence over time on the shopper-keyed
-branch, for example: viewed a product, then viewed a second product within 5
-seconds. Shopper 42 viewed P1 at 10:00:00, then P2 at 10:00:03, a 3 second
-gap. The pattern matches. A comparison-shopping signal is raised for shopper
-42.
-
-## Two things with the same name: `Recommendation` vs. the recommendation service
-
-Easy to conflate, and worth stating plainly what each is, and what it is not.
-
-- The **recommendation service** is a separate, external system, called over
-  the network. In a real company it already exists, built and maintained by
-  a different team, since deciding which specific product to suggest is
-  usually a trained-model problem, not something to reimplement inside a
-  streaming job. In this lab it does not exist for real, so Phase 4 mocks it,
-  to give something real to call while building the actual mechanism, async
-  I/O, that does not block the rest of the pipeline while waiting on the
-  reply.
-- **`Recommendation`** is the data record the job writes after that reply
-  comes back. It combines the service's answer with the shopper ID, a
-  timestamp, and whatever else the job knows, and that combined record is
-  what gets published to the `recommendation` topic.
-
-The service produces an answer. `Recommendation` is the record that carries
-that answer forward. One is a program called mid-pipeline. The other is the
-pipeline's own output.
-
-## Re-keying the product branch back to shopper, and why it is not duplication
-
-**The problem.** `keyBy` does not just group data on paper, it physically
-decides which worker handles which piece of data. Same key, same worker.
-Different key, no guarantee of the same worker, and no shared memory between
-workers.
-
-With a 3-worker example:
-
-| Data about shopper 42 | Key used | Worker it lands on |
+| Click | Gap from previous | New boundary |
 |---|---|---|
-| Session and CEP signal | shopperId = 42 | Worker 1 |
-| P1 match | productId = P1 | Worker 2 |
-| P2 match | productId = P2 | Worker 0 |
+| 10:00:00 | first | 10:00:06 |
+| 10:00:03 | 3s | 10:00:09 |
+| 10:00:07 | 4s | 10:00:13 |
+| 10:00:11 | 4s | 10:00:17 |
 
-Each worker holds a genuinely different fact, not a copy of another worker's
-fact. Worker 1 knows the session shape, since it only ever receives clicks
-keyed by shopper, and it never receives `Product Change` data at all, that
-stream is only ever routed by product. Worker 2 and Worker 0 each know
-whether one specific product's clicks landed near that product's own price
-change, since they receive every click on that product from every shopper,
-and they have no visibility into any other product or that shopper's overall
-session. Nothing is duplicated. Each fact exists in exactly one place, the
-only place it could have been computed.
+Anchoring to the first Click would fire at 10:00:06, before the 10:00:07 Click
+arrived, splitting one real session in two.
 
-**Why they still need to end up together.** The job's required output is one
-`Recommendation` per shopper, and no single worker above has enough
-information to produce that alone. Re-keying branch two's output by
-`shopperId` physically moves the P1 and P2 matches to Worker 1, the same
-place the session and CEP data already live. Only after that move can one
-function see all of it at once.
+**Behind the watermark is not the same as too late for a window.** Two different
+checks:
 
-Without this step, the job would instead publish three disconnected facts,
-and something downstream would have to notice they share a `shopperId` and
-stitch them back together itself, rebuilding the same correlation problem
-outside Flink, with none of Flink's tools for it, no windowing, no
-exactly-once state on failure.
+- one compares a number shared across the whole stream
+- the other compares the end boundary of the one window this Click belongs to
 
-## `connect`, not `union`
+| Click | Event time | Watermark | This Click's window | Outcome |
+|---|---|---|---|---|
+| A, 1st | 10:00:05 | none | new, ends 10:00:11 | accepted, opens |
+| B, 1st | 10:00:12 | 10:00:03 | new, ends 10:00:18 | accepted, opens |
+| D, 1st | 10:00:09 | 10:00:10 | new, ends 10:00:15 | accepted, opens |
+| A, 2nd | 10:00:08 | 10:00:10 | existing, extends to 10:00:14 | accepted, extends |
+| C, 1st | 10:00:05 | 10:00:20 | new, ends 10:00:11 | **rejected, Late Click** |
 
-Once everything sits on one worker, per shopper, `connect` combines the two
-differently-typed branches into one function with two entry points,
-`processElement1` for branch one, `processElement2` for branch two, both
-reading and writing the same shared per-key state. `union` requires both
-streams to carry the same type and interleaves them into one processing
-method with no way to tell which branch an element came from, wrong here
-since a session signal and a price-drop match are not interchangeable.
+- Rows 3 and 4 sit behind the watermark by one second each and are still
+  accepted, because their own window boundary is still ahead of it.
+- Only the last row's window would already be behind the watermark before it
+  could exist.
+- A rejected Click is not dropped. Flink's default would drop it, but
+  `.sideOutputLateData(...)` routes it to `LATE_CLICKS`. Phase 8 uses that count
+  to tell whether the watermark bound is too tight.
 
-Shopper 42's state on Worker 1, built up as things arrive:
+## The Product-keyed branch: interval join and `Unmatched Click`
 
-| Arrives via | What it is | Shared state after |
+Each Click is joined against Product Changes on the same Product within ±2
+seconds:
+
+| Click | Nearest change on that Product | Gap | Result |
+|---|---|---|---|
+| 42 on P1 @ 10:00:00 | P1 dropped @ 10:00:01 | 1s | match |
+| 42 on P2 @ 10:00:03 | P2 dropped @ 10:00:04 | 1s | match |
+| 43 on P1 @ 10:00:05 | P1 dropped @ 10:00:01 | 4s | no match |
+
+- **The join matches any Product update, not only price drops.** An
+  `EnrichedClick` carries the Product's `stock`, and filtering to drops would
+  blind the job to Products that went out of stock without a price move, breaking
+  the suppression rule for exactly the Products it exists to catch.
+  `price < previousPrice` is asked later, on the record.
+- **`Unmatched Click` and `Late Click` are different populations.** A Late Click
+  is a *timing* failure: it arrived after its window fired. An Unmatched Click is
+  a *matching* outcome: it arrived on time and there was nothing nearby to pair
+  with. Neither is an error.
+- Because `intervalJoin` is an inner join, the unmatched population is counted at
+  the merge, **once per Browsing Session candidate** rather than once per Click.
+
+## CEP: the abandoned cart
+
+Watches one ordered sequence per Shopper: **viewed a Product, added that same
+Product to the cart, did not check out within 30 seconds.**
+
+Shopper 42 viewed P1 at 10:00:00 and carted it at 10:00:06. No CHECKOUT follows,
+so at 10:00:30 the pattern completes and a `CART_ABANDONMENT` Signal is raised
+for P1.
+
+- **The same-Product link needs an `IterativeCondition`.** The Product is unknown
+  when the job is built, so the condition reads it from the match in progress via
+  `ctx.getEventsForPattern("view")`. A `SimpleCondition` sees only the candidate
+  event and would let any cart complete any view.
+- **`followedBy`, not `next`.** Strict adjacency would require the cart to be the
+  very next Click, which almost never happens.
+- **An absence takes time to prove.** Nothing concludes at 10:00:06; the answer
+  exists only once the window expires. A partial match that never gets a cart goes
+  to `CEP_TIMED_OUT`.
+- **Consequence:** a session closes 6 seconds after its last Click, so roughly
+  60% of abandonments confirm *after* their own session closed and are read by the
+  Shopper's next one.
+
+## Broadcast state: the Promo Rule
+
+- Not grouped by Shopper or Product.
+- Every parallel worker holds the full current rule, and a change updates every
+  worker at once with no restart. That is the property Drill C tests. How that
+  differs from the merge's keyed state is in
+  [the Phase 4 knowledge doc](phase-4-advanced-flink.md).
+- In the running example both of Shopper 42's Clicks landed within 2 seconds of a
+  price drop, so both qualify for the extra 5 percent, checked directly against
+  broadcast state with no join.
+
+## Re-keying and the merge
+
+**`keyBy` physically decides which worker handles which record.** Same key, same
+worker; different key, no guarantee, and workers share no memory. With three
+workers:
+
+| Fact about Shopper 42 | Key | Worker |
 |---|---|---|
-| `processElement1` | session signal, P1 and P2 viewed | session = [P1, P2] |
-| `processElement2` | P1 match | + priceDropMatches = [P1] |
-| `processElement1` | CEP comparison-shopping flag | + comparisonShopping = true |
-| `processElement2` | P2 match | + priceDropMatches = [P1, P2] |
+| session and cart-abandonment Signals | shopperId 42 | Worker 1 |
+| P1 match | productId P1 | Worker 2 |
+| P2 match | productId P2 | Worker 0 |
 
-## End to end: shopper 42's full trip through the job
+- **Nothing is duplicated.** Each worker computed a different fact in the only
+  place it could have been computed. Worker 1 has never received a single Product
+  Change; Worker 2 has no idea what else Shopper 42 did.
+- **So no worker can produce the output alone.** `keyBy(shopperId)` on the join's
+  output physically moves the P1 and P2 matches to Worker 1, where the session
+  data already is.
+- **Skip the merge** and the job publishes three disconnected facts, leaving
+  something downstream to stitch them together with none of Flink's tools: no
+  keyed state, no exactly-once on failure, no event time.
+
+**`connect`, not `union`.** `union` needs one identical type; a Browsing Session
+Signal and an enriched Click carry different payloads. `connect` gives one
+function two typed entry points over the same keyed state:
+
+| Arrives via | What it is | State afterwards |
+|---|---|---|
+| `processElement2` | P1 match, stock 40 | `matchesByProduct = {P1}` |
+| `processElement1` | cart abandonment on P1 | `+ abandonedCarts = {P1}` |
+| `processElement2` | P2 match | `matchesByProduct = {P1, P2}` |
+| `processElement1` | **BROWSING_SESSION, candidate P1** | reads both, **emits**, clears the matches |
+
+- Only `BROWSING_SESSION` emits. The other two write state the session close
+  reads.
+- The two maps have **different lifetimes on purpose**: a price-drop match is
+  about one Click in one session and is spent once read, while "abandoned a cart
+  recently" is a Shopper-level fact that survives a session boundary and expires
+  on its own 60 second timer.
+
+### Three inputs, four outcomes
+
+`"most-viewed-in-session"` is not an input kind, it is an **output label**. Three
+record types arrive:
+
+```
+processElement1   ShopperSignal, kind = BROWSING_SESSION   <- every closed session, always
+processElement1   ShopperSignal, kind = CART_ABANDONMENT   <- optional extra
+processElement2   EnrichedClick                            <- optional extra
+```
+
+Only the first is guaranteed, so `reason` names which extras turned up:
+
+```java
+reason = cartAbandoned ? "cart-abandoned"
+       : priceDropped  ? "price-drop"
+       : "most-viewed-in-session";     // neither extra arrived
+```
+
+So `reason == "most-viewed-in-session"` is **exactly** the
+`!priceDropped && !cartAbandoned` case, the same condition that routes to
+`UNMATCHED`. They are one case, not two.
+
+## Async I/O, and two things called "recommendation"
+
+| | What it is |
+|---|---|
+| the **recommendation service** | an external system called over the network. Another team owns it in a real company, because choosing which Product to suggest is a trained-model problem. Phase 4 mocks it |
+| **`Recommendation`** | the record written afterwards, combining the service's answer with what the job already knew |
+
+One is a program called mid-pipeline; the other is the pipeline's output.
+
+- The call is **its own operator**, `AsyncDataStream.orderedWait(...)`, downstream
+  of the merge. A `KeyedCoProcessFunction` cannot make it and stay correct.
+- **`orderedWait`, not `unorderedWait`.** Unordered reorders records between
+  watermarks, and Phase 3's restart Drill asserts identical output.
+- The point of async I/O is keeping many requests in flight instead of stalling
+  the subtask on every reply.
+
+## End to end: Shopper 42's trip
 
 1. Click at 10:00:00 on P1 enters `clickstream`, gets its watermark, forks.
-2. Shopper-keyed branch: shopper 42's session window opens.
-3. Product-keyed branch: matched against P1's price drop, 1 second away.
-4. Click at 10:00:03 on P2 arrives. Session window extends, 3 second gap,
-   still one session. Product-keyed branch: matched against P2's price drop,
-   1 second away.
-5. CEP: P1 then P2 within 5 seconds, comparison-shopping signal raised.
-6. Broadcast promo rule: both matches qualify for the extra 5 percent.
-7. Branch two's two matches get re-keyed to shopper 42, moved to the same
-   worker as the session and CEP data.
-8. One `connect`-based function now holds all of it: the session, the CEP
-   flag, both price-drop matches.
-9. That function calls the recommendation service asynchronously: shopper
-   42, comparing P1 and P2, both recently discounted. Mocked reply: suggest
-   P2.
-10. The function packages the reply with everything else into one
-    `Recommendation`: shopper 42, suggest P2, 5 percent price-drop bonus,
-    reason comparison-shopping. Published to `recommendation`.
+2. Shopper-keyed: 42's session window opens.
+3. Product-keyed: matched against P1's price drop one second away.
+4. Click at 10:00:03 on P2 extends the session, and matches P2's drop.
+5. Click at 10:00:06 carts P1. Nothing concludes yet.
+6. At 10:00:30 the CEP window expires with no CHECKOUT: `CART_ABANDONMENT` on P1.
+7. Both matches are re-keyed to Shopper 42, landing on the worker holding the
+   session data.
+8. The session closes with candidate P1, which is abandoned, price-drop matched,
+   and in stock, so `SignalMerger` emits a `RecommendationRequest` with
+   `reason = "cart-abandoned"`.
+9. `PromoRuleApplier` fills in the extra 5 percent from broadcast state.
+10. Async I/O asks the mocked service, which replies "suggest P2".
+11. A `Recommendation` is published: Shopper 42, suggest P2, 5 percent off,
+    reason cart-abandoned.
 
-Shopper 43's click on P1 at 10:00:05, 4 seconds after that product's price
-drop, misses the join window and becomes an `Unmatched Click` instead, a
-normal outcome, not an error, and not part of shopper 43's eventual
-`Recommendation` reasoning for this product.
+Shopper 43's Click on P1 at 10:00:05 is four seconds after that Product's drop,
+so it never matches. If P1 is also 43's candidate when their session closes, that
+session is counted in `UNMATCHED` and no Recommendation is published for it.

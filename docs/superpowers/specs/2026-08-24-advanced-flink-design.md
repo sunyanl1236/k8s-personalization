@@ -91,70 +91,82 @@ join's own bookkeeping, which is the thing ADR 0003 rejected to keep the real
 operator in play, and it adds a third shuffle on the clickstream for a side
 output nothing reads until Phase 8.
 
-### The `product-change` topic is read as `PriceChange`, not `ProductChange`
+### `Product Change` is one state snapshot, not a sum type
 
-**The problem.** `ProductChange` is a sealed interface. A sealed interface is
-not a POJO by Flink's rules, and Phase 3 sets `pipeline.generic-types: false`,
-so it cannot silently become a Kryo type either. A `DataStream<ProductChange>`
-throws at job-graph construction, before the first record.
+Recorded in full as [ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md).
+Summarised here because the rest of this design depends on it.
 
-**The decision.** The deserializer reads the `type` discriminator that
-`JsonCodec` already writes on the wire and collects only `PriceChange`, which is
-a plain record and a valid Flink POJO. `StockChange` records are read and not
-collected. `ProductChange` never enters the job graph.
+**The problem.** `ProductChange` was a sealed interface. Asked directly, Flink
+2.2 answers `GenericTypeInfo` and `KryoSerializer` for it, while both variants
+resolve to `PojoTypeInfo`. `pipeline.generic-types: false` turns that Kryo
+fallback into a hard failure at job-graph construction, so a sum type can never
+be a stream element type here.
+
+Two further findings turned a workaround into a redesign. Nothing in the project
+consumes `StockChange`: it is named twenty-five times across the documents and
+never once read. And `PriceChange` carries no previous price, so "price *drop*"
+has never been checkable, even though the generator stamps every Promo Rule with
+`"N% off, price-drop bonus"`.
+
+**The decision.** One record carrying the Product's full state and the state it
+replaced. `PriceChange` and `StockChange` are deleted.
 
 ```java
-public class PriceChangeDeserializationSchema
-        implements DeserializationSchema<PriceChange> {
+public record ProductChange(String productId, Instant eventTime,
+                            double price, double previousPrice,
+                            int stock, int previousStock) {}
+```
+
+No discriminator, no nullable field, every field always a real value. On a
+Product's first event the previous values equal the current ones.
+
+| Question | Expression |
+|---|---|
+| Did the price drop? | `price < previousPrice` |
+| Is the Product out of stock? | `stock == 0` |
+| Did stock move? | `stock != previousStock` |
+
+**Stock gets a job**, which is what justifies keeping it: a Recommendation is
+suppressed when its candidate Product is out of stock, routed to a fourth side
+output rather than dropped.
+
+**The join must not filter on the drop.** This is the consequence most easily
+got wrong. If only price drops reach the interval join, the merge never learns
+the stock of a Product that went out of stock without a price move, and the
+suppression rule silently fails for exactly the Products it exists to catch. So
+the join matches **any** Product update near a Click, and `EnrichedClick`
+carries the values the merge then tests.
+
+**Two generator changes**, both deliberate synthetic-data choices in the spirit
+of Phase 3's derived session gap. `ProductChangeFactory` keeps a ten-entry map
+of each Product's last price and stock. And stock is `0` with probability `0.1`
+rather than the natural `random.nextInt(501)`, which would fire the suppression
+rule about once in five hundred events and make it unobservable.
+
+**The wire format drops `"type"`**, since a discriminator restating what the
+fields already say is a second source of the same fact.
+
+The deserializer becomes one schema with no narrowing:
+
+```java
+public class ProductChangeDeserializationSchema
+        implements DeserializationSchema<ProductChange> {
 
     @Override
-    public void deserialize(byte[] message, Collector<PriceChange> out) {
-        ProductChange change = JsonCodec.productChangeFromJson(message);
-        if (change instanceof PriceChange price) {
-            out.collect(price);
-        }
+    public ProductChange deserialize(byte[] message) {
+        return JsonCodec.productChangeFromJson(message);
     }
 
     @Override
-    public PriceChange deserialize(byte[] message) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public TypeInformation<PriceChange> getProducedType() {
-        return TypeInformation.of(PriceChange.class);
+    public TypeInformation<ProductChange> getProducedType() {
+        return TypeInformation.of(ProductChange.class);
     }
 }
 ```
 
-It stays a `DeserializationSchema`, matching `ClickDeserializationSchema` and
-keeping `setValueOnlyDeserializer(...)` on the `KafkaSource` builder. The
-`Collector` overload is the one that can emit zero records, which is how a
-`StockChange` is dropped. The single-value `deserialize` is then unreachable,
-because Flink calls the `Collector` form when it is overridden.
-
-**Why dropping `StockChange` is not a loss.** Nothing consumes it. `CONTEXT.md`
-names the domain term **Price Change**, ADR 0003 describes the join as
-clickstream against a price-change stream, and no later phase lists stock
-levels. The sealed interface is still doing its real job in `JsonCodec`, where
-the exhaustive `switch` guarantees both variants get written. The pipeline
-simply does not need the sum type on the read side.
-
-Rejected: **a custom `TypeInfoFactory` registered via
-`pipeline.serialization-config`.** It works, and it keeps `:domain`
-Flink-free because that route needs no `@TypeInfo` annotation. Rejected on cost.
-A `TypeInfoFactory` alone is not enough. It must return a `TypeInformation`,
-which must supply a `TypeSerializer`, which for a sum type writes a tag and
-delegates. Any `TypeSerializer` reaching state or a checkpoint also needs a
-`TypeSerializerSnapshot`, and Phases 5 through 7 restore from checkpoints and
-savepoints repeatedly, so that snapshot is a compatibility contract this project
-actually exercises. Roughly 150 lines and about 3 hours, in a 13 hour phase
-whose stated overrun risk is CEP.
-
-Rejected: **one flat `ProductChangeRecord` POJO with a kind discriminator, split
-into typed streams after the source.** Consistent with the `ShopperSignal`
-decision below, and it keeps `StockChange` available. Rejected because it pays
-the unused-field cost a second time in one phase for a stream with no consumer.
+Alternatives and their costs are in ADR 0008. The main one rejected was a custom
+`TypeInfoFactory` plus `TypeSerializer` plus `TypeSerializerSnapshot`, about 150
+lines and a checkpoint-compatibility contract for Phases 5 through 7.
 
 ### The CEP pattern is an abandoned cart, not the pattern the spec names
 
@@ -264,7 +276,7 @@ branches write into keyed state that the session close reads.
 
 | Input | Effect |
 |---|---|
-| `processElement2(EnrichedClick)` | put `productId` into `priceDropMatches` |
+| `processElement2(EnrichedClick)` | record the Product's `stock`; if `price < previousPrice`, put the `EnrichedClick` into `matchesByProduct` |
 | `processElement1(CART_ABANDONMENT)` | put `productId` into `abandonedCarts` |
 | `processElement1(BROWSING_SESSION)` | read both maps for the candidate Product, emit, clear both maps |
 
@@ -277,8 +289,12 @@ session closes, which is the rate Phase 3 sized its Drill around. And `reason`
 becomes the field carrying which branches contributed, which is what the Phase 3
 design says `reason` exists for.
 
-`reason` precedence, most specific first: `"cart-abandoned"`, then
-`"price-drop"`, then Phase 3's `"most-viewed-in-session"`.
+A candidate Product whose recorded `stock` is `0` is suppressed before any of
+this, routed to the `OUT_OF_STOCK` side output and never reaching the sink.
+
+For everything that does emit, `reason` precedence is, most specific first:
+`"cart-abandoned"`, then `"price-drop"`, then Phase 3's
+`"most-viewed-in-session"`.
 
 **Both lookups are narrowed to the candidate Product, and that narrowing is
 load-bearing.** The candidate is the most-clicked Product of the Browsing
@@ -287,9 +303,59 @@ Products, so an unnarrowed check would put `reason = "cart-abandoned"` on
 roughly 80 percent of Recommendations and drown the other two values. Narrowed
 to the candidate it lands near 15 percent.
 
-**State is bounded by the clear on session close.** An event-time timer is the
-safety net for a Shopper whose session never closes, so an `EnrichedClick` for
-an idle Shopper cannot pin state forever.
+**The two maps have different lifetimes, and that is deliberate.** Decided
+2026-08-28, after working the timing through.
+
+A cart abandonment is confirmed `cep-within` (30s) after the VIEW, because an
+absence cannot be proven any sooner. A Browsing Session closes 6s after its last
+Click and spans about 40s. So a VIEW in the first ~16 seconds of a session
+confirms in time and later ones do not: roughly **40% land in their own session,
+60% arrive after it closed**.
+
+Those 60% are **not lost**. The write lands after the session-close clear, so the
+entry survives and the Shopper's *next* session close reads it. The effect is
+attribution one session late, not disappearance.
+
+The resolution is that the two facts are not the same kind of fact:
+
+| Fact | Scope | Why |
+|---|---|---|
+| price-drop match | **this Browsing Session** | it is about a specific Click near a specific price move |
+| cart abandonment | **this Shopper, for a while** | "abandoned a cart on P1 recently" survives a session boundary |
+
+So `matchesByProduct` clears on session close. `abandonedCarts` expires on its
+own event-time timer, **60 seconds** after the abandonment, which is derived
+rather than picked. A Shopper produces about 0.04 cart abandonments per second:
+
+| TTL | Retained | Share of Recommendations reading `"cart-abandoned"` |
+|---|---|---|
+| clear on session close | ~0.4 | too few, and 60% silently discarded |
+| **60s** | **~2.4 across 10 Products** | **~21%**, matching the design's expectation |
+| 5 min | ~12 | most Products in the set, swamping the other reasons |
+
+60 seconds is also the existing cooldown, so the job has one retention horizon
+rather than two.
+
+**The argument that actually carries this decision is bounded staleness, not
+loss.** With clear-on-session-close, how long an abandonment survives depends on
+when the Shopper next browses. A Shopper who wanders off leaves the entry in
+state until they return, possibly hours later, and it is then applied as though
+fresh. State stays bounded, at most one entry per Product, but it goes stale
+without limit. A timer makes retention a stated 60 seconds instead of an
+emergent property of Shopper behaviour.
+
+Rejected: **clear both maps on session close.** Simpler, no timer, and it loses
+nothing. Rejected only on that staleness argument, which makes it a close call
+rather than a clear one.
+
+**State stays bounded** by the session-close clear on one map and the timer on
+the other, so an `EnrichedClick` for a Shopper who never closes a session cannot
+pin state forever.
+
+Rejected: **shorten `cep-within` to about 10s** so abandonments confirm before
+their session closes. No merge changes at all. Rejected because "did not check
+out within 10 seconds" is a weak claim about hesitation: it changes what the
+Signal means in order to make a plumbing problem go away.
 
 ### Promo Rules: structural condition, latest rule wins
 
@@ -323,13 +389,22 @@ under which the interval join affects the output. If every Recommendation got
 the discount, the whole Product-keyed branch could be deleted and the
 `recommendation` topic would look identical apart from `reason`.
 
-**Expected split, and a correction to an earlier figure.** The 33 percent
-interval-join match rate is per Click. Per Recommendation it is much higher,
-because the candidate is the most-clicked Product and gets several chances to
-match: roughly 80 percent of Recommendations carry a discount and 20 percent sit
-at `0.0`. Both populations are non-empty in every run, which is what the
-assertion test and the Drill need, and the high rate makes a mid-run rule change
-visible within seconds.
+**Expected split.** Under ADR 0008 the join matches any Product update, while
+the discount needs a genuine price drop, so the two rates differ. At the
+generator's defaults of 1.0 Product Changes per second over 10 Products with a 4
+second window:
+
+| Population | Share |
+|---|---|
+| Clicks matching any Product update | 33% |
+| Clicks matching a genuine price drop | about 12% |
+| Recommendations carrying a discount | about 41% |
+| Recommendations suppressed, out of stock | about 10% |
+| Browsing Sessions reaching `UNMATCHED` | about 20% |
+
+Per Recommendation the figures beat the per-Click ones because the candidate is
+the most-clicked Product and gets several chances to match. Every population is
+non-empty in every run, which is what the assertion tests and the Drills need.
 
 Rejected: **max over all active rules, keeping every rule in state.** Exercises
 `MapState` iteration properly, which a single entry does not. Rejected because
@@ -451,13 +526,17 @@ Watermarks are still assigned once on the raw stream, before the fork, per ADR
 0003. Assigning them per branch would let the two sides drift and make the
 merge's event time meaningless.
 
-Three side outputs now exist, and they carry three different populations:
+Four side outputs now exist, and they carry four genuinely different
+populations:
 
 | Side output | Source | Meaning |
 |---|---|---|
 | `LATE_CLICKS` | session window, Phase 3 | Click behind the watermark, missed its window |
 | `CEP_TIMED_OUT` | `TimedOutPartialMatchHandler` | viewed and never carted inside 30s |
-| `UNMATCHED` | merge operator | candidate Product found no Price Change in the interval |
+| `UNMATCHED` | merge operator | candidate Product found no Product Change in the interval |
+| `OUT_OF_STOCK` | merge operator | candidate Product had `stock == 0`, so the Recommendation was suppressed |
+
+The fourth exists because a suppression nobody can count is a bad rule.
 
 ## New types
 
@@ -466,12 +545,13 @@ what Flink's POJO rules require.
 
 ```java
 public record EnrichedClick(String shopperId, String productId, Instant clickTime,
-                            double newPrice, Instant priceChangeTime) {}
+                            double price, double previousPrice,
+                            int stock, Instant changeTime) {}
 
 public enum SignalKind { BROWSING_SESSION, CART_ABANDONMENT }
 
-public record ShopperSignal(String shopperId, SignalKind kind, Instant eventTime,
-                            String productId, int clickCount) {}
+public record ShopperSignal(String shopperId, SignalKind kind,
+                            Instant eventTime, String productId) {}
 
 public record RecommendationRequest(String shopperId, String candidateProductId,
                                     boolean priceDropMatched, boolean cartAbandoned,
@@ -479,9 +559,17 @@ public record RecommendationRequest(String shopperId, String candidateProductId,
                                     Instant generatedAt) {}
 ```
 
-`clickCount` is meaningful only for `BROWSING_SESSION`. That unused field is the
-price of the union, and Flink's rejection of sealed interfaces leaves no
-alternative.
+Four fields, and every one is meaningful for **both** kinds: `eventTime` is the
+window end for a Browsing Session and the pattern's completion time for a cart
+abandonment, while `productId` is the candidate Product in one case and the
+abandoned Product in the other.
+
+An earlier draft also carried `clickCount`, on the reasoning that `SessionSignal`
+has it. Nothing downstream reads it: neither `RecommendationRequest` nor
+`Recommendation` carries a click count, so it would have crossed a shuffle on
+every record for no consumer. `SessionSignal` keeps it for the session branch's
+own output. The rule is that a transport type carries what its **consumer**
+reads, not the union of what its producers happen to know.
 
 `SessionSignal` survives unchanged. A chained `.map()` converts it, which costs
 no shuffle, so Phase 3's `SessionAggregator` and its Drill stay exactly as
@@ -499,23 +587,59 @@ the reason Phase 3 established.
 
 | Artifact | Scope | Why |
 |---|---|---|
-| `flink-cep:2.2.0` | **open, see below** | The Pattern API |
+| `flink-cep:2.2.0` | `compileOnly` + `runtimeOnly` | The Pattern API. Provided in the image's `lib/`, see below |
 | `flink-test-utils:2.2.0` | `testImplementation` | Bounded-job tests |
-| `flink-streaming-java:2.2.0` test-jar | `testImplementation` | `ProcessFunctionTestHarnesses` |
+| `flink-runtime:2.2.0:tests` | `testImplementation` | `ProcessFunctionTestHarnesses` and the `*OperatorTestHarness` classes. **Confirmed 2026-08-28**, see below |
 | JUnit 5 | `testImplementation` | No test framework exists yet |
 | AssertJ | `testImplementation` | Readable assertions on collected output |
 
-**`flink-cep`'s scope is genuinely open and gets checked first.** It is not
-bundled in `flink-dist` the way `flink-connector-base` turned out to be, so the
-`compileOnly` plus `runtimeOnly` pattern the other Flink modules use may be
-wrong here. Whether it needs `implementation` depends on how Phase 5 builds its
-fat jar and its operator image. This is the same shape of problem Task 3 hit,
-so it is checked before any CEP code is written, the way Task 0 checked the
-Operator version.
+**`flink-cep`'s scope, resolved 2026-08-24.** Two sources agree that the official
+distribution provides it, so the job must not bundle it.
 
-The exact artifact coordinate for `ProcessFunctionTestHarnesses` is reasoning
-from the documentation, not a verified fact. It gets confirmed when that task
-starts.
+The `flink:2.2.0` image holds `lib/flink-cep-2.2.0.jar`. The
+[advanced configuration page][d-advanced] explains the shape behind that:
+
+> the Flink Core Dependencies do not contain any connectors or libraries (i.e.
+> **CEP**, SQL, ML) ... The `/lib` directory of the Flink distribution
+> **additionally** contains various JARs including commonly used modules ...
+> These are loaded by default
+
+So CEP is not inside `flink-dist.jar`, but it ships as a separate jar in `lib/`
+and is on the classpath by default. Scope is `compileOnly` plus `runtimeOnly`,
+matching `flink-streaming-java`.
+
+**Two things this check surfaced that Phase 5 needs, and nothing else records.**
+
+`flink-s3-fs-hadoop` is in `opt/`, not `lib/`. It is shipped and **not** on the
+classpath. ADR 0001 predicted it becomes a plugin directory in Phase 5, and the
+image confirms it.
+
+More importantly, `runtimeOnly` alone will not keep these jars out of Phase 5's
+fat jar. Gradle's Shadow plugin builds from the runtime classpath, so every
+`runtimeOnly` dependency gets bundled. Today that set is
+`flink-streaming-java`, `flink-clients`, `flink-statebackend-rocksdb`,
+`flink-connector-base`, and now `flink-cep`. Bundling any of them alongside a
+distribution that already loads them is the duplicate-class problem the
+`compileOnly` split exists to avoid. Phase 5 needs a dedicated configuration or
+an explicit Shadow exclusion set. The scope declaration expresses the intent;
+it does not by itself enforce it.
+
+The `lib/` guarantee also holds only for an unmodified image. The same page
+notes those jars "can be removed from the classpath just by removing them from
+the `/lib` folder", so a slimmed base image in Phase 5 would invalidate this.
+
+**The artifact holding `ProcessFunctionTestHarnesses` is resolved, 2026-08-28.**
+It is not `flink-streaming-java`, and `flink-test-utils` does not bring it: that
+pulls only the plain `flink-runtime`. Both `ProcessFunctionTestHarnesses` and
+the `*OperatorTestHarness` base classes live in the **tests classifier** of
+`flink-runtime`, so it must be declared:
+
+```groovy
+testImplementation "org.apache.flink:flink-runtime:${flinkVersion}:tests"
+```
+
+Verified by locating the classes inside `flink-runtime-2.2.0-tests.jar` and then
+compiling and running a test that imports them.
 
 ## Testing
 
@@ -585,7 +709,7 @@ it, and Task 9's Drill could not exercise the sink it is meant to prove.
 | Document | Change |
 |---|---|
 | [ADR 0003](../../adr/0003-interval-join-key-and-semantics.md) | Amendment, or a superseding ADR: `intervalJoin` cannot emit the `Unmatched Click` side output, so it moves to the merge and changes grain |
-| [design spec](2026-07-25-flink-k8s-personalization-design.md) | The coverage map's CEP line still says "viewed a product repeatedly, viewed a competitor, went idle" |
+| [design spec](2026-07-25-flink-k8s-personalization-design.md) | ~~The coverage map's CEP line~~ **corrected 2026-08-30** to the abandoned cart |
 | [walkthrough](../../knowledge/flink-job-walkthrough.md) | Step 9 puts the async call inside the merge function. Async I/O is its own operator |
 | `CONTEXT.md` | The glossary says **Price Change** while the topic is `product-change` and the type is `ProductChange`. Add **Cart Abandonment**. Restate **Unmatched Click** at its new grain |
 | [status.md](../plans/status.md) | Phase 4 progress, and closing the `ProductChange` warning Phase 3 surfaced |
@@ -600,7 +724,7 @@ one-per-phase pattern.
 | CEP overruns, as the design spec predicts | The phase passes 16 hours | The spec pre-agrees the fallback: trim CEP to a single pattern before cutting anything from the Kubernetes HA side. This design already uses a single pattern, so the remaining trim is dropping `TimedOutPartialMatchHandler` and its side output |
 | `flink-cep` packaging is wrong for Phase 5's fat jar | Rework after Phase 4 is written | Checked before any CEP code, as this phase's Task 0 |
 | Async I/O reorders output and fails Phase 3's Drill | A Drill fails for a reason that is not a bug | `orderedWait`, plus a mock whose reply is a pure function of the request |
-| The union's unused `clickCount` field spreads | Wide records with optional fields everywhere | The union exists once, on the Shopper side only, because Flink's type system forces it. The Product side stays typed |
+| The union type accretes fields its consumer does not read | Wide records with optional fields, copied across a shuffle for nobody | `ShopperSignal` carries only what the merge reads, four fields, all meaningful for both kinds. Adding one because a producer happens to know it is the failure mode |
 
 ## Out of scope
 
@@ -620,3 +744,4 @@ one-per-phase pattern.
 [d-join]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/datastream/operators/joining.md
 [d-broadcast]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/datastream/fault-tolerance/broadcast_state.md
 [d-process]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/datastream/operators/process_function.md
+[d-advanced]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/advanced.md

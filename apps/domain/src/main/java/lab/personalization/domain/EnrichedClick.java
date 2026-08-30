@@ -2,13 +2,14 @@ package lab.personalization.domain;
 
 import java.time.Instant;
 
-public record ProductChange(
+public record EnrichedClick(
+        String shopperId,
         String productId,
-        Instant eventTime,
+        Instant clickTime,
         double price,
         double previousPrice,
         int stock,
-        int previousStock) {
+        Instant changeTime) {
 
     public boolean priceDropped() {
         return price < previousPrice;

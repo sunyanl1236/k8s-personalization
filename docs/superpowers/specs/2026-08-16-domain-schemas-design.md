@@ -35,6 +35,17 @@ clickstream, not needed by anything currently in the phase plan.
 
 ### `Product Change`
 
+> **Superseded 2026-08-28 by
+> [ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md).** The sealed
+> interface below cannot be a Flink stream element type: Flink 2.2 resolves
+> `ProductChange` to `GenericTypeInfo` and `KryoSerializer`, which
+> `pipeline.generic-types: false` rejects. So the compile-time guarantee this
+> section pays for was only ever available inside `JsonCodec`, never inside an
+> operator. `ProductChange` is now one record carrying price, stock, and the
+> values they replaced. The rest of this section is kept as the record of what
+> was decided in Phase 2 and why.
+
+
 ```java
 public sealed interface ProductChange permits PriceChange, StockChange {}
 public record PriceChange(String productId, Instant eventTime, double newPrice) implements ProductChange {}

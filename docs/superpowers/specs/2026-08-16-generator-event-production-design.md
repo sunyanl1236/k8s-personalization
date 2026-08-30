@@ -1,7 +1,16 @@
 # Generator event-production design
 
 Date: 2026-08-16
-Status: approved (design), not yet implemented
+Status: approved (design), implemented; partly superseded 2026-08-28
+
+> **Superseded in part by
+> [ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md).**
+> `PriceChange` and `StockChange` no longer exist, and the wire format's
+> `"type"` field is gone: one `ProductChange` record now carries price, stock,
+> and the values they replaced, so a discriminator would only restate what the
+> fields already say. `ProductChangeFactory` also keeps a ten-entry map of each
+> Product's last event, and emits `stock` of zero with probability 0.1 so the
+> out-of-stock rule can be observed. Everything else here still holds.
 Derives from: [domain schemas design](2026-08-16-domain-schemas-design.md),
 Phase 2 of
 [the implementation plan](../plans/2026-08-10-implementation-phases.md).

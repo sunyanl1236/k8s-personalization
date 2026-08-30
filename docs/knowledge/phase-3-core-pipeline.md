@@ -837,9 +837,17 @@ during Task 3. It only mattered *because* this flag is false. With the flag at
 its default, `Instant` would have gone quietly to Kryo and nobody would have
 checked.
 
-**`ProductChange` fails, on purpose.** It is a sealed interface over
-`PriceChange` and `StockChange`. An interface is not a POJO, so there is no
+**`ProductChange` failed, on purpose.** It was a sealed interface over
+`PriceChange` and `StockChange`. An interface is not a POJO, so there was no
 schema to generate from.
+
+> **Resolved 2026-08-28 by
+> [ADR 0008](../adr/0008-product-change-as-a-state-snapshot.md).** Phase 4 did
+> not add a custom `TypeInformation`, and did not split the stream into two
+> typed branches. It removed the sum type: `ProductChange` is now one record
+> carrying `price`, `previousPrice`, `stock`, and `previousStock`. The
+> mechanism described below is still exactly why the old model could not work,
+> which is why it is kept.
 
 ```
 default (generic-types: true)     ->  Kryo, silently. Job runs. Problem hidden.
@@ -1311,7 +1319,7 @@ either an open question in the design or something that cost real time.
 3. **`flink-connector-base` is not transitive.** Flink bundles it in
    `flink-dist`, so nothing pulls it in for a `MiniCluster` run.
 4. **`flink-s3-fs-native` is not published to Maven Central at any version.** See
-   [ADR 0007](../adr/0007-s3-filesystem-plugin.md).
+   [ADR 0008](../adr/0007-s3-filesystem-plugin.md).
 5. **`FileSystem.initialize` is required and its failure names AWS.** See the
    section above on the static registry.
 6. **A checkpoint directory without `_metadata` is not a checkpoint.** Restoring

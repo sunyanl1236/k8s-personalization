@@ -245,7 +245,7 @@ made during its run is discarded.
 | Keyed state | `KeyedProcessFunction` maintaining per-user running state |
 | Operator state | Checkpointed generator/source state |
 | Broadcast state | Live promo/discount rule updates without redeploying the job |
-| CEP | Multi-step behavior pattern: viewed a product repeatedly, viewed a competitor, went idle, triggers a real-time offer |
+| CEP | Multi-step behavior pattern: **abandoned cart** — viewed a Product, added that same Product to the cart, did not check out within 30s. Superseded the original "viewed repeatedly, viewed a competitor, went idle", which fires on 83% of Clicks at the generator's real rates and so carries no information. See the [Phase 4 design](2026-08-24-advanced-flink-design.md) |
 | Interval join | Clickstream joined against an inventory/price-change event stream |
 | Async I/O | Call to a mocked external recommendation service per relevant event |
 | Checkpointing / savepoints | Exactly-once delivery to the recommendation sink; savepoint-based redeploys when rule *logic* (not just broadcast state) changes |

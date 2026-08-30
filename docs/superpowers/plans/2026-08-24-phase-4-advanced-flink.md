@@ -6,7 +6,7 @@ the `recommendation` topic changes without a restart.
 
 **Architecture:** The raw watermarked clickstream forks three ways. Two
 Shopper-keyed branches (session window, CEP) union into one `ShopperSignal`. One
-Product-keyed branch runs an interval join against `PriceChange` and re-keys its
+Product-keyed branch runs an interval join against `ProductChange` and re-keys its
 output to `shopperId`. The two sides `connect` in a `KeyedCoProcessFunction`
 that emits only on a Browsing Session close. A stateless
 `BroadcastProcessFunction` then applies the active Promo Rule, and
@@ -48,16 +48,16 @@ Phase 3 Task 6 creates, so it cannot start earlier.
 
 | # | Task | Status |
 |---|---|---|
-| 0 | Confirm how `flink-cep` is packaged | not started |
-| 1 | `JsonCodec` reverse direction, and the `PriceChange` source | not started |
-| 2 | Test infrastructure, the interval join, and `EnrichedClick` | not started |
-| 3 | CEP: abandoned cart and `ShopperSignal` | not started |
-| 4 | The `connect` merge and the `UNMATCHED` side output | not started |
-| 5 | Broadcast Promo Rules | not started |
-| 6 | Async I/O and the mocked recommendation service | not started |
-| 7 | End-to-end test of the assembled graph | not started |
-| 8 | Drill C: change a Promo Rule mid-run | not started |
-| 9 | Documents: ADR amendment, glossary, knowledge doc, status | not started |
+| 0 | Confirm how `flink-cep` is packaged | done 2026-08-24, gate cleared, provided in `lib/` |
+| 1 | `Product Change` snapshot model, and its source | done 2026-08-28, redesigned mid-flight per ADR 0008, rate and `stock=0` share confirmed live |
+| 2 | Test infrastructure, the interval join, and `EnrichedClick` | done 2026-08-28, 5 tests green, live rate confirmed |
+| 3 | CEP: abandoned cart and `ShopperSignal` | done 2026-08-28, 5 tests green, live rate confirmed |
+| 4 | The `connect` merge and the `UNMATCHED` side output | done 2026-08-29, 9 tests green, live run confirmed after a network-buffer config fix |
+| 5 | Broadcast Promo Rules | done 2026-08-29, 5 tests green. Step 7 live check not run |
+| 6 | Async I/O and the mocked recommendation service | done 2026-08-30, 2 tests green, live verified on the topic |
+| 7 | End-to-end test of the assembled graph | done 2026-08-30, 27 tests green |
+| 8 | Drill C: change a Promo Rule mid-run | done 2026-08-30, all four claims confirmed, runbook carries the real transcript |
+| 9 | Documents: ADR amendment, glossary, knowledge doc, status | done 2026-08-30 |
 
 ## Global constraints
 
@@ -70,24 +70,30 @@ these.
   JUnit.
 - `pipeline.generic-types: false`. Any Kryo fallback must fail loudly.
 - **No sealed interface and no abstract supertype may enter the job graph.**
-  Every type crossing an operator boundary is a flat record or an enum.
+  Every type crossing an operator boundary is a flat record or an enum. See
+  [ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md).
+- **Never filter the Product Change stream down to price drops.** The merge
+  needs stock from every update, drop or not.
 - **Nothing in the output derives from wall-clock time.** `generatedAt` is the
   Browsing Session's window end. Every timer is an event-time timer. Every mock
   reply is a pure function of its request.
 - Watermarks are assigned **once, on the raw stream, before the fork**.
-- Watermark bound **5s**, session gap **6s**, join interval **-2s to +2s**, CEP
+- Watermark bound **5s**, session gap **6s**, join interval **-2s to +2s**
+  (`--join-lower-bound-seconds` / `--join-upper-bound-seconds`), CEP
   `within` **30s**, checkpoint interval **10s**, cooldown **60s** of event time.
 - Async I/O uses `orderedWait`, never `unorderedWait`.
 - Delivery guarantee `EXACTLY_ONCE`, with a **stable** transactional id prefix.
 - Any consumer verifying output sets `isolation.level=read_committed`.
 - Every test runs at **parallelism 1** over **bounded** input.
 - Ubiquitous language from [CONTEXT.md](../../../CONTEXT.md): Shopper, Click,
-  Browsing Session, Product, Price Change, Promo Rule, Recommendation, Signal,
-  Late Click, Unmatched Click, Drill.
+  Browsing Session, Product, Product Change, Promo Rule, Recommendation, Signal,
+  Late Click, Unmatched Click, Cart Abandonment, Out of Stock, Drill.
 
 ---
 
 ## Task 0: Confirm how `flink-cep` is packaged
+
+**Status: done, 2026-08-24. Gate cleared, Task 1 is unblocked.**
 
 **Files:** none. This task's whole output is a decision recorded in the spec.
 
@@ -106,188 +112,220 @@ operator copy it into `lib/`. Getting this backwards fails at runtime with
 `NoClassDefFoundError`, or with a much worse duplicate-class problem, never at
 compile time.
 
-- [ ] **Step 1: Look in the official image.**
+- [x] **Step 1: Look in the official image.**
+
+The plan's original `ls lib opt | grep -i cep` was replaced, because `ls` over
+two directories loses which one each match came from, which is the only thing
+this task needs to know.
 
 ```bash
-docker run --rm flink:2.2.0 sh -c 'ls lib opt | grep -i cep'
+docker run --rm flink:2.2.0 sh -c \
+  'find lib opt -iname "*cep*"; echo "--- lib ---"; ls lib; echo "--- opt ---"; ls opt'
 ```
 
-If the file lands under `lib/`, `flink-cep` is provided and the scope is
-`compileOnly` plus `runtimeOnly`, matching `flink-streaming-java`. If it lands
-under `opt/` or nowhere, the job jar owns it and the scope is `implementation`,
-matching `flink-connector-kafka`.
+Result: `lib/flink-cep-2.2.0.jar`. Provided, so the scope is `compileOnly` plus
+`runtimeOnly`, matching `flink-streaming-java`.
 
-- [ ] **Step 2: Cross-check against the documentation.**
+- [x] **Step 2: Cross-check against the documentation.**
 
-Read the project-configuration page for 2.2 and find which modules it lists as
-already provided:
+The [advanced configuration page][d0-advanced] states it, and names CEP
+explicitly:
 
-<https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/overview.md>
+> the Flink Core Dependencies do not contain any connectors or libraries (i.e.
+> **CEP**, SQL, ML) ... The `/lib` directory of the Flink distribution
+> **additionally** contains various JARs including commonly used modules ...
+> These are loaded by default
 
-Two independent sources agreeing is the standard this project has been using
-since Phase 0's kubeadm API-version surprise. If they disagree, the image wins,
-because the image is what Phase 5 actually runs.
+The two sources agree. CEP is not inside `flink-dist.jar`, and it ships as its
+own jar in `lib/` which is loaded by default.
 
-- [ ] **Step 3: Record the answer.**
+- [x] **Step 3: Record the answer.**
 
-Edit the Dependencies table in
-[the spec](../specs/2026-08-24-advanced-flink-design.md), replace the word
-`open` with the real scope, and delete the paragraph that says the scope is
-open. Add one line saying which of the two sources you checked.
+Done, in [the spec's Dependencies section](../specs/2026-08-24-advanced-flink-design.md#dependencies).
 
-**Gate:** do not start Task 1 until the table says a real scope. A wrong scope
-found in Phase 5 means rebuilding an image and re-running an HA Drill.
+**Three findings beyond the gate itself, recorded because nothing else records
+them.**
+
+1. `flink-s3-fs-hadoop` is in `opt/`, not `lib/`. Shipped, and **not** on the
+   classpath. ADR 0001 predicted it becomes a plugin directory in Phase 5, and
+   the image confirms it.
+2. **`runtimeOnly` will not keep these jars out of Phase 5's fat jar.** Gradle's
+   Shadow plugin builds from the runtime classpath, so every `runtimeOnly`
+   dependency gets bundled: `flink-streaming-java`, `flink-clients`,
+   `flink-statebackend-rocksdb`, `flink-connector-base`, and now `flink-cep`.
+   Bundling any of them next to a distribution that already loads them is the
+   duplicate-class problem the `compileOnly` split exists to prevent. Phase 5
+   needs a dedicated configuration or an explicit exclusion set. The scope
+   declares the intent; it does not enforce it.
+3. The `lib/` guarantee holds only for an unmodified image. The same page notes
+   those jars "can be removed from the classpath just by removing them from the
+   `/lib` folder", so a slimmed base image in Phase 5 would invalidate this.
+
+[d0-advanced]: https://github.com/apache/flink/blob/release-2.2.0/docs/content/docs/dev/configuration/advanced.md
 
 ---
 
-## Task 1: `JsonCodec` reverse direction, and the `PriceChange` source
+## Task 1: `Product Change` snapshot model, and its source
+
+**Status: done, 2026-08-28. Task 2 is unblocked.**
+
+**Redesigned 2026-08-28.** Steps 1 to 4 were implemented against the old sealed
+model and are partly superseded by
+[ADR 0008](../../adr/0008-product-change-as-a-state-snapshot.md). What survives
+is called out per step.
 
 **Files:**
+- Rewrite: `apps/domain/src/main/java/lab/personalization/domain/ProductChange.java`
+- **Delete**: `PriceChange.java`, `StockChange.java`
 - Modify: `apps/domain/src/main/java/lab/personalization/domain/JsonCodec.java`
-- Create: `apps/pipeline/src/main/java/lab/personalization/pipeline/PriceChangeDeserializationSchema.java`
-- Modify: `apps/pipeline/src/main/java/lab/personalization/pipeline/PipelineConfig.java`
-- Modify: `apps/pipeline/src/main/java/lab/personalization/pipeline/ClickDeserializationSchema.java`
-- Modify: `apps/pipeline/src/main/java/lab/personalization/pipeline/PersonalizationJob.java`
+- Modify: `apps/generator/src/main/java/lab/personalization/generator/factory/ProductChangeFactory.java`
+- Rename: `PriceChangeDeserializationSchema.java` -> `ProductChangeDeserializationSchema.java`
+- Modify: `PipelineConfig.java`, `PersonalizationJob.java`
 
 **Interfaces produced:**
 ```java
+public record ProductChange(String productId, Instant eventTime,
+                            double price, double previousPrice,
+                            int stock, int previousStock)
 public static Click clickFromJson(byte[] bytes)
 public static ProductChange productChangeFromJson(byte[] bytes)
-public class PriceChangeDeserializationSchema implements DeserializationSchema<PriceChange>
+public class ProductChangeDeserializationSchema implements DeserializationSchema<ProductChange>
 ```
 
-**The problem, before the mechanism.** `JsonCodec` today can write all four
-records but can read exactly one: `fromJson(byte[]) -> Click`. Phase 3 only ever
-needed that direction for one topic. Phase 4 reads two more topics, so the
-reverse direction has to grow, and Java cannot overload on return type alone.
-Three readers therefore need three names.
+**The problem, before the mechanism.** A sealed interface cannot be a Flink
+stream element type. Asked directly, Flink 2.2 answers `GenericTypeInfo` and
+`KryoSerializer` for `ProductChange`, while `PriceChange` and `StockChange` both
+resolve to `PojoTypeInfo`. `pipeline.generic-types: false` turns that fallback
+into a hard failure while the job graph is being built.
 
-**The rename, and why it happens now.** `fromJson` is fine while there is one
-reader and becomes actively misleading the moment there are three. Rename it to
-`clickFromJson` in this task. It has exactly two call sites, `JsonCodec` itself
-and `ClickDeserializationSchema`, so it is a two-minute change now and a
-permanent wart if deferred.
+**Why the fix is a redesign and not a cast.** Two further facts, both in ADR
+0007. Nothing in the project reads `StockChange`. And `PriceChange` carries no
+previous price, so "price drop" was never checkable, though the generator stamps
+every Promo Rule `"N% off, price-drop bonus"`.
 
-**The concept this task exists to prove.** `ProductChange` is a sealed
-interface. A sealed interface is not a POJO by Flink's rules, and
-`pipeline.generic-types: false` blocks the Kryo fallback, so a
-`DataStream<ProductChange>` throws while the job graph is being built, before a
-single record is read. The spec's answer is to never let the sum type into the
-graph: read the `type` discriminator that `JsonCodec` already writes, and
-collect only `PriceChange`, which is a plain record and a valid POJO.
+**The shape to build.** One record carrying the Product's state and the state it
+replaced. No discriminator, no nullable field, every field always real. On a
+Product's first event the previous values equal the current ones.
 
-**The failure mode to watch for.** If you write
-`DeserializationSchema<ProductChange>` and filter afterwards with `.filter(...)`
-plus a cast, it compiles and then throws at `env.execute()` with a message about
-a generic type. The filter is too late. The type has to be narrowed **inside**
-the deserializer, where the stream's element type is decided.
+**The failure mode to watch for.** It is tempting to filter the stream to price
+drops right at the source. **Do not.** If only drops reach the interval join,
+the merge never learns the stock of a Product that went out of stock without a
+price move, and Task 4's suppression rule silently fails for exactly the
+Products it exists to catch. The join takes every Product update; the drop test
+happens later, on `EnrichedClick`.
 
-- [ ] **Step 1: Add a numeric field pattern to `JsonCodec`.**
+- [x] **Step 1: `numberField` in `JsonCodec`.** Done, and still needed.
 
-The existing `stringField(...)` helper only matches quoted values. `newPrice`
-and `discountPercent` are written unquoted, so they need their own pattern.
+The pattern first specified here, `(-?[0-9.eE+]+)`, was wrong: `-?` anchors only
+the start and the class holds no `-`, so `1.0E-4` matched as `1.0E` and threw
+`NumberFormatException`. The corrected grammar below was probed against eight
+shapes.
 
 ```java
 private static Pattern numberField(String name) {
-    return Pattern.compile("\"" + name + "\"\\s*:\\s*(-?[0-9.eE+]+)");
+    return Pattern.compile("\"" + name + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)");
 }
 ```
 
-Same tolerance argument as the existing regex approach: field order and
-incidental whitespace must not matter, because Drill C injects a hand-typed
-Promo Rule with `kcat`.
+- [x] **Step 2: rename `fromJson` to `clickFromJson`.** Done, and still correct.
+Three readers cannot share one name, since Java does not overload on return
+type.
 
-- [ ] **Step 2: Rename `fromJson` to `clickFromJson`, and write `productChangeFromJson`.**
+- [x] **Step 3: rewrite `ProductChange`, delete the two variants.**
 
-`productChangeFromJson` switches on the `type` field the generator writes,
-`"PRICE"` or `"STOCK"`, and returns the matching variant. Make the switch
-**exhaustive with a default that throws**, naming the unknown value. A silent
-`null` here surfaces three operators downstream as a `NullPointerException` with
-no clue where it came from.
+Six fields. Deleting `PriceChange` and `StockChange` will break
+`ProductChangeFactory` and `JsonCodec`, which is the point: the compiler walks
+you to every site that assumed a sum type.
 
-- [ ] **Step 3: Write `PriceChangeDeserializationSchema`.**
+- [x] **Step 4: rewrite both directions in `JsonCodec`.**
 
-Stay on `DeserializationSchema`, matching `ClickDeserializationSchema`, so
-`setValueOnlyDeserializer(...)` on the `KafkaSource` builder still works.
+`toJson` loses its pattern `switch`, and `productChangeFromJson` loses its type
+`switch`. Both get shorter. The wire format drops `"type"`:
 
-```java
-@Override
-public void deserialize(byte[] message, Collector<PriceChange> out) {
-    // collect only when the parsed value is a PriceChange
-}
-
-@Override
-public PriceChange deserialize(byte[] message) {
-    throw new UnsupportedOperationException();
-}
-
-@Override
-public TypeInformation<PriceChange> getProducedType() {
-    return TypeInformation.of(PriceChange.class);
-}
+```json
+{"productId":"P1","eventTime":"...","price":19.99,"previousPrice":24.99,"stock":0,"previousStock":40}
 ```
 
-The `Collector` overload is the one that can emit **zero** records, which is how
-a `StockChange` gets dropped. The single-value form is unreachable once the
-`Collector` form is overridden, and throwing is more honest than returning
-`null`.
+You lose compiler-enforced exhaustiveness here. ADR 0008 accepts that trade
+knowingly; it is not an oversight to fix later.
 
-- [ ] **Step 4: Add `--product-change-topic` to `PipelineConfig`, default `product-change`.**
+- [x] **Step 5: teach `ProductChangeFactory` to remember.**
 
-Follow the existing `inputTopic` naming discussion in the Phase 3 plan: a bare
-`topic` would be ambiguous now that there are three of them.
+A `Map<String, ProductChange>` of the last event per Product, ten entries. The
+new event's previous values come from that map, or equal its own current values
+when the Product has not been seen.
 
-- [ ] **Step 5: Build the second `KafkaSource` and print it.**
+**Stock is `0` with probability `0.1`**, otherwise `1` to `500`. The natural
+`random.nextInt(501)` makes stock zero about once in five hundred events, so
+Task 4's suppression rule would essentially never fire and could not be drilled.
+This is a deliberate synthetic-data choice, the same kind as Phase 3's derived
+6 second session gap.
 
-A second source, its own consumer group suffix, and the same watermark strategy
-shape as the clickstream. `PriceChange` needs watermarks too, because the
-interval join in Task 2 is an event-time operator and will not fire without
-them on **both** sides.
+- [x] **Step 6: rename the deserializer and delete the narrowing.**
 
-```java
-env.fromSource(priceChanges, priceChangeWatermarks, "product-change")
-   .print("PRICE");
-```
+`ProductChangeDeserializationSchema` now needs only the single-value
+`deserialize(byte[])` and `getProducedType()`. The `Collector` overload existed
+solely to emit zero records for a `StockChange`, and nothing is dropped any
+more.
 
-- [ ] **Step 6: Verify against the real topic.**
+- [x] **Step 7: `--product-change-topic` in `PipelineConfig`.** Done, unchanged.
+
+- [x] **Step 8: build the second source and print it.**
+
+Its own consumer group, and its own `WatermarkStrategy<ProductChange>` with
+`forBoundedOutOfOrderness(...)`, a timestamp assigner reading
+`ProductChange::eventTime`, and `.withIdleness(...)`. All three are required.
+Without idleness, one idle partition of `product-change` pins the watermark at
+`Long.MIN_VALUE` and Task 2's join fires nothing, which looks like a broken join
+rather than a watermark problem. This is Phase 3 Task 4's bug in a new place.
+
+Honour `config.bounded()` here as the Click source does, or bounded mode hangs
+with one source finished and the other running forever.
+
+**Keep the stream in a variable.** Task 2 forks it into the interval join, and
+you cannot fork what you chained straight into `.print(...)`.
+
+- [x] **Step 9: verify against the real topic.**
 
 ```bash
 apps/gradlew -p apps :generator:run                                       # terminal 1
 apps/gradlew -p apps :pipeline:run --args="--start-from-earliest=false"   # terminal 2
 ```
 
-Expected: `PRICE` lines at roughly **one every two seconds**. The generator's
-`product-change-rate` default is 1.0 per second and about half of what it emits
-is a `StockChange`, which this deserializer drops.
+Expected: `ProductChange` lines at **one per second**, matching
+`product-change-rate`. Nothing is dropped now, so half the rate would mean the
+old narrowing survived somewhere.
 
-If you see roughly one per second, the `StockChange` branch is being collected
-too. If you see none, check the topic name before anything else.
-
----
+Check two things in the printed records, not just the rate. About one in ten
+should carry `stock=0`. And `previousPrice` should differ from `price` on most
+records but equal it on the first event seen for each Product.
 
 ## Task 2: Test infrastructure, the interval join, and `EnrichedClick`
 
+**Status: done, 2026-08-28. Task 3 is unblocked.**
+
 **Files:**
 - Create: `apps/domain/src/main/java/lab/personalization/domain/EnrichedClick.java`
-- Create: `apps/pipeline/src/main/java/lab/personalization/pipeline/PriceDropJoiner.java`
+- Create: `apps/pipeline/src/main/java/lab/personalization/pipeline/ProductChangeJoiner.java`
 - Create: `apps/pipeline/src/test/java/lab/personalization/pipeline/IntervalJoinTest.java`
 - Modify: `apps/pipeline/build.gradle`
 - Modify: `PersonalizationJob.java`
 
-**Interfaces consumed:** `PriceChange` source from Task 1.
+**Interfaces consumed:** `ProductChange` source from Task 1.
 
 **Interfaces produced:**
 ```java
 public record EnrichedClick(String shopperId, String productId, Instant clickTime,
-                            double newPrice, Instant priceChangeTime)
-class PriceDropJoiner extends ProcessJoinFunction<Click, PriceChange, EnrichedClick>
+                            double price, double previousPrice,
+                            int stock, Instant changeTime)
+class ProductChangeJoiner extends ProcessJoinFunction<Click, ProductChange, EnrichedClick>
 ```
 
 **The concept.** An interval join asks, for each element on the left, which
 elements on the right have an event time inside a window **relative to that
 element**. It is not a windowed join: there is no shared window boundary, every
 Click carries its own interval. Both sides must be keyed by the same key, and
-`PriceChange` has no `shopperId`, so this branch forks from the raw stream and
+`ProductChange` has no `shopperId`, so this branch forks from the raw stream and
 applies its own `keyBy(productId)`, per
 [ADR 0003](../../adr/0003-interval-join-key-and-semantics.md).
 
@@ -316,7 +354,7 @@ non-obvious Gradle facts, each of which produces a confusing failure:
 - **JUnit 5 needs `useJUnitPlatform()`.** Without it Gradle finds zero tests and
   reports success, which is the worst possible failure.
 
-- [ ] **Step 1: Add the test configuration to `apps/pipeline/build.gradle`.**
+- [x] **Step 1: Add the test configuration to `apps/pipeline/build.gradle`.**
 
 ```groovy
 configurations {
@@ -340,7 +378,7 @@ dependencies {
 problem above. It is a deliberate choice, not boilerplate: it says "whatever a
 real cluster provides at runtime, a test JVM has to provide for itself".
 
-- [ ] **Step 2: Prove the test task actually runs.**
+- [x] **Step 2: Prove the test task actually runs.**
 
 Write a throwaway test asserting `1 + 1 == 2` and run:
 
@@ -352,24 +390,25 @@ Expected: `1 test completed`. If it says `NO-SOURCE` or reports success with no
 test count, `useJUnitPlatform()` is missing or the file is in the wrong source
 root. Delete the throwaway test once it has told you what you needed.
 
-- [ ] **Step 3: Write `EnrichedClick` in `:domain`.**
+- [x] **Step 3: Write `EnrichedClick` in `:domain`.**
 
 An enriched Click is a Signal by the `CONTEXT.md` definition, so it is domain
 vocabulary. It carries both event times, not just the Click's, because Phase 8's
 dashboard needs the gap between them and recomputing it downstream is
 impossible once one of them is dropped.
 
-- [ ] **Step 4: Write the failing test.**
+- [x] **Step 4: Write the failing test.**
 
 ```java
 @Test
-void clickWithinTwoSecondsOfPriceChangeMatches() throws Exception {
+void clickWithinTwoSecondsOfProductChangeMatches() throws Exception {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
 
     Instant t = Instant.parse("2026-08-24T10:00:00Z");
-    // Click on P1 at t, PriceChange on P1 at t+1s  -> expect one EnrichedClick
-    // Click on P2 at t, PriceChange on P2 at t+4s  -> expect nothing
+    // Click on P1 at t, ProductChange on P1 at t+1s  -> expect one EnrichedClick
+    // Click on P2 at t, ProductChange on P2 at t+4s  -> expect nothing
+    // and assert the EnrichedClick carries price, previousPrice and stock
 }
 ```
 
@@ -383,28 +422,28 @@ collect with `.executeAndCollect()`. Assert with AssertJ that exactly one
 interval-join candidate, so the test terminates instead of waiting. An unbounded
 source in a test hangs forever and looks like a deadlock.
 
-- [ ] **Step 5: Run it and watch it fail.**
+- [x] **Step 5: Run it and watch it fail.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*IntervalJoinTest*'
 ```
 
-Expected: a compile failure naming `EnrichedClick` or `PriceDropJoiner`. Read
+Expected: a compile failure naming `EnrichedClick` or `ProductChangeJoiner`. Read
 the message. If instead it hangs, you have an unbounded source.
 
-- [ ] **Step 6: Write `PriceDropJoiner` and wire the branch into the job.**
+- [x] **Step 6: Write `ProductChangeJoiner` and wire the branch into the job.**
 
 ```java
 clicks.keyBy(Click::productId)
-      .intervalJoin(priceChanges.keyBy(PriceChange::productId))
+      .intervalJoin(productChanges.keyBy(ProductChange::productId))
       .between(Duration.ofSeconds(-2), Duration.ofSeconds(2))
-      .process(new PriceDropJoiner())
+      .process(new ProductChangeJoiner())
 ```
 
 `clicks` here is the **raw watermarked stream**, the same variable the
 Shopper-keyed branch forks from, not anything downstream of `keyBy(shopperId)`.
 
-- [ ] **Step 7: Run the test until it passes, then check the live rate.**
+- [x] **Step 7: Run the test until it passes, then check the live rate.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*IntervalJoinTest*'
@@ -413,7 +452,7 @@ apps/gradlew -p apps :pipeline:run --args="--start-from-earliest=false"
 
 Expected from the live run: `EnrichedClick` output at roughly **one third** of
 the Click rate. The spec's arithmetic gives 33 percent, from
-`1 - e^(-0.4)` where 0.4 is the expected number of Price Changes on one Product
+`1 - e^(-0.4)` where 0.4 is the expected number of Product Changes on one Product
 inside a 4 second window.
 
 Zero output with a passing test means watermarks or idleness on the
@@ -422,6 +461,8 @@ Zero output with a passing test means watermarks or idleness on the
 ---
 
 ## Task 3: CEP: abandoned cart and `ShopperSignal`
+
+**Status: done, 2026-08-28. Task 4 is unblocked.**
 
 **Files:**
 - Create: `apps/domain/src/main/java/lab/personalization/domain/SignalKind.java`
@@ -436,8 +477,8 @@ Zero output with a passing test means watermarks or idleness on the
 **Interfaces produced:**
 ```java
 public enum SignalKind { BROWSING_SESSION, CART_ABANDONMENT }
-public record ShopperSignal(String shopperId, SignalKind kind, Instant eventTime,
-                            String productId, int clickCount)
+public record ShopperSignal(String shopperId, SignalKind kind,
+                            Instant eventTime, String productId)
 class CartAbandonmentMatcher extends PatternProcessFunction<Click, ShopperSignal>
         implements TimedOutPartialMatchHandler<Click>
 static final OutputTag<Click> CEP_TIMED_OUT
@@ -489,49 +530,76 @@ which is step 5's second half and the third case in step 3. That loses one side
 output from Phase 8's dashboard and nothing else. Take it if this task passes
 four hours, and record it in `status.md`.
 
-- [ ] **Step 1: Add `flink-cep` at the scope Task 0 established.**
+- [x] **Step 1: Add `flink-cep` at the scope Task 0 established.**
 
 ```groovy
-// scope decided by Task 0, not guessed here
-"org.apache.flink:flink-cep:${flinkVersion}"
+compileOnly "org.apache.flink:flink-cep:${flinkVersion}"
+runtimeOnly "org.apache.flink:flink-cep:${flinkVersion}"
 ```
 
-- [ ] **Step 2: Write `SignalKind` and `ShopperSignal` in `:domain`.**
+The pair, not `implementation`. Task 0 confirmed `lib/flink-cep-2.2.0.jar` is in
+the official image and loaded by default, so the job must not bundle it.
+`compileOnly` gives you the Pattern API at compile time; `runtimeOnly` puts it
+on the classpath under `MiniCluster`, where there is no distribution to provide
+it.
 
-`clickCount` is meaningful only for `BROWSING_SESSION` and is `0` otherwise.
-That unused field is the price of the union, and it is forced: a sealed
-interface over the two Signal kinds would fail exactly the way `ProductChange`
-does.
+- [x] **Step 2: Write `SignalKind` and `ShopperSignal` in `:domain`.**
 
-- [ ] **Step 3: Write the failing test, three cases.**
+Four fields, all meaningful for both kinds. `eventTime` is the window end for a
+Browsing Session and the pattern's completion time for a cart abandonment;
+`productId` is the candidate Product in one case and the abandoned Product in
+the other.
+
+**Do not add `clickCount` because `SessionSignal` has it.** Nothing downstream
+reads a click count, so it would cross a shuffle on every record for no
+consumer. A transport type carries what its consumer reads.
+
+The record is flat with an enum discriminator rather than a sealed interface
+over the two kinds, and that is forced: a sealed interface fails exactly the way
+`ProductChange` did, giving `GenericTypeInfo` and a `KryoSerializer` that
+`pipeline.generic-types: false` rejects.
+
+- [x] **Step 3: Write the failing test, five cases.**
 
 ```java
 @Test void viewThenCartWithNoCheckoutMatches()
 @Test void viewThenCartThenCheckoutDoesNotMatch()
-@Test void viewWithNoCartLandsInTheTimedOutSideOutput()
+@Test void aCartOnADifferentProductDoesNotMatch()           // the IterativeCondition
+@Test void oneShoppersCartDoesNotCompleteAnothersPattern()  // the keyBy
+@Test void aViewThatIsNeverCartedLandsInTheTimedOutSideOutput()
 ```
 
 Bounded input, parallelism 1, event times spaced a few seconds apart inside the
 30 second window. The third case is what proves `TimedOutPartialMatchHandler` is
 wired, and it is the one most likely to be skipped.
 
-- [ ] **Step 4: Run it and read the failure.**
+- [x] **Step 4: Run it and read the failure.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*CartAbandonmentCepTest*'
 ```
 
-- [ ] **Step 5: Write the pattern and the matcher.**
+- [x] **Step 5: Write the pattern and the matcher.**
 
-`processMatch(...)` builds a `ShopperSignal` with `kind = CART_ABANDONMENT`,
-`productId` from the `"view"` step, and `clickCount = 0`.
+`processMatch(...)` builds a `ShopperSignal` with `kind = CART_ABANDONMENT` and
+`productId` from the `"view"` step.
 `processTimedOutMatch(...)` calls `ctx.output(CEP_TIMED_OUT, ...)`.
 
 `eventTime` on the Signal comes from the matched Clicks, never from
 `Instant.now()`. The global constraint about wall-clock time applies here as
-much as it does to `generatedAt`.
+much as it does to `generatedAt`. The ADD_TO_CART Click's own `eventTime` is
+used, being the last real observation in the match.
 
-- [ ] **Step 6: Wire the branch and check the live rate.**
+**One unknown, resolved 2026-08-28 by the test rather than by reading.** It was
+not clear whether Flink delivers a pattern ending in `notFollowedBy(...)
+.within(...)` through `processMatch` when the window expires cleanly, or whether
+it treats "view, cart, no checkout" as a timed-out partial instead. It is
+`processMatch`: a clean expiry is a **match**, and `processTimedOutMatch` sees
+only genuinely incomplete sequences such as a VIEW that was never carted. If it
+had been the other way, the emission would have had to move into
+`processTimedOutMatch`.
+
+- [x] **Step 6: Wire the branch and check the live rate.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*CartAbandonmentCepTest*'
@@ -548,6 +616,42 @@ same-Product `IterativeCondition`, so any ADD_TO_CART matches any VIEW.
 ---
 
 ## Task 4: The `connect` merge and the `UNMATCHED` side output
+
+**Status: done, 2026-08-29. Task 5 is unblocked.**
+
+**The live run needed a config fix first, and the cause was not this task's
+code.** The first attempt failed at deploy, before a single Recommendation was
+produced:
+
+```
+java.io.IOException: Insufficient number of network buffers: required 17,
+but only 0 available. The total number of network buffers is currently set to
+2048 of 32768 bytes each.
+```
+
+Phase 4 has grown the graph to five `keyBy` shuffles, and `MiniCluster`'s default
+network memory no longer covers them at the default parallelism of 16. The lever
+is `taskmanager.memory.network.*` in `apps/pipeline/conf/config.yaml`, not
+pinning parallelism, for the same reason Phase 3 Task 4 refused to pin it: Phase
+6 varies parallelism deliberately.
+
+**Fixed 2026-08-29** in `apps/pipeline/conf/config.yaml`, which is where Flink
+settings live as data:
+
+```yaml
+taskmanager.memory.process.size: 2gb
+taskmanager.memory.network.min: 256mb
+taskmanager.memory.network.max: 256mb
+```
+
+256mb of 32KB buffers is 8192, against the 2048 the default `network.min` gave.
+Setting min and max to the same value is the documented way to pin the size
+rather than let it be derived from a fraction of a small total.
+
+After the fix every output appeared with **zero** failed tasks and no buffer
+complaint: `REQUEST`, `UNMATCHED`, `CART-ABANDONED`, `CEP-TIMEOUT`,
+`PRICE-DROP-MATCH`, `MERGED-SIGNAL`, `SIGNAL`. This also unblocks Tasks 5, 6 and
+Drill C, which could not have been verified live either.
 
 **Requires Phase 3 Task 6 to be done.**
 
@@ -568,6 +672,7 @@ public record RecommendationRequest(String shopperId, String candidateProductId,
                                     Instant generatedAt)
 class SignalMerger extends KeyedCoProcessFunction<String, ShopperSignal, EnrichedClick, RecommendationRequest>
 static final OutputTag<RecommendationRequest> UNMATCHED
+static final OutputTag<RecommendationRequest> OUT_OF_STOCK
 ```
 
 **The problem this operator solves.** `keyBy` physically decides which worker
@@ -595,7 +700,7 @@ to one record per Browsing Session candidate.
 
 | Input | Effect |
 |---|---|
-| `processElement2(EnrichedClick)` | put `productId` into `priceDropMatches` |
+| `processElement2(EnrichedClick)` | record the Product's `stock`; if `price < previousPrice`, put the `EnrichedClick` into `matchesByProduct` |
 | `processElement1(CART_ABANDONMENT)` | put `productId` into `abandonedCarts` |
 | `processElement1(BROWSING_SESSION)` | read both maps **for the candidate Product only**, emit, clear both maps |
 
@@ -609,14 +714,14 @@ check would put `reason = "cart-abandoned"` on roughly 80 percent of
 Recommendations and drown the other two values. Narrowed, it lands near 15
 percent.
 
-- [ ] **Step 1: Write `RecommendationRequest` in `:domain`.**
+- [x] **Step 1: Write `RecommendationRequest` in `:domain`.**
 
 `discountPercent` is `0.0` here and stays that way until Task 5.
 `candidateProductId` is what the job proposes; `Recommendation.productId` in
 Task 6 is what the service answered. They are allowed to differ, and that
 difference is the entire reason async I/O exists in this pipeline.
 
-- [ ] **Step 2: Write the failing harness test.**
+- [x] **Step 2: Write the failing harness test.**
 
 ```java
 KeyedTwoInputStreamOperatorTestHarness<String, ShopperSignal, EnrichedClick, RecommendationRequest> harness =
@@ -624,17 +729,14 @@ KeyedTwoInputStreamOperatorTestHarness<String, ShopperSignal, EnrichedClick, Rec
                 new SignalMerger(), ShopperSignal::shopperId, EnrichedClick::shopperId, Types.STRING);
 ```
 
-**The exact artifact holding `ProcessFunctionTestHarnesses` is not verified.**
-`flink-test-utils` may bring it transitively. If the import does not resolve,
-check what is actually on the test classpath before guessing:
+**Resolved in Task 2, 2026-08-28.** `flink-test-utils` does **not** bring the
+harness classes; it pulls only the plain `flink-runtime`. Both
+`ProcessFunctionTestHarnesses` and the `*OperatorTestHarness` base classes live
+in the tests classifier, already declared in `build.gradle`:
 
-```bash
-apps/gradlew -p apps :pipeline:dependencies --configuration testCompileClasspath | grep -i flink
+```groovy
+testImplementation "org.apache.flink:flink-runtime:${flinkVersion}:tests"
 ```
-
-The candidates are `flink-test-utils`, or a `tests` classifier on
-`flink-runtime` or `flink-streaming-java`. Resolve it, then record the answer in
-the spec's Dependencies table so it is not rediscovered in Phase 6.
 
 Five behaviours to assert:
 
@@ -651,31 +753,58 @@ Five behaviours to assert:
 Case 5 is the one that catches the unbounded-state bug, and it is the one people
 skip.
 
-- [ ] **Step 3: Run it and read the failure.**
+- [x] **Step 3: Run it and read the failure.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*MergeFunctionTest*'
 ```
 
-- [ ] **Step 4: Rewrite `RecommendationDecider` as `SignalMerger`.**
+- [x] **Step 4: Rewrite `RecommendationDecider` as `SignalMerger`.**
 
 Phase 3's body becomes `processElement1`, exactly as the
 [core pipeline design](../specs/2026-08-23-core-pipeline-design.md) predicted.
 The cooldown state and its event-time timer carry over unchanged. Only the
 output type changes, from `Recommendation` to `RecommendationRequest`.
 
-`reason` precedence, most specific first: `"cart-abandoned"`, then
-`"price-drop"`, then Phase 3's `"most-viewed-in-session"`.
+A candidate Product whose recorded `stock` is `0` is suppressed **before** any
+of this. It goes to `OUT_OF_STOCK` and never reaches the sink, because
+recommending something nobody can buy is the rule ADR 0008 added stock to
+prevent. Routed rather than dropped: a suppression nobody can count is a bad
+rule.
 
-- [ ] **Step 5: Add the safety-net timer.**
+For everything that does emit, `reason` precedence is, most specific first:
+`"cart-abandoned"`, then `"price-drop"`, then Phase 3's
+`"most-viewed-in-session"`.
 
-Clearing both maps on session close bounds the state for any Shopper who keeps
-shopping. A Shopper whose session never closes would pin state forever. Register
-an event-time timer when a map first gains an entry, and clear on
-`onTimer(...)`. Event-time, not processing-time, for the reason the global
-constraints give.
+- [x] **Step 5: Give the two maps their different lifetimes.**
 
-- [ ] **Step 6: Union, re-key, connect, and verify live.**
+**Settled 2026-08-28.** A cart abandonment confirms 30s after the VIEW, because
+an absence cannot be proven sooner, while a Browsing Session closes 6s after its
+last Click. About **60% of abandonments arrive after their own session has
+closed**, and are therefore read by the Shopper's *next* session close rather
+than their own. They are not lost, just attributed one session late.
+
+- `matchesByProduct` **clears on session close.** It is about a specific Click
+  near a specific price move, so it is session-scoped.
+- `abandonedCarts` **expires on its own event-time timer, 60 seconds** after the
+  abandonment. "Abandoned a cart on P1 recently" is a Shopper-level fact that
+  survives a session boundary.
+
+60s is derived, not picked: at ~0.04 abandonments per second per Shopper it
+retains about 2.4 across 10 Products, giving the ~21% share of
+`"cart-abandoned"` the design expects. Five minutes would retain ~12 and swamp
+the other reasons.
+
+**Why a timer rather than clearing both maps.** Clearing both is simpler and
+loses nothing, so this is a close call. It is chosen for bounded staleness: with
+clear-on-close, an abandonment survives until the Shopper next browses, which for
+an inactive Shopper is unbounded and would then be applied as though fresh.
+
+Event-time timers, never processing-time, for the reason the global constraints
+give. Both mechanisms together keep state bounded for a Shopper whose session
+never closes.
+
+- [x] **Step 6: Union, re-key, connect, and verify live.**
 
 ```java
 DataStream<ShopperSignal> shopperSignals = sessionSignals.map(/* to ShopperSignal */)
@@ -705,6 +834,9 @@ emitting.
 ---
 
 ## Task 5: Broadcast Promo Rules
+
+**Status: done, 2026-08-29. Task 6 is unblocked.** Step 7's live check was not
+run; the task is signed off on its five harness tests.
 
 **Files:**
 - Modify: `apps/domain/src/main/java/lab/personalization/domain/JsonCodec.java`
@@ -752,20 +884,27 @@ worker could write its own copy, the copies would diverge and the state would no
 longer be broadcast. When the compiler refuses, it is telling you something
 true.
 
-- [ ] **Step 1: Write `promoRuleFromJson` and `PromoRuleDeserializationSchema`.**
+- [x] **Step 1: Write `promoRuleFromJson` and `PromoRuleDeserializationSchema`.**
 
 `discountPercent` is unquoted on the wire, so it needs the `numberField` pattern
 from Task 1, not `stringField`.
 
-- [ ] **Step 2: Add `--promo-rule-topic` to `PipelineConfig`, default `promo-rule`.**
+- [x] **Step 2: Add `--promo-rule-topic` to `PipelineConfig`, default `promo-rule`.**
 
-- [ ] **Step 3: Write the failing harness test.**
+- [x] **Step 3: Write the failing harness test.**
 
 ```java
 BroadcastOperatorTestHarness<RecommendationRequest, PromoRule, RecommendationRequest> harness =
         ProcessFunctionTestHarnesses.forBroadcastProcessFunction(
                 new PromoRuleApplier(), PromoRuleApplier.PROMO_RULES);
 ```
+
+**The broadcast harness does not use `processElement1` / `processElement2`.**
+Unlike the two-input harness, it mirrors the function's own method names:
+`harness.processElement(...)` for the request stream and
+`harness.processBroadcastElement(...)` for the rules. It also exposes
+`getBroadcastState(descriptor)`, which is how the test asserts that a new rule
+**replaces** rather than accumulates.
 
 Four behaviours:
 
@@ -779,18 +918,18 @@ Four behaviours:
 
 Case 4 is the one that proves the condition is structural rather than universal.
 
-- [ ] **Step 4: Run it and read the failure.**
+- [x] **Step 4: Run it and read the failure.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*PromoRuleBroadcastTest*'
 ```
 
-- [ ] **Step 5: Write `PromoRuleApplier`.**
+- [x] **Step 5: Write `PromoRuleApplier`.**
 
 Records are immutable, so `processElement` emits a **copy** of the request with
 the discount filled in, not a mutation.
 
-- [ ] **Step 6: Broadcast the source and connect it.**
+- [x] **Step 6: Broadcast the source and connect it.**
 
 ```java
 BroadcastStream<PromoRule> rules = env.fromSource(promoRuleSource, WatermarkStrategy.noWatermarks(), "promo-rule")
@@ -808,7 +947,7 @@ No `keyBy` before this operator. The discount step needs no keyed state, so a
 plain `BroadcastProcessFunction` avoids a second `shopperId` shuffle that the
 keyed variant would force.
 
-- [ ] **Step 7: Verify live.**
+- [x] **Step 7: Verify live.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*PromoRuleBroadcastTest*'
@@ -822,6 +961,10 @@ range, and the number changes about every 30 seconds. Unmatched requests stay at
 ---
 
 ## Task 6: Async I/O and the mocked recommendation service
+
+**Status: done, 2026-08-30. Task 7 is unblocked.** The `recommendation` topic now
+carries real discounts and real reasons; the Phase 3 `RecommendationDecider` path
+is removed from the job.
 
 **Files:**
 - Create: `apps/pipeline/src/main/java/lab/personalization/pipeline/RecommendationClient.java`
@@ -878,7 +1021,7 @@ carries much the same overhead as ordered.
   input breaks the restart Drill exactly the way `Instant.now()` on `generatedAt`
   would have.
 
-- [ ] **Step 1: Write the `RecommendationClient` interface and the mock.**
+- [x] **Step 1: Write the `RecommendationClient` interface and the mock.**
 
 The interface exists for one concrete reason: a test injects a slow
 implementation to reach the `timeout(...)` path, which is otherwise unreachable.
@@ -888,7 +1031,7 @@ That is the only justification needed, and it is enough.
 simulates latency on a dedicated executor. No `Random`, no `Instant.now()`, no
 `Thread.sleep` on the caller's thread.
 
-- [ ] **Step 2: Write the failing test, two cases.**
+- [x] **Step 2: Write the failing test, two cases.**
 
 ```java
 @Test void repliesArriveInInputOrder()
@@ -899,13 +1042,13 @@ The second constructs `AsyncRecommendationLookup` with a client that never
 completes inside the timeout, and asserts a `Recommendation` still comes out
 rather than the job failing.
 
-- [ ] **Step 3: Run it and read the failure.**
+- [x] **Step 3: Run it and read the failure.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test --tests '*AsyncRecommendationTest*'
 ```
 
-- [ ] **Step 4: Write `AsyncRecommendationLookup`.**
+- [x] **Step 4: Write `AsyncRecommendationLookup`.**
 
 Open the client in `open(...)`, close it in `close(...)`. The function holds no
 keyed state, so the documented restriction on keyed state inside async functions
@@ -915,7 +1058,7 @@ never arises.
 carries the Browsing Session's window end. Not from the moment the reply
 arrived.
 
-- [ ] **Step 5: Wire it, then rewire the sink.**
+- [x] **Step 5: Wire it, then rewire the sink.**
 
 ```java
 AsyncDataStream.orderedWait(priced, new AsyncRecommendationLookup(),
@@ -926,7 +1069,7 @@ The Kafka sink Phase 3 Task 8 built now consumes this operator's output instead
 of `RecommendationDecider`'s. The sink itself, its `EXACTLY_ONCE` guarantee, and
 its transactional id prefix are unchanged.
 
-- [ ] **Step 6: Verify end to end against the real topic.**
+- [x] **Step 6: Verify end to end against the real topic.**
 
 ```bash
 apps/gradlew -p apps :generator:run                                       # terminal 1
@@ -946,6 +1089,16 @@ transactions too, which makes the next task's Drill unreadable.
 
 ## Task 7: End-to-end test of the assembled graph
 
+**Status: done, 2026-08-30. Task 8 is unblocked.**
+
+**The finding that cost two failed attempts.** A window fires when the WATERMARK
+passes its end, not when its last element arrives. A fixture ending at `+47` with
+a 5s bound only reaches watermark `+42`, so a window ending at `+53` fires at
+`MAX_WATERMARK` alongside the CEP match, and their arrival order at the merge is a
+race. The fix is a **watermark pusher**: one Click from another Shopper far in the
+future, so the window under test closes during the stream. Any bounded test whose
+assertion depends on operator ordering needs one.
+
 **Files:**
 - Create: `apps/pipeline/src/test/java/lab/personalization/pipeline/PersonalizationJobTest.java`
 - Modify: `PersonalizationJob.java`
@@ -964,7 +1117,7 @@ sources and returns the `Recommendation` stream:
 ```java
 static DataStream<Recommendation> buildGraph(
         DataStream<Click> clicks,
-        DataStream<PriceChange> priceChanges,
+        DataStream<ProductChange> productChanges,
         DataStream<PromoRule> promoRules,
         PipelineConfig config,
         RecommendationClient client)
@@ -978,7 +1131,7 @@ test use a fast deterministic one.
 work runs the same graph in two namespaces, and Phase 6 varies parallelism
 against it. A `main` that cannot be assembled without Kafka makes both harder.
 
-- [ ] **Step 1: Extract `buildGraph(...)` and confirm nothing changed.**
+- [x] **Step 1: Extract `buildGraph(...)` and confirm nothing changed.**
 
 ```bash
 apps/gradlew -p apps :pipeline:run --args="--start-from-earliest=false"
@@ -987,13 +1140,15 @@ apps/gradlew -p apps :pipeline:run --args="--start-from-earliest=false"
 Expected: identical behaviour to Task 6. A pure refactor is done when the output
 is unchanged, not when it compiles.
 
-- [ ] **Step 2: Write the end-to-end test.**
+- [x] **Step 2: Write the end-to-end test.**
 
 Construct a fixture, by hand and small enough to reason about:
 
 - One Shopper, one Browsing Session that closes.
 - Two Clicks on `P1`, one VIEW then one ADD_TO_CART, no CHECKOUT, so CEP fires.
-- One `PriceChange` on `P1` within 2 seconds of a Click, so the join matches.
+- One `ProductChange` on `P1` within 2 seconds of a Click, whose `price` is
+  below its `previousPrice` and whose `stock` is non-zero, so the join matches
+  and the discount applies.
 - One `PromoRule` at 10 percent.
 
 Assert exactly one `Recommendation` comes out, that `discountPercent` is `10.0`,
@@ -1004,7 +1159,7 @@ value.
 The `generatedAt` assertion is the one that would catch a regression Phase 3
 Task 9's Drill also catches, but three phases earlier and in one second.
 
-- [ ] **Step 3: Run the whole suite.**
+- [x] **Step 3: Run the whole suite.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test
@@ -1016,6 +1171,11 @@ five tests silently is the failure mode Task 2 step 2 warned about.
 ---
 
 ## Task 8: Drill C: change a Promo Rule mid-run
+
+**Status: done, 2026-08-30. All four claims confirmed, twice.** The
+[runbook](../../runbooks/phase-4-promo-rule-drill.md) carries a **real transcript**,
+unlike the Phase 0 and Drill B runbooks, which still have only their
+predicted-behaviour versions.
 
 **Files:**
 - Create: `docs/runbooks/phase-4-promo-rule-drill.md`
@@ -1031,7 +1191,7 @@ watching a number change and inferring causation. Injecting a known value with
 `kcat` makes the expected result exact before you run it, which is the standard
 Phase 1 set for the external listener check.
 
-- [ ] **Step 1: Start the generator, the job, and a committed-read consumer.**
+- [x] **Step 1: Start the generator, the job, and a committed-read consumer.**
 
 ```bash
 apps/gradlew -p apps :generator:run --args="--promo-rule-interval-seconds=3600"
@@ -1043,13 +1203,13 @@ kcat -b localhost:30016 -t recommendation -C -o end \
 The one hour rule interval silences the generator's own rules for the duration,
 so the only rule change in the window is the one you inject.
 
-- [ ] **Step 2: Record the baseline.**
+- [x] **Step 2: Record the baseline.**
 
 Note the `discountPercent` on Recommendations reading `"price-drop"` or
 `"cart-abandoned"`, and confirm those reading `"most-viewed-in-session"` sit at
 `0.0`.
 
-- [ ] **Step 3: Inject a known rule.**
+- [x] **Step 3: Inject a known rule.**
 
 ```bash
 echo '{"ruleId":"drill-1","description":"drill","discountPercent":42.0}' \
@@ -1059,18 +1219,20 @@ echo '{"ruleId":"drill-1","description":"drill","discountPercent":42.0}' \
 `42.0` is outside the generator's 5 to 20 range on purpose. If you see it, it
 came from you.
 
-- [ ] **Step 4: Confirm all four claims.**
+- [x] **Step 4: Confirm all four claims.**
 
 1. Discounted Recommendations now carry `42.0`, within about 10 seconds, which
    is one checkpoint interval.
-2. Recommendations reading `"most-viewed-in-session"` still sit at `0.0`. **This
-   is the claim that separates broadcast state working from a rule applying to
-   everything**, and it is the one worth being slow about.
+2. `"cart-abandoned"` records whose candidate had **no** price drop still read
+   `0.0`. **This is the claim that separates broadcast state working from a rule
+   applying to everything**, and it is the one worth being slow about.
+   *Corrected 2026-08-30:* this step used to check `"most-viewed-in-session"`
+   records, but since Task 4 those go to `UNMATCHED` and never reach the topic.
 3. The job never restarted. Check its console for a restart line, and note that
    Recommendations kept flowing across the change with no gap.
 4. `kubectl get kafkatopic -n kafka` still shows all four topics `Ready`.
 
-- [ ] **Step 5: Write the runbook, with the real transcript.**
+- [x] **Step 5: Write the runbook, with the real transcript.**
 
 Follow the shape of
 [the Phase 0 drill runbook](../../runbooks/phase-0-control-plane-drill.md), one
@@ -1086,10 +1248,13 @@ repeat that here.
 ## Task 9: Documents
 
 **Files:**
-- Create: `docs/adr/0007-unmatched-click-moves-to-the-merge.md`
+- Create: `docs/adr/0009-unmatched-click-moves-to-the-merge.md`
 - Create: `docs/knowledge/phase-4-advanced-flink.md`
 - Modify: `docs/adr/0003-interval-join-key-and-semantics.md`
-- Modify: `CONTEXT.md`
+- Modify: `docs/superpowers/specs/2026-08-16-domain-schemas-design.md` (status note, superseded by ADR 0008)
+- Modify: `docs/superpowers/specs/2026-08-16-generator-event-production-design.md` (status note, the `"type"` field is gone)
+- ~~Create: `docs/adr/0008-product-change-as-a-state-snapshot.md`~~ **done 2026-08-28**
+- ~~Modify: `CONTEXT.md`~~ **done 2026-08-28**
 - Modify: `docs/knowledge/flink-job-walkthrough.md`
 - Modify: `docs/superpowers/specs/2026-07-25-flink-k8s-personalization-design.md`
 - Modify: `docs/superpowers/plans/status.md`
@@ -1099,7 +1264,7 @@ running code contradicts. A design document that disagrees with the code is
 worse than no document, because the next phase trusts it. Phase 5 reads ADR 0003
 and the walkthrough.
 
-- [ ] **Step 1: Write ADR 0007.**
+- [x] **Step 1: Write ADR 0009.**
 
 `intervalJoin` is an inner join, so `ProcessJoinFunction` is never invoked for a
 non-matching Click and the side output cannot originate there. Record the
@@ -1108,12 +1273,12 @@ Browsing Session candidate, and the alternative that was rejected: buffering
 every Click for the join interval, which re-implements the join's bookkeeping
 and adds a third shuffle.
 
-- [ ] **Step 2: Add a status line to ADR 0003.**
+- [x] **Step 2: Add a status line to ADR 0003.**
 
-Do not rewrite its diagram. Mark it superseded in part, pointing at ADR 0007,
+Do not rewrite its diagram. Mark it superseded in part, pointing at ADR 0009,
 the same way ADR 0003 itself handles the design spec's architecture diagram.
 
-- [ ] **Step 3: Update `CONTEXT.md`.**
+- [x] **Step 3: Update `CONTEXT.md`.**
 
 Four changes:
 
@@ -1128,7 +1293,7 @@ Four changes:
 - **Signal**: confirm it still covers all three producers, since the union type
   now makes that literal in code.
 
-- [ ] **Step 4: Fix the walkthrough's step 9.**
+- [x] **Step 4: Fix the walkthrough's step 9.**
 
 The merge function does not call the service. It emits a
 `RecommendationRequest`, and a separate `AsyncDataStream.orderedWait` operator
@@ -1137,14 +1302,14 @@ makes the call. Fix the step and the surrounding paragraph.
 Also replace the CEP section's two-step pattern with the abandoned cart, and its
 `Unmatched Click` paragraph with the new grain.
 
-- [ ] **Step 5: Fix the design spec's coverage map.**
+- [x] **Step 5: Fix the design spec's coverage map.**
 
 The CEP row still reads "viewed a product repeatedly, viewed a competitor, went
 idle". Replace it and add one line saying the Phase 4 design supersedes it, with
 the reason: at the generator's real rates that pattern needs a 60 second
 `within`, which spans ten session gaps.
 
-- [ ] **Step 6: Write the Phase 4 knowledge doc.**
+- [x] **Step 6: Write the Phase 4 knowledge doc.**
 
 One doc per phase, following `phase-3-core-pipeline.md`. Cover the five concepts
 as they were actually built, not as they were planned. Include the two numbers
@@ -1152,14 +1317,14 @@ that were derived rather than chosen, the 30 second CEP `within` and the plateau
 that makes it insensitive to tuning, and the candidate-Product narrowing that
 keeps `"cart-abandoned"` from swamping the other reasons.
 
-- [ ] **Step 7: Update `status.md`.**
+- [x] **Step 7: Update `status.md`.**
 
 Mark Phase 4 done. Close the `ProductChange` warning Phase 3 surfaced, recording
 which of the three resolutions was taken and why. Add anything Phase 5 needs and
 nothing else records, in the same "surfaced for the next phase" style Phase 3
 used.
 
-- [ ] **Step 8: Confirm nothing is stale.**
+- [x] **Step 8: Confirm nothing is stale.**
 
 ```bash
 grep -rn "viewed a competitor\|unmatched: side output\|Price Change" \
@@ -1167,4 +1332,4 @@ grep -rn "viewed a competitor\|unmatched: side output\|Price Change" \
 ```
 
 Read each hit. Every remaining one should be either inside ADR 0003's
-now-superseded section or inside ADR 0007's description of what it supersedes.
+now-superseded section or inside ADR 0008's description of what it supersedes.

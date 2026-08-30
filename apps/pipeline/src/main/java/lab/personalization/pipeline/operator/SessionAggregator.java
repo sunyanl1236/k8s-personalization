@@ -1,4 +1,4 @@
-package lab.personalization.pipeline;
+package lab.personalization.pipeline.operator;
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -9,10 +9,15 @@ import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 
 import lab.personalization.domain.Click;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.util.OutputTag;
 import lab.personalization.domain.SessionSignal;
 
 public class SessionAggregator 
     extends ProcessWindowFunction<Click, SessionSignal, String, TimeWindow> {
+
+    public static final OutputTag<Click> LATE_CLICKS =
+            new OutputTag<>("late-clicks", TypeInformation.of(Click.class)) {};
 
     @Override
     public void process(String shopperId, Context ctx, Iterable<Click> elements, Collector<SessionSignal> out) throws Exception {
