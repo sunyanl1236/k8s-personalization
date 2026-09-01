@@ -1,7 +1,4 @@
 # Doc: https://strimzi.io/docs/operators/latest/deploying.html
-# apiVersion confirmed from the live cluster (`kubectl api-resources
-# --api-group=kafka.strimzi.io`), not a doc example, several docs still show
-# v1beta2, this operator's actual CRDs are v1.
 apiVersion: kafka.strimzi.io/v1
 kind: Kafka
 metadata:
@@ -60,6 +57,15 @@ spec:
               nodePort: 30019
               advertisedHost: localhost
               advertisedPort: 30019
+      # In-cluster access. Phase 5 is the first time a client runs inside the
+      # cluster: the Flink JobManager and TaskManager pods. For them the
+      # `external` listener above is the wrong door, because a pod resolving
+      # `localhost` gets itself. The `external` listener stays exactly as it
+      # is, since the generator and every `kcat` check still run on the host.
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
     version: "4.3.0"
     # metadataVersion deliberately omitted. Strimzi derives it automatically
     # from spec.kafka.version (confirmed from operator source,

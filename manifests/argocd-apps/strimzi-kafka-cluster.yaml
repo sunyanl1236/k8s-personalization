@@ -21,8 +21,6 @@ spec:
     namespace: kafka
   syncPolicy:
     automated:
-      # selfHeal: false per ADR 0004, same reasoning as every other
-      # Application here, needed for the Phase 5 drift-correction drill to
-      # be observable rather than instant.
+      # ArgoCD will not automatically undo a change you make directly to the cluster
       selfHeal: false
       prune: true
