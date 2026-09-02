@@ -24,3 +24,6 @@ build/
 # machine, so none of it is shared.
 .idea/
 *.iml
+
+# Third-party Helm chart, unpacked for reading only.
+charts/

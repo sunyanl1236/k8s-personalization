@@ -1,0 +1,40 @@
+# Fetch chart flink-kubernetes-operator version 1.15.0 from Apache's release directory. 
+# Render it with two values: watch personalization-blue and personalization-green, 
+# and omit the "list nodes" rule. Apply the result to this cluster, putting anything 
+# that does not name its own namespace into flink-operator.
+
+# And what actually lands:
+# flink-operator          9 objects   the operator pod, its config, webhook, certificate
+# personalization-blue    5 objects   ServiceAccount flink, 2 Roles, 2 RoleBindings
+# personalization-green   5 objects   identical
+# cluster-scoped          6 objects   4 CRDs, 2 webhook configurations
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flink-operator
+  namespace: argocd          # where the instruction lives
+spec:
+  project: default
+  source:
+    repoURL: https://downloads.apache.org/flink/flink-kubernetes-operator-1.15.0/
+    chart: flink-kubernetes-operator
+    targetRevision: 1.15.0
+    helm:
+      valuesObject:
+        # the operator reconciles FlinkDeployment objects only in these two namespaces
+        # and the chart creates the job RBAC in these two namespaces, namespaced Roles only, no ClusterRole
+        watchNamespaces:
+          - personalization-blue
+          - personalization-green
+        rbac:
+          nodesRule:
+            create: false # do not add the rule list nodes
+  destination:
+    server: https://kubernetes.default.svc # apply to the same cluster ArgoCD is running in
+    namespace: flink-operator # It is where the operator itself lands
+  syncPolicy:
+    automated:
+      selfHeal: false
+      prune: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,6 +1,7 @@
 plugins {
     id 'java'
     id 'application'
+    id 'com.gradleup.shadow' version '9.6.1'
 }
 
 group = 'lab.personalization'
@@ -42,6 +43,17 @@ configurations {
     // Whatever a real cluster provides at runtime, a test JVM must provide for
     // itself: compileOnly does not reach the test compile classpath on its own.
     testImplementation.extendsFrom compileOnly
+
+    dependencyScope('bundled')
+    resolvable('bundledClasspath') {
+        extendsFrom configurations.bundled
+    }
+    implementation.extendsFrom configurations.bundled
+}
+
+shadowJar {
+    archiveFileName = 'pipeline-all.jar'
+    configurations = [project.configurations.bundledClasspath]
 }
 
 test {
@@ -64,7 +76,7 @@ configurations.all {
 }
 
 dependencies {
-    implementation project(':domain')
+    bundled project(':domain')
 
     compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
     runtimeOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
@@ -80,7 +92,7 @@ dependencies {
     compileOnly "org.apache.flink:flink-cep:${flinkVersion}"
     runtimeOnly "org.apache.flink:flink-cep:${flinkVersion}"
 
-    implementation "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
+    bundled "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
 
     // discovered at runtime through ServiceLoader, never referenced from Java
     runtimeOnly "org.apache.flink:flink-s3-fs-hadoop:${flinkVersion}"

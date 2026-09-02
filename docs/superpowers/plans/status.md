@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
@@ -525,7 +525,111 @@ a dedicated configuration or an explicit exclusion set. Separately,
 `flink-s3-fs-hadoop` was confirmed to live in `opt/`, not `lib/`, which is the
 plugin-directory move ADR 0001 predicted.
 
-## Phase 5: Operator and HA — ⬜ not started
+## Phase 5: Operator and HA — 🟡 in progress
+
+Design and plan both written and approved:
+[design](../specs/2026-08-30-operator-and-ha-design.md),
+[implementation plan](2026-08-30-phase-5-operator-and-ha.md). The plan runs 12
+tasks; check its Progress table for the live position.
+
+Every design decision was settled **before** the plan was written, with the
+evidence and the command that produced it, so no task carries a verification
+gate. That is a change from Phases 3 and 4, which both opened with a Task 0
+check.
+
+- ✅ Task 0: Kafka internal listener. `- name: plain`, port 9092, `type: internal`,
+  `tls: false`, added beside the untouched `external` listener.
+  **This was a blocker nothing had recorded.** The `Kafka` CR had one listener,
+  and the in-cluster bootstrap Service therefore exposed only
+  `tcp-replication 9091`, which is Strimzi's broker-to-broker listener. A Flink
+  pod had nothing to connect to.
+  The reason the `external` listener could not simply be reused from inside is
+  the **two-step bootstrap**: a client asks the bootstrap address who has what,
+  then reconnects to the addresses it is handed. `external` advertises
+  `localhost:30017-30019`, deliberately, for host-side clients. Inside a pod
+  `localhost` is that pod, so a TaskManager would connect to itself. After the
+  change the advertised addresses are
+  `personalization-brokers-N.personalization-kafka-brokers.kafka.svc:9092`.
+  Gate passed with a real in-cluster probe, not a Service listing: a `kcat` pod
+  in the `kafka` namespace listed **3 brokers** on
+  `personalization-kafka-bootstrap.kafka.svc.cluster.local:9092`.
+  **One naming fact worth keeping.** Strimzi does **not** derive the Service port
+  name from the listener's `name`. The listener is `plain`; the port is
+  `tcp-clients`, a fixed name per listener role. Do not match on the listener
+  name when selecting a Service port.
+- ✅ Task 1: Shadow fat jar, allowlist scoped. `com.gradleup.shadow` 9.6.1, since
+  `com.github.johnrengelman.shadow` is unmaintained and does not support Gradle 9.
+  Five content checks pass and the 27 Phase 4 tests stay green, read from the XML
+  report rather than from `BUILD SUCCESSFUL`.
+  **An allowlist, not an exclusion list**, and the reason is the failure mode.
+  Excluding the five `runtimeOnly` Flink dependencies does not exclude their
+  transitive `flink-core`, `flink-runtime`, and `flink-shaded-*`, so those still
+  land in the jar. A missed exclusion is a **silent** duplicate class that wins a
+  scan order. A missed allowlist entry is a `NoClassDefFoundError` at startup,
+  naming the class.
+  The Gradle 9 idiom is `dependencyScope('bundled')` plus
+  `resolvable('bundledClasspath')`, with `implementation.extendsFrom
+  configurations.bundled` so the compile classpath is unchanged. Confirmed
+  working: `compileJava` stayed `UP-TO-DATE`.
+  Exactly two dependencies are bundled, `:domain` and `flink-connector-kafka`.
+  Verified absent: `flink-streaming-java`, log4j, the S3 plugin, and `flink-cep`,
+  all at count **0**.
+  **A result that looks wrong and is not.** The jar does contain
+  `org/apache/flink/streaming/connectors` (71) and
+  `org/apache/flink/streaming/util` (3). Those ship inside
+  `flink-connector-kafka:5.0.0-2.2` under legacy package names. Confirmed with
+  `javap` that `flink-dist-2.2.0.jar` contains neither. A package name is not
+  evidence of which artifact a class came from.
+- ✅ Task 2: the image, and loading it into `kind`. `apps/pipeline/Dockerfile`
+  and `scripts/build-image.sh`. Tag `lab/personalization-pipeline:0.1-b606416-dirty`,
+  both files verified inside the image before loading, present on all three
+  workers.
+  `RUN cp` rather than `COPY` for the S3 plugin, because the source file is
+  already inside the base image and `COPY` reads the build context.
+  `ENABLE_BUILT_IN_PLUGINS` was verified to work in the 2.2.0 entrypoint and
+  rejected anyway: it moves one of the two required files, so it would mean a
+  second mechanism for the job jar.
+  **Two defects found by running it, both now in the plan.** `kind load` returns
+  **before** containerd finishes registering the image on every node, which
+  produced a false "missing on worker2"; the script now retries for 30s per node.
+  And running the script as `./scripts/build-image.sh | tail -30` reported
+  `exit code 0` while the script printed a red failure, because a pipeline's exit
+  code is the last command's. That one is general, not specific to this script.
+  **Surfaced for Task 5.** Rebuilding produces a different image **digest** for
+  the same tag (`dbc3f08` then `79c7cf38`). Docker builds are not
+  byte-reproducible. `kind load` overwrites by tag so the nodes stay correct, but
+  a tag is a label and not an identity, and the `-dirty` suffix is currently real.
+- ✅ Task 3: namespaces and the credentials Secret. `manifests/flink/namespaces.yaml`
+  and `scripts/bootstrap-flink-secret.sh`. Both `personalization-blue` and
+  `personalization-green` exist; green is deliberately empty until Phase 7, and
+  is created now only so Task 4's chart puts the `flink` ServiceAccount, Role,
+  and RoleBinding in it without a later re-sync.
+  Gate passed by running the script **twice**: the first run created both
+  Secrets, the second changed nothing. Both `access-key` and `secret-key` were
+  compared byte for byte against `storage-configuration` in `minio-tenant` and
+  match. The guard is **per namespace**, not global as in
+  `bootstrap-minio-secret.sh`, because a partial run could otherwise never be
+  repaired by re-running.
+  The script copies and never generates. Generating would rotate the credentials
+  under a running MinIO Tenant, and the symptom is an S3 403 from Flink hours
+  later that reads like a MinIO fault.
+  `manifests/flink/namespaces.yaml` sits **above** `manifests/flink/blue/` on
+  purpose. Task 5's Application syncs that subdirectory with `prune: true`, so a
+  namespace file inside it would let the Application delete the namespace its own
+  resources live in.
+  **Two kubectl facts this task settled.** `kind` is CamelCase and
+  case-sensitive: `kind: namespace` is rejected with
+  `no kind "namespace" is registered for version "v1"`, because the lowercase
+  form is a command-line resource name, not a manifest kind. And
+  `--dry-run=client` did **not** catch it, since it never contacts the API
+  server; it printed two `created (dry run)` lines for a type that does not
+  exist. Use `--dry-run=server` by default.
+- ⬜ Tasks 4 to 11
+
+**One step still open from Task 0.** Step 5, re-confirming the host-side
+`external` listener after the broker roll, was never run. One command closes it:
+`kcat -b localhost:30016 -L | head -5`.
+
 
 ## Phase 6: Autoscaling — ⬜ not started
 

@@ -1,11 +1,6 @@
 # Strimzi Cluster Operator, installed as an ArgoCD Application (ADR 0004),
 # not the direct `helm install` used earlier and then undone.
-# Manages the Strimzi operator, third-party software, packaged and 
-# published by the Strimzi project as a Helm chart. You never wrote 
-# its Deployment, RBAC, or CRD YAML, Strimzi's own maintainers did, 
-# and packaged it specifically so you don't have to. Pointing at their 
-# published chart, by name and version, is the only mode that makes sense here.
-# Same shape ArgoCD's own docs show for any Helm-chart Application:
+# ArgoCD will render all chart templates
 # https://argo-cd.readthedocs.io/en/stable/user-guide/helm
 apiVersion: argoproj.io/v1alpha1
 kind: Application

@@ -27,7 +27,7 @@ about where the real difficulty was.
 | 2 | Domain model and generator | done |
 | 3 | [Core pipeline](phase-3-core-pipeline.md) | done |
 | 4 | [Advanced Flink](phase-4-advanced-flink.md) | in progress |
-| 5 | Operator and HA | not started |
+| 5 | [Operator and HA](phase-5-operator-and-ha.md) | in progress |
 | 6 | Autoscaling | not started |
 | 7 | Blue/green and OTel | not started |
 | 8 | Observability and docs | not started |

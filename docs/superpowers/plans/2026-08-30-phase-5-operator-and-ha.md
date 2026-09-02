@@ -53,10 +53,10 @@ Nothing in Phase 4 remains open. This plan has no cross-phase dependency.
 
 | # | Task | Status |
 |---|---|---|
-| 0 | Kafka internal listener | not started |
-| 1 | Shadow fat jar, allowlist scoped | not started |
-| 2 | The image, and loading it into `kind` | not started |
-| 3 | Namespaces and the credentials Secret | not started |
+| 0 | Kafka internal listener | done 2026-08-31, listener `plain`, 3 brokers reachable on 9092 from an in-cluster pod |
+| 1 | Shadow fat jar, allowlist scoped | done 2026-08-31, 24MB jar, five content checks pass, 27 tests green |
+| 2 | The image, and loading it into `kind` | done 2026-08-31, tag `0.1-b606416-dirty`, both files verified in-image, present on all 3 workers |
+| 3 | Namespaces and the credentials Secret | done 2026-08-31, idempotence proven by a second run, both Secrets match the source |
 | 4 | The operator, as an ArgoCD Application | not started |
 | 5 | The `FlinkDeployment`, the Service, the PDB | not started |
 | 6 | The gap check instrument | not started |
@@ -69,6 +69,25 @@ Nothing in Phase 4 remains open. This plan has no cross-phase dependency.
 Tasks 0, 1, and 3 depend on nothing and can run in any order. Task 2 needs 1.
 Task 4 needs 3. Task 5 needs 0, 2, and 4. Tasks 6 to 10 are strictly sequential
 after 5.
+
+### Where to resume
+
+**Next: Task 4.** Task 5 unblocks once it lands, since 0, 2, and 3 are closed. Task 4
+follows it, and Task 5 then unblocks once 3 and 4 are done, since 0 and 2 are
+already closed.
+
+**Carry forward into Task 5.** The image tag currently on the nodes is
+`lab/personalization-pipeline:0.1-b606416-dirty`. The `-dirty` suffix is real:
+`HEAD` is `b606416` and seven paths are uncommitted, including
+`apps/pipeline/build.gradle`, `apps/pipeline/Dockerfile`, and
+`scripts/build-image.sh`. Commit those and re-run `scripts/build-image.sh`
+before writing `spec.image`, or the `FlinkDeployment` will name an image that
+corresponds to no commit.
+
+Note also that rebuilding produces a **different image digest for the same tag**,
+observed on 2026-08-31 as `dbc3f08` then `79c7cf38`. Docker builds are not
+byte-reproducible. `kind load` overwrites by tag, so the nodes stay correct, but
+a tag is a label and not an identity.
 
 ## Global constraints
 
@@ -150,7 +169,7 @@ the brokers to apply it. Watch the pods roll one at a time. If two go down at
 once, stop and read the `Kafka` resource's status, because that is a
 `minInSyncReplicas` problem and not a listener problem.
 
-- [ ] **Step 1: Add the listener beside the existing one.**
+- [x] **Step 1: Add the listener beside the existing one.**
 
 Inside the existing `listeners:` list, not replacing it:
 
@@ -165,7 +184,7 @@ Inside the existing `listeners:` list, not replacing it:
 already gives. Add a comment saying this listener exists for in-cluster clients
 and dates from Phase 5, so the two listeners' purposes stay distinguishable.
 
-- [ ] **Step 2: Sync the Application and watch the roll.**
+- [x] **Step 2: Sync the Application and watch the roll.**
 
 ```bash
 kubectl get pods -n kafka -w
@@ -175,16 +194,16 @@ Expected: the three `brokers` pods restart one at a time. The three
 `controllers` pods do not restart, because a client listener does not concern
 them.
 
-- [ ] **Step 3: Confirm the port reached the Service.**
+- [x] **Step 3: Confirm the port reached the Service.**
 
 ```bash
 kubectl get svc personalization-kafka-bootstrap -n kafka \
   -o jsonpath='{range .spec.ports[*]}{.name}{" "}{.port}{"\n"}{end}'
 ```
 
-Expected: two lines now. `tcp-replication 9091` and a new `tcp-plain 9092`.
+Expected: two lines now. `tcp-replication 9091` and a new `tcp-clients 9092`.
 
-- [ ] **Step 4: Prove a pod inside the cluster can actually reach it.**
+- [x] **Step 4: Prove a pod inside the cluster can actually reach it.**
 
 This is the step that makes the task done. The Service having a port is not the
 same as a broker answering on it.
@@ -256,7 +275,7 @@ refuse to resolve when Shadow asks it for files, with
 explicitly rather than relying on the legacy default, which Gradle 9 is
 progressively removing.
 
-- [ ] **Step 1: Add the plugin.**
+- [x] **Step 1: Add the plugin.**
 
 ```groovy
 plugins {
@@ -269,7 +288,7 @@ plugins {
 `com.github.johnrengelman.shadow` is the version most search results still show.
 It is unmaintained and does not support Gradle 9. This project is on 9.7.0.
 
-- [ ] **Step 2: Declare the allowlist configuration.**
+- [x] **Step 2: Declare the allowlist configuration.**
 
 Skeleton, not the finished block. `bundled` must be resolvable, must not be
 consumable, and `implementation` must extend it so the compile classpath is
@@ -285,13 +304,13 @@ configurations {
 }
 ```
 
-- [ ] **Step 3: Move exactly two dependencies into it.**
+- [x] **Step 3: Move exactly two dependencies into it.**
 
 `project(':domain')` and `flink-connector-kafka` change from `implementation` to
 `bundled`. Every other line in the `dependencies` block is untouched, including
 all five `runtimeOnly` declarations, which `:pipeline:run` still needs.
 
-- [ ] **Step 4: Point `shadowJar` at the allowlist and fix the name.**
+- [x] **Step 4: Point `shadowJar` at the allowlist and fix the name.**
 
 ```groovy
 shadowJar {
@@ -302,13 +321,13 @@ shadowJar {
 
 A stable file name matters because Task 2's Dockerfile copies it by name.
 
-- [ ] **Step 5: Build it.**
+- [x] **Step 5: Build it.**
 
 ```bash
 apps/gradlew -p apps :pipeline:shadowJar
 ```
 
-- [ ] **Step 6: Verify the contents, four counts.**
+- [x] **Step 6: Verify the contents, four counts.**
 
 This is the step that makes the task done. Do not accept `BUILD SUCCESSFUL` as
 the answer, for the same reason Phase 4 Task 2 stopped trusting it.
@@ -325,7 +344,29 @@ Expected: the first two counts are greater than zero. **The last two are exactly
 zero.** A non-zero third or fourth count means the allowlist is not being
 honoured and the jar will collide with `lib/` at run time.
 
-- [ ] **Step 7: Confirm you broke nothing local.**
+**A fifth check, because the fourth one's result looks alarming and is fine.**
+
+```bash
+unzip -l $J | grep -oE 'org/apache/flink/[a-z0-9]+/[a-z0-9]+' | sort | uniq -c
+```
+
+Expected, and observed on 2026-08-31:
+
+```
+    168 org/apache/flink/connector/kafka
+     71 org/apache/flink/streaming/connectors
+      3 org/apache/flink/streaming/util
+```
+
+The last two look like `flink-streaming-java` leaking in. They are not.
+`flink-connector-kafka:5.0.0-2.2` ships its own classes under those legacy
+package names. Confirmed with `javap` against the image that
+`flink-dist-2.2.0.jar` contains neither
+`org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema` nor
+`org.apache.flink.streaming.util.serialization.SimpleStringSchema`. A package
+name is not evidence of which artifact a class came from.
+
+- [x] **Step 7: Confirm you broke nothing local.**
 
 ```bash
 apps/gradlew -p apps :pipeline:test
@@ -378,7 +419,7 @@ new code, stale image, and a stack trace that looks like a Flink bug.
 daemon image store. If the image is not loaded, the pod sits in `ErrImagePull`
 trying to reach a registry that has never heard of `lab/personalization-pipeline`.
 
-- [ ] **Step 1: Write the Dockerfile.**
+- [x] **Step 1: Write the Dockerfile.**
 
 Build context is `apps/pipeline`, so the jar path is relative to that directory:
 
@@ -391,7 +432,7 @@ RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop \
 COPY build/libs/pipeline-all.jar /opt/flink/usrlib/pipeline.jar
 ```
 
-- [ ] **Step 2: Write `scripts/build-image.sh`.**
+- [x] **Step 2: Write `scripts/build-image.sh`.**
 
 Follow the shape the three existing scripts already use: `set -euo pipefail`, the
 `info` / `ok` / `die` helpers, and a header comment saying what it does and when
@@ -408,13 +449,13 @@ Refuse to build on a dirty working tree, or print a loud warning. A tag naming a
 commit that does not contain the code in the image is the failure mode above,
 wearing a disguise.
 
-- [ ] **Step 3: Build and load.**
+- [x] **Step 3: Build and load.**
 
 ```bash
 ./scripts/build-image.sh
 ```
 
-- [ ] **Step 4: Verify both files, inside the image.**
+- [x] **Step 4: Verify both files, inside the image.**
 
 This is the step that makes the task done, and it is the whole reason the spec
 chose build time over the entrypoint variable. You can check before any pod
@@ -429,7 +470,7 @@ docker run --rm --entrypoint sh lab/personalization-pipeline:$TAG -c \
 Expected: `flink-s3-fs-hadoop-2.2.0.jar` in the first directory, and
 `pipeline.jar` in the second.
 
-- [ ] **Step 5: Verify the image reached the nodes.**
+- [x] **Step 5: Verify the image reached the nodes.**
 
 ```bash
 docker exec personalization-lab-worker crictl images | grep personalization-pipeline
@@ -437,6 +478,20 @@ docker exec personalization-lab-worker crictl images | grep personalization-pipe
 
 Expected: one line with your tag. Repeat for `worker2` and `worker3`. All three
 must have it, because Task 5 spreads TaskManagers across all three Zones.
+
+**Two things this step got wrong on the first run, both worth building into the
+script.**
+
+`kind load` returns **before** containerd has finished registering the image on
+every node. A check that runs immediately reports a false absence on whichever
+node was slowest. Retry for up to 30 seconds per node before declaring failure.
+
+And do not run the script as `./scripts/build-image.sh | tail -30`. A pipeline's
+exit code is the **last** command's, so `tail` succeeding masks the script's
+`exit 1` entirely. The script printed a red failure and the shell reported
+`exit code 0`. Either drop the pipe or read `${PIPESTATUS[0]}`. This is general,
+not specific to this script: any `set -euo pipefail` script piped into `tail`,
+`head`, or `grep` reports the pipe's status and not its own.
 
 ---
 
@@ -460,31 +515,76 @@ permissions. Green stays empty in this phase.
 Per [CONTEXT.md](../../../CONTEXT.md), `blue` and `green` are namespace names and
 not roles. Phase 5 makes blue the Active Side, and that is a starting position.
 
-**The problem this Secret solves.** The `FlinkDeployment` goes into Git, because
-ArgoCD reads it from Git. A password written there is in history forever. This
-project already refused that twice, for the ArgoCD admin password and for the
-MinIO root password.
+### Why this script exists at all
 
-So the manifest carries a Secret **name**. The name is a reference. It names the
-box without carrying what is in the box.
+Three things force it, and only the third is a choice.
 
-**Why a script and not a manifest.** Same reasoning as
-`scripts/bootstrap-minio-secret.sh`, which this one should read like. The values
-already exist in the cluster, in `storage-configuration` in the `minio-tenant`
-namespace. Secrets are namespaced, so the Flink pods cannot read that one across
-the boundary. The script copies, it does not generate.
+**1. A pod can only mount a Secret from its own namespace.** This is a hard
+Kubernetes rule, not a preference. There is no syntax for `secretKeyRef` to reach
+across a namespace boundary. The credentials exist in `minio-tenant`; the Flink
+pods will be in `personalization-blue`. So a second copy has to exist there. No
+script can avoid that. The only question is what creates it.
+
+**2. It cannot be a manifest in Git.** That is the project rule already applied
+twice, for the ArgoCD admin password and for the MinIO root password. A Secret
+manifest carries base64, which is encoding and not encryption, so committing it
+puts the password in history permanently. The `FlinkDeployment` therefore carries
+a Secret **name**. A name is a reference. It names the box without carrying what
+is in the box.
+
+So the Secret must be created **outside** Git. Something has to run a command.
+
+**3. That command could just be typed.** Here is the honest version. Without the
+script:
+
+```bash
+source scripts/minio-env.sh
+for ns in personalization-blue personalization-green; do
+  kubectl create secret generic minio-credentials -n $ns \
+    --from-literal=access-key="$MINIO_ACCESS_KEY" \
+    --from-literal=secret-key="$MINIO_SECRET_KEY"
+done
+```
+
+Five lines. The script is thin, and it is worth saying so rather than pretending
+otherwise.
+
+### What the script actually buys
+
+| Buys | Worth it? |
+|---|---|
+| **Survives a cluster rebuild.** [README.md](../../../README.md) says the bootstrap scripts must be re-run after `kind delete` plus `kind create`. Without this file you must remember the key names `access-key` and `secret-key`, and both namespaces, months later | This is the real reason |
+| **Records the contract.** Task 5's `secretKeyRef` depends on those exact key names. The script is where they are written down and executable | Yes |
+| **Fits the existing set.** Three bootstrap-ish scripts already exist with the same helpers and the same `README.md` table row | Yes |
+| Idempotence guard | Marginal. `kubectl create` already errors on an existing Secret, which is a safe failure |
+
+### The alternative not taken, and what it costs
+
+In production you would not copy a Secret between namespaces by hand. You would
+use the External Secrets Operator, or a reflector controller that mirrors one
+Secret into many namespaces and keeps them in step.
+
+Rejected here because it means installing another operator to manage one Secret
+whose source is another pod in the same cluster. For this lab the cost is not
+repaid.
+
+**The consequence, and it is the thing that will be forgotten.** The hand-copy is
+the lab-scale answer and not the general one, so a rotation in `minio-tenant`
+will **not** propagate. If that password is ever rotated, `minio-credentials`
+must be deleted in both namespaces and this script re-run. Say so in the script's
+header.
 
 **The failure mode to watch for.** A re-run that regenerates or overwrites a
 password under a running job breaks checkpointing at the next interval, and the
-error surfaces as an S3 403 that looks like a MinIO problem. Make a re-run
-against an existing Secret a no-op, exactly as `bootstrap-minio-secret.sh` does.
+error surfaces as an S3 403 that looks like a MinIO problem. The script copies,
+it never generates, and a re-run against an existing Secret is a no-op.
 
-- [ ] **Step 1: Write `manifests/flink/namespaces.yaml`.**
+- [x] **Step 1: Write `manifests/flink/namespaces.yaml`.**
 
 Two `Namespace` objects. Add a comment saying green is deliberately empty until
 Phase 7, so a reader does not assume it is a mistake.
 
-- [ ] **Step 2: Apply it.**
+- [x] **Step 2: Apply it.**
 
 ```bash
 kubectl apply -f manifests/flink/namespaces.yaml
@@ -505,7 +605,7 @@ category as the `kafka` namespace that Strimzi's own Application creates through
 `CreateNamespace=true`. The file stays tracked in Git either way, so the declared
 state is still in the repository.
 
-- [ ] **Step 3: Write `scripts/bootstrap-flink-secret.sh`.**
+- [x] **Step 3: Write `scripts/bootstrap-flink-secret.sh`.**
 
 It reads the same source `scripts/minio-env.sh` reads:
 
@@ -523,7 +623,7 @@ MinIO calls them root user and root password. S3 calls them access key and secre
 key. Same two strings, two names. `scripts/minio-env.sh` already says this in its
 header, and it is worth saying again here.
 
-- [ ] **Step 4: Run it, then run it a second time.**
+- [x] **Step 4: Run it, then run it a second time.**
 
 ```bash
 ./scripts/bootstrap-flink-secret.sh
@@ -534,7 +634,7 @@ Expected: the first run creates two Secrets. The **second run changes nothing**
 and says so. That is the idempotence guard, and running it twice on purpose is
 how you know it is real.
 
-- [ ] **Step 5: Verify the values match the source.**
+- [x] **Step 5: Verify the values match the source.**
 
 ```bash
 kubectl get secret minio-credentials -n personalization-blue \
@@ -585,7 +685,7 @@ first `FlinkDeployment` you apply in Task 5 is rejected by the API server with a
 webhook call failure, and the message names TLS rather than Flink. Confirm the
 `Certificate` is Ready in this task, not in the next one.
 
-- [ ] **Step 1: Write the Application.**
+- [x] **Step 1: Write the Application.**
 
 Follow `manifests/argocd-apps/strimzi.yaml` exactly in shape, including its habit
 of explaining `metadata.namespace` versus `spec.destination.namespace`. The
@@ -615,11 +715,34 @@ values that differ:
 The `repoURL` is the release directory itself. It serves an `index.yaml`, which
 is what makes it a valid Helm repository rather than only a download page.
 
-- [ ] **Step 2: Apply it and let the root app-of-apps pick it up.**
+- [ ] **Step 2: Commit and push. Do not `kubectl apply` this one.**
+
+`manifests/argocd-apps/root.yaml` already watches `path: manifests/argocd-apps`,
+so the root app-of-apps owns that directory. Applying the file by hand creates an
+Application that ArgoCD did not create, sitting outside the app-of-apps tree
+until a later push causes root to adopt it. That is self-inflicted drift, in the
+phase whose point is observing drift deliberately.
+
+Push it, and root creates the child Application itself. Two automated syncs then
+chain, each on roughly a three minute poll: root syncs and creates
+`flink-operator`, then `flink-operator` syncs itself and installs the chart.
+
+To skip the wait:
 
 ```bash
-kubectl apply -f manifests/argocd-apps/flink-operator.yaml
+kubectl -n argocd annotate app root argocd.argoproj.io/refresh=hard --overwrite
 ```
+
+Watch both:
+
+```bash
+kubectl -n argocd get app root flink-operator \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+```
+
+Note this differs from Task 3's namespaces, which **are** applied by hand. The
+difference is ownership: nothing in ArgoCD claims `manifests/flink/`, while root
+explicitly claims `manifests/argocd-apps/`.
 
 - [ ] **Step 3: Confirm the certificate before anything else.**
 

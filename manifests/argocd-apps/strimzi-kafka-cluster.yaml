@@ -23,4 +23,5 @@ spec:
     automated:
       # ArgoCD will not automatically undo a change you make directly to the cluster
       selfHeal: false
+      # when a resource disappears from Git, delete it from the cluster rather than leaving an orphan
       prune: true
