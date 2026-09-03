@@ -12,7 +12,11 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: flink-operator
-  namespace: argocd          # where the instruction lives
+  namespace: argocd # where the application lives
+  annotations:
+    # Problem: the chart omits `priority` on the CRDs' printer columns, the API server defaults it to 0, and a text diff then reports OutOfSync forever.
+    # Fix: compare against a dry-run apply instead, which receives the same defaults, so both sides match.
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
 spec:
   project: default
   source:
@@ -38,3 +42,5 @@ spec:
       prune: true
     syncOptions:
       - CreateNamespace=true
+      # required by ServerSideDiff=true
+      - ServerSideApply=true
