@@ -4,7 +4,7 @@ metadata:
   name: personalization
   namespace: personalization-blue
 spec:
-  image: lab/personalization-pipeline:0.1-c144539
+  image: lab/personalization-pipeline:0.1-0bd7f52
   imagePullPolicy: IfNotPresent
   flinkVersion: v2_2
   mode: native
