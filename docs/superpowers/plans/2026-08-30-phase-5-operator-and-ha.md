@@ -57,8 +57,8 @@ Nothing in Phase 4 remains open. This plan has no cross-phase dependency.
 | 1 | Shadow fat jar, allowlist scoped | done 2026-08-31, 24MB jar, five content checks pass, 27 tests green |
 | 2 | The image, and loading it into `kind` | done 2026-08-31, tag `0.1-b606416-dirty`, both files verified in-image, present on all 3 workers |
 | 3 | Namespaces and the credentials Secret | done 2026-08-31, idempotence proven by a second run, both Secrets match the source |
-| 4 | The operator, as an ArgoCD Application | not started |
-| 5 | The `FlinkDeployment`, the Service, the PDB | not started |
+| 4 | The operator, as an ArgoCD Application | done 2026-09-02, Synced/Healthy, operator 2/2, `v2_2` on the installed CRD, RBAC in both namespaces |
+| 5 | The `FlinkDeployment`, the Service, the PDB | in progress 2026-09-06, Steps 1 and 2 written, Steps 3 to 14 open |
 | 6 | The gap check instrument | not started |
 | 7 | Drill A: kill a TaskManager | not started |
 | 8 | Drill B: kill the leader JobManager | not started |
@@ -72,17 +72,50 @@ after 5.
 
 ### Where to resume
 
-**Next: Task 4.** Task 5 unblocks once it lands, since 0, 2, and 3 are closed. Task 4
-follows it, and Task 5 then unblocks once 3 and 4 are done, since 0 and 2 are
-already closed.
+**Next: Task 5, Step 3.** Steps 1 and 2 are written into
+`manifests/flink/blue/flinkdeployment.yaml`: the top level block and the whole of
+`spec.flinkConfiguration`, including the deliberate absence of `s3.access-key`
+and `s3.secret-key` with the comment that says so. Steps 3 to 14 are open.
 
-**Carry forward into Task 5.** The image tag currently on the nodes is
-`lab/personalization-pipeline:0.1-b606416-dirty`. The `-dirty` suffix is real:
-`HEAD` is `b606416` and seven paths are uncommitted, including
-`apps/pipeline/build.gradle`, `apps/pipeline/Dockerfile`, and
-`scripts/build-image.sh`. Commit those and re-run `scripts/build-image.sh`
-before writing `spec.image`, or the `FlinkDeployment` will name an image that
-corresponds to no commit.
+Three files named by this task exist but are **empty**:
+`manifests/flink/blue/rest-nodeport.yaml`, `manifests/flink/blue/pdb.yaml`, and
+`manifests/argocd-apps/flink-job-blue.yaml`. An empty file is not an absent file.
+`prune: true` on the Application will not remove an empty document, but ArgoCD
+also cannot render one, so write them before Step 8 rather than after.
+
+**The environment is up** as of 2026-09-06. All six ArgoCD Applications are
+Synced and Healthy, and the operator pod is 2/2 Running.
+
+**One field question settled from the installed CRD.** Upstream docs on the
+operator's `main` branch mark `spec.jobManager.resource` deprecated in favour of
+`resources`. That field **does not exist** on the CRD this cluster has. The
+`jobManager` properties are exactly `['podTemplate', 'replicas', 'resource']`.
+Step 4's `resource: {memory, cpu}` is correct and is the only option.
+
+**Two things to settle before Step 8 syncs anything.**
+
+1. `apps/pipeline/conf/config.yaml` is **deleted** in the working tree. That
+   breaks a global constraint of this phase: `:pipeline:run` against
+   `MiniCluster` must keep working unchanged through Phase 6 and Phase 7. The
+   file is unmodified in `HEAD` (`a34e204`), so
+   `git checkout -- apps/pipeline/conf/config.yaml` restores it. The Dockerfile
+   does not copy `conf/`, so the deletion never affected the image. It only
+   affects the local run.
+
+2. `spec.image` currently reads `lab/personalization-pipeline:0.1-86a77e6`, and
+   `HEAD` is `86a77e6`, so the tag is clean and correct **as written**. It is
+   unverified against the nodes, because the cluster is down. Confirm with
+   `docker exec personalization-lab-worker crictl images | grep personalization`
+   once the cluster is up. Note that restoring `config.yaml` also restores a
+   clean `apps/` tree, so a rebuild would produce the same tag rather than a
+   `-dirty` one.
+
+`scripts/build-image.sh` was changed on 2026-09-06 and the change is
+uncommitted: the dirty check narrowed from `git status --porcelain` to
+`git status --porcelain -- apps/`. The reasoning is sound, since the image
+contents depend on `apps/` alone, and an uncommitted manifest or document should
+not rename an image. It does mean the tag no longer promises a clean tree, only
+clean image inputs.
 
 Note also that rebuilding produces a **different image digest for the same tag**,
 observed on 2026-08-31 as `dbc3f08` then `79c7cf38`. Docker builds are not
@@ -715,7 +748,7 @@ values that differ:
 The `repoURL` is the release directory itself. It serves an `index.yaml`, which
 is what makes it a valid Helm repository rather than only a download page.
 
-- [ ] **Step 2: Commit and push. Do not `kubectl apply` this one.**
+- [x] **Step 2: Commit and push. Do not `kubectl apply` this one.**
 
 `manifests/argocd-apps/root.yaml` already watches `path: manifests/argocd-apps`,
 so the root app-of-apps owns that directory. Applying the file by hand creates an
@@ -744,7 +777,7 @@ Note this differs from Task 3's namespaces, which **are** applied by hand. The
 difference is ownership: nothing in ArgoCD claims `manifests/flink/`, while root
 explicitly claims `manifests/argocd-apps/`.
 
-- [ ] **Step 3: Confirm the certificate before anything else.**
+- [x] **Step 3: Confirm the certificate before anything else.**
 
 ```bash
 kubectl get certificate -n flink-operator
@@ -754,7 +787,7 @@ Expected: `flink-operator-serving-cert`, `READY: True`. If it is not True,
 nothing after this point will work, and the reason is in
 `kubectl describe certificate`.
 
-- [ ] **Step 4: Confirm the operator is running and the CRDs landed.**
+- [x] **Step 4: Confirm the operator is running and the CRDs landed.**
 
 ```bash
 kubectl get pods -n flink-operator
@@ -764,7 +797,7 @@ kubectl get crd | grep flink.apache.org
 Expected: one operator pod Running with all containers ready, and four CRDs,
 including `flinkdeployments.flink.apache.org`.
 
-- [ ] **Step 5: Confirm `v2_2` is really accepted by the installed CRD.**
+- [x] **Step 5: Confirm `v2_2` is really accepted by the installed CRD.**
 
 ```bash
 kubectl get crd flinkdeployments.flink.apache.org -o jsonpath=\
@@ -775,7 +808,7 @@ Expected: a list ending in `v2_0 v2_1 v2_2`. This is the single fact the whole
 phase rests on, so read it from the installed CRD rather than from the chart
 tarball.
 
-- [ ] **Step 6: Confirm RBAC landed in both job namespaces.**
+- [x] **Step 6: Confirm RBAC landed in both job namespaces.**
 
 ```bash
 for ns in personalization-blue personalization-green; do
@@ -858,7 +891,7 @@ against the default 2048 buffers, because this graph has five `keyBy` shuffles.
 The `256mb` network setting gives 8192 buffers. A container sized below the
 process size hits the same wall from the other direction, as an OOMKill.
 
-- [ ] **Step 1: Write the `FlinkDeployment`, top level.**
+- [x] **Step 1: Write the `FlinkDeployment`, top level.**
 
 ```yaml
 apiVersion: flink.apache.org/v1beta1
@@ -878,7 +911,7 @@ spec:
 image exists only in the nodes' image stores. A pull attempt reaches no registry
 and fails.
 
-- [ ] **Step 2: Write `spec.flinkConfiguration`.**
+- [x] **Step 2: Write `spec.flinkConfiguration`.**
 
 Every value is a **string** in this map, including numbers. Carried unchanged
 from `apps/pipeline/conf/config.yaml`:

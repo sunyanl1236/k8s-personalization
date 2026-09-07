@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-08-31
+Last updated: 2026-09-06
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
@@ -624,7 +624,85 @@ check.
   `--dry-run=client` did **not** catch it, since it never contacts the API
   server; it printed two `created (dry run)` lines for a type that does not
   exist. Use `--dry-run=server` by default.
-- ⬜ Tasks 4 to 11
+- ✅ Task 4: the operator, as an ArgoCD Application. `flink-kubernetes-operator`
+  1.15.0 from `https://downloads.apache.org/flink/flink-kubernetes-operator-1.15.0/`,
+  which serves an `index.yaml` and so is a valid Helm repo, not only a download
+  page. Synced and Healthy, operator pod `2/2 Running`, four CRDs installed.
+  Gates read from the **installed** CRD rather than the chart tarball: the
+  `flinkVersion` enum ends `"v2_0","v2_1","v2_2"`. RBAC landed in both job
+  namespaces, and `watchNamespaces` also gave the operator **namespaced**
+  `flink-operator` Roles there instead of cluster-scoped ones.
+  The pod's two containers are `flink-kubernetes-operator` and `flink-webhook`.
+  The second is what `flink-operator-serving-cert` serves TLS for, which is why
+  cert-manager is a real prerequisite and why an unready certificate would fail a
+  Task 5 apply with a message about TLS rather than about Flink.
+  **The Application is not applied by hand.** `root.yaml` watches
+  `path: manifests/argocd-apps`, so it must be committed and pushed, and root
+  creates the child Application. Applying it with `kubectl` would create an
+  Application outside the app-of-apps tree, which is self-inflicted drift in the
+  phase whose point is observing drift deliberately. This differs from Task 3's
+  namespaces, which **are** applied by hand, because nothing in ArgoCD claims
+  `manifests/flink/`.
+  **A permanent OutOfSync, diagnosed rather than tolerated.** The Application sat
+  OutOfSync while Healthy, on all four CRDs. The whole diff was three lines of
+  `> priority: 0`: the chart omits `priority` on `additionalPrinterColumns`, the
+  API server defaults it, and a text diff then reports drift forever. Fixed with
+  `argocd.argoproj.io/compare-options: ServerSideDiff=true`, which compares
+  against a dry-run apply so both sides carry the same defaults. Left unfixed it
+  would have been worse than cosmetic, since this project uses OutOfSync as the
+  **signal** in Drill D.
+  `ServerSideApply=true` was added as well, and for its **own** reason, not as a
+  dependency: an earlier claim that `ServerSideDiff` requires it was wrong, and
+  the docs record that the old structured-merge strategy which `ServerSideApply`
+  used to select was discontinued precisely because it mishandled CRD defaults.
+  The real justification is measured: client-side apply stores the whole object in
+  a `last-applied-configuration` annotation capped at 262144 bytes, and
+  `flinkdeployments` was using **166871**, 64% of the limit, on a CRD that grows
+  each release. After the change, `managedFields` shows
+  `argocd-controller/Apply` instead of `/Update` and the annotation is **0 bytes**.
+  **How to read a diff without the argocd CLI**, which is not installed and which
+  README deliberately does not install:
+  `kubectl -n argocd exec argocd-application-controller-0 -- argocd --core app diff <app>`.
+  The binary ships in the image. The `argocd-server` pod's ServiceAccount lacks
+  the RBAC for it; the application controller's does not.
+- 🟡 Task 5: the `FlinkDeployment`, the Service, the PDB. **In progress.**
+  Steps 1 and 2 are written into `manifests/flink/blue/flinkdeployment.yaml`:
+  the top level block (`image`, `imagePullPolicy: IfNotPresent`,
+  `flinkVersion: v2_2`, `mode: native`, `serviceAccount: flink`) and the whole
+  of `spec.flinkConfiguration`. `s3.access-key` and `s3.secret-key` are absent
+  on purpose and carry the comment that says so, because their absence is what
+  makes Hadoop S3A fall through to `EnvironmentVariableCredentialsProvider` and
+  pick up the four environment variables Step 3 adds.
+  Steps 3 to 14 are open: the shared `podTemplate`, the two role blocks with
+  their Zone spread constraints, the `job` block, the NodePort Service, the
+  PodDisruptionBudget, the ArgoCD Application, and every verification.
+  `manifests/flink/blue/rest-nodeport.yaml`, `manifests/flink/blue/pdb.yaml`,
+  and `manifests/argocd-apps/flink-job-blue.yaml` exist as **empty** files.
+  Nothing of this task has reached the cluster. Nothing is committed either;
+  `manifests/flink/blue/` and `manifests/argocd-apps/flink-job-blue.yaml` are
+  both untracked, and ArgoCD reads GitHub rather than the working tree, so an
+  uncommitted Application is invisible to it.
+  **The environment is up** as of 2026-09-06. Six Applications Synced and
+  Healthy, operator 2/2 Running, Kubernetes server v1.34.8.
+  **`resource` versus `resources`, settled from the installed CRD.** Upstream
+  docs on the operator's `main` branch mark `spec.jobManager.resource`
+  deprecated in favour of `resources`. That field does not exist on operator
+  1.15.0's CRD, whose `jobManager` properties are exactly
+  `['podTemplate', 'replicas', 'resource']`. The plan's shape is the only one
+  available. Same discipline as Task 4 Step 5: read the installed CRD, not the
+  docs for a later release.
+  **A global constraint is currently broken.** `apps/pipeline/conf/config.yaml`
+  is deleted in the working tree. The phase requires `:pipeline:run` against
+  `MiniCluster` to keep working unchanged through Phase 6 and Phase 7. The file
+  is intact in `HEAD`, so `git checkout -- apps/pipeline/conf/config.yaml`
+  restores it. The image is unaffected, since the Dockerfile never copied
+  `conf/`.
+  **`scripts/build-image.sh` changed, uncommitted.** The dirty check narrowed
+  from the whole tree to `apps/` only. Image contents depend on `apps/` alone,
+  so an uncommitted manifest no longer renames the image. The tag now promises
+  clean image inputs rather than a clean tree.
+- ⬜ Tasks 6 to 11
+
 
 **One step still open from Task 0.** Step 5, re-confirming the host-side
 `external` listener after the broker roll, was never run. One command closes it:

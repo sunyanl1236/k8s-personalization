@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flink-job-blue
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sunyanl1236/k8s-personalization
+    targetRevision: HEAD
+    path: manifests/flink/blue
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: personalization-blue
+  syncPolicy:
+    automated:
+      selfHeal: false
+      prune: true

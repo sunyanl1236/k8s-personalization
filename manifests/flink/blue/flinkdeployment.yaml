@@ -1,0 +1,103 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: personalization
+  namespace: personalization-blue
+spec:
+  image: lab/personalization-pipeline:0.1-86a77e6
+  imagePullPolicy: IfNotPresent
+  flinkVersion: v2_2
+  mode: native
+  serviceAccount: flink
+  # map[string]string, so every number and boolean below is quoted
+  flinkConfiguration:
+    state.backend.type: rocksdb
+    execution.checkpointing.interval: 10s
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.incremental: "true"
+    execution.checkpointing.num-retained: "3"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    pipeline.generic-types: "false"
+
+    s3.path.style.access: "true"
+    # s3.access-key and s3.secret-key are absent on purpose: they arrive as env vars from the minio-credentials Secret
+    s3.endpoint: http://minio.minio-tenant.svc.cluster.local
+
+    execution.checkpointing.dir: s3://checkpoints/phase-5
+    high-availability.type: kubernetes
+    high-availability.storageDir: s3://checkpoints/phase-5-ha #  the JobGraph and pointers. The ConfigMap holds only a pointer to this
+    execution.checkpointing.savepoint-dir: s3://checkpoints/phase-5-savepoints
+
+    jobmanager.scheduler: Adaptive #  the scheduler can run at reduced parallelism when slots are short, rather than waiting
+    taskmanager.numberOfTaskSlots: "2"
+    # ClusterIP because Flink cannot pin a NodePort number (pin localhost, same machine); rest-nodeport.yaml does that instead
+    kubernetes.rest-service.exposed.type: ClusterIP
+
+    taskmanager.memory.process.size: 2gb
+    taskmanager.memory.network.min: 256mb
+    taskmanager.memory.network.max: 256mb
+  podTemplate:
+    spec:
+      containers:
+        - name: flink-main-container
+          env:
+            # AWS_* are read by Hadoop S3A's EnvironmentVariableCredentialsProvider
+            # on the TaskManagers, which never run main()
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: secret-key
+            # MINIO_* are read by Env.require at PersonalizationJob.java:191,
+            # on the leader JobManager only
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: access-key
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: secret-key
+  jobManager:
+    replicas: 2
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: personalization
+                component: jobmanager
+  taskManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone # node label in kind-cluster.yaml
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app: personalization
+                component: taskmanager
+  job: # application mode
+    jarURI: local:///opt/flink/usrlib/pipeline.jar
+    parallelism: 6
+    upgradeMode: savepoint
+    state: running
+    args:
+      - "--bootstrap-servers=personalization-kafka-bootstrap.kafka.svc.cluster.local:9092"

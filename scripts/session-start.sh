@@ -221,11 +221,30 @@ reconcile_kubelet_ip() {
 # zero clusters and zero listeners on every container start: its startup
 # script overwrites /home/envoy/cds.yaml and /home/envoy/lds.yaml with empty
 # resource lists before launching Envoy, and nothing else in this project
-# repopulates them. Left alone, the load balancer comes up after every
+# repopulates them.
+#
+# The Envoy reload below anchors its pgrep pattern with ^ on purpose. That
+# whole start command sits in PID 1's own command line, so an unanchored
+# "envoy -c" matches three processes: PID 1, the real Envoy, and the very
+# `sh -c` doing the killing. `kill -9` on PID 1 takes the container down,
+# `docker exec` then returns 137, and `set -e` aborts this script before the
+# kubeconfig normalization and the status report ever run. Anchoring the
+# pattern leaves exactly the Envoy process. Left alone, the load balancer comes up after every
 # restart with no route to any control-plane node, and kubectl fails with a
 # bare EOF talking to it. This regenerates both files from the current
 # pinned control-plane IPs and forces Envoy to reload, skipping the reload
 # if the routes are already correct.
+#
+# Both files have to end up owned by the container's own 'envoy' user (uid
+# 101). The image entrypoint drops privileges with su-exec, so the start
+# command that rewrites them runs as 101, while `docker cp` lands them owned
+# by the host user instead. Truncating a file you do not own is refused even
+# though the directory is writable, so the rewrite fails with "Permission
+# denied", the container's `&&` chain aborts, and the load balancer exits 1
+# on every later start. That takes the published apiserver port down with it,
+# and kubectl then fails with a bare "connection refused" against a port
+# nothing is listening on. `docker cp` is followed by an explicit chown for
+# exactly that reason.
 # ---------------------------------------------------------------------------
 LB_NAME="${CLUSTER_NAME}-external-load-balancer"
 
@@ -303,7 +322,8 @@ YAML
   info "Repopulating load balancer routes to the control plane"
   d cp "$tmp_cds" "${LB_NAME}:/home/envoy/cds.yaml"
   d cp "$tmp_lds" "${LB_NAME}:/home/envoy/lds.yaml"
-  d exec "$LB_NAME" sh -c 'kill -9 $(pgrep -f "envoy -c") 2>/dev/null || true'
+  d exec "$LB_NAME" chown envoy:envoy /home/envoy/cds.yaml /home/envoy/lds.yaml
+  d exec "$LB_NAME" sh -c 'kill -9 $(pgrep -f "^envoy -c") 2>/dev/null || true'
   ok "Load balancer routes updated (${#cp_ips[@]} control-plane backend(s): ${cp_ips[*]})"
 }
 

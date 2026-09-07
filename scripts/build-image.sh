@@ -30,10 +30,10 @@ kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER}" \
 
 SHA="$(git rev-parse --short HEAD)"
 SUFFIX=""
-if [[ -n "$(git status --porcelain)" ]]; then
+if [[ -n "$(git status --porcelain -- apps/)" ]]; then
   SUFFIX="-dirty"
-  warn "working tree is dirty; tagging ${SHA}${SUFFIX}"
-  warn "the image will not correspond to any commit until you commit and rebuild"
+  warn "apps/ has uncommitted changes; tagging ${SHA}${SUFFIX}"
+  warn "the image contents will not match this commit until you commit and rebuild"
 fi
 TAG="0.1-${SHA}${SUFFIX}"
 IMAGE="${IMAGE_NAME}:${TAG}"
