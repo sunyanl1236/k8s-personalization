@@ -12,6 +12,7 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.cep.CEP;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.GlobalConfiguration;
+import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -190,6 +191,14 @@ public class PersonalizationJob {
 
         flinkConfig.setString("s3.access-key", Env.require("MINIO_ACCESS_KEY"));
         flinkConfig.setString("s3.secret-key", Env.require("MINIO_SECRET_KEY"));
+
+        // On Kubernetes the operator renders job.jarURI into this file as
+        // pipeline.jars=local:///opt/flink/usrlib/pipeline.jar. Flink's entrypoint
+        // has already consumed that scheme; re-reading the file hands it back, and
+        // ExecutionConfigAccessor.getJars then calls new URL() on it, which fails
+        // with MalformedURLException: unknown protocol: local. Absent under
+        // MiniCluster, so this is a no-op locally.
+        flinkConfig.removeConfig(PipelineOptions.JARS);
 
         if (config.restoreFrom() != null) {
             flinkConfig.set(StateRecoveryOptions.SAVEPOINT_PATH, config.restoreFrom());
