@@ -914,3 +914,31 @@ Confirmed directly from Strimzi's docs rather than assumed: **ZooKeeper is gone,
 
 Why this project specifically uses it, not just "it's popular": it's the exact mechanism behind the four reserved Kafka ports in `kind-cluster.yaml` (`ADR 0002`, Strimzi's `nodeport` listener creates one `NodePort` Service per broker plus bootstrap, not one shared port), it keeps the whole stack's architectural pattern consistent (operator-managed everything, no exceptions), and it's a real CNCF project underlying Red Hat's commercial Kafka product, not a lab-only convenience.
 
+
+## Why `fs.inotify.max_user_instances` had to be raised
+
+### The symptom
+
+Nodes go `NotReady`, or containers fail with `too many open files`. Neither
+message mentions inotify, which is why this costs time to find.
+
+### The mechanism
+
+Every kubelet and every container runtime watches files for changes, and each
+watcher consumes one inotify instance. The kernel default is 128 per user. A
+6-node kind cluster exhausts that, because all six nodes are processes belonging
+to the same host user.
+
+### The fix
+
+`/etc/sysctl.d/99-kind.conf` raises the limit to 1024:
+
+```
+fs.inotify.max_user_instances = 1024
+```
+
+This is one of only two permanent host settings this project keeps. The other is
+`C:\Users\yilul\.wslconfig`, giving WSL 24GB against a stack that needs about
+13Gi, applied on `wsl --shutdown`. Both are exceptions to the
+scoped-and-reversible rule in [README.md](../../README.md), taken because
+neither has a per-session form.

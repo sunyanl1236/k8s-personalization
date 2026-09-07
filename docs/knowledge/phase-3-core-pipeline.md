@@ -16,21 +16,17 @@ This file is only for how things actually work.
 Came up in Task 2, while exposing MinIO's S3 API so `MiniCluster` on the host
 could write checkpoints to it.
 
-The confusion is worth recording because the obvious mental model is wrong. A
-`NodePort` Service looks like it should chain: host port, then ClusterIP, then
-pod. It does not. There is no process listening on the ClusterIP at all. A
-Service is a set of packet-rewriting rules that `kube-proxy` programs into the
-node's iptables or nftables, so nothing ever "arrives" at the ClusterIP to be
-forwarded onward.
+**The general mechanism now lives in one place**, in
+[phase-1-data-platform.md](phase-1-data-platform.md), under "The three port
+numbers: two ways in, one way out". It covers the two entrances, the single
+exit, why nothing listens on the ClusterIP, and what changing each of the three
+numbers actually does. Read that first. What follows is only this cluster's
+instance of it.
 
-`nodePort` and `port` are two separate keys in the same rewrite table, not two
-hops in one path. Both keys name the same right-hand side, which is
-`targetPort`.
-
-MinIO's ClusterIP is 10.96.241.160 and targetPort is 9000. Say the pod's IP is
+MinIO's ClusterIP is 10.96.241.160 and `targetPort` is 9000. Say the pod's IP is
 10.244.1.7 (check yours with `kubectl get pod -n minio-tenant -o wide`).
 
-Your path, from the host:
+From the host:
 
 ```
 localhost:30014
@@ -39,7 +35,7 @@ localhost:30014
               └─▶ pod, listening on 9000
 ```
 
-A pod inside the cluster calling the Service:
+From a pod inside the cluster:
 
 ```
 curl http://minio.minio-tenant.svc:80
@@ -48,22 +44,15 @@ curl http://minio.minio-tenant.svc:80
               └─▶ pod, listening on 9000
 ```
 
-Two entry points. Both rules end at targetPort. Neither one visits the other.
+Two entry points. Both rules end at `targetPort`. Neither one visits the other.
 
-Corrected diagram
+**Note the asymmetry, which the Phase 5 Flink Service does not show.** Here
+`port` is **80** and `targetPort` is **9000**, on the Operator-created `minio`
+Service. Different door number, same exit. That is the sharpest available proof
+that the two numbers are independent.
 
-                    ┌─ nodePort 30014 ─┐
-host / any node ────┤                  ├──▶ pod 10.244.1.7:9000   (targetPort)
-                    │                  │
-in-cluster client ──┴─ port 80 ────────┘
-                       (ClusterIP 10.96.241.160)
+### One consequence worth keeping
 
-### Three consequences worth keeping
-
-- **`targetPort` is the only one of the three that must be correct.** It sits on
-  the right-hand side of both rules. `nodePort` decides how the host gets in.
-  `port` is only used by in-cluster callers addressing the ClusterIP, and
-  nothing in this project does that, so its value is free.
 - **The rules are generated from the `selector`, not from the Service name.** A
   wrong selector produces a Service that is created without error and routes
   nowhere. Listing the endpoints prints the real `podIP:targetPort` list, so an
@@ -1325,3 +1314,62 @@ either an open question in the design or something that cost real time.
 6. **A checkpoint directory without `_metadata` is not a checkpoint.** Restoring
    from one fails with `FileNotFoundException`, and a bucket listing cannot
    distinguish it from a good one. Read `Completed checkpoint N` from the log.
+
+## Why the output looks like silence, then a burst
+
+### The symptom
+
+A `read_committed` consumer on `recommendation` shows nothing for about ten
+seconds, then many records at once, then nothing again. It looks like a stall.
+
+### It is the exactly-once sink working
+
+The sink is transactional. Records become visible only when the checkpoint
+covering them commits the transaction. `execution.checkpointing.interval` is
+`10s`, so the visible period is 10s. The sawtooth *is* the mechanism.
+
+### Why `isolation.level=read_committed` matters
+
+```bash
+kcat -C -b localhost:30016 -t recommendation -X isolation.level=read_committed
+```
+
+Without it, a consumer sees records from transactions that were never committed,
+including the orphan a restart is meant to fence away.
+
+### Two things that confuse when reading the output
+
+1. **Offsets advance by 2 per record.** Each committed transaction writes a
+   control record into every partition it touched. Those occupy an offset and are
+   never delivered to consumers, so a plain record count and the offset counter
+   disagree by design.
+2. **Timestamps are ordered per Shopper, not globally.** Records are keyed by
+   `shopperId`, and Kafka orders within a partition only.
+
+## Why Gradle commands need `-p apps`
+
+### The symptom
+
+```
+$ apps/gradlew run
+does not contain a Gradle build
+```
+
+### The mechanism
+
+Gradle resolves the build root from the **working directory**, not from where
+the `gradlew` script lives. The build moved under `apps/` in Phase 3, so the
+repo root has no `settings.gradle` and the wrapper alone cannot find one.
+
+### The two equivalent forms
+
+```bash
+apps/gradlew -p apps :generator:run      # flag form
+cd apps && ./gradlew :generator:run      # directory form
+```
+
+The flag form is used throughout this project so Gradle, `kubectl` and `kcat`
+commands can all run from the repo root without changing directory between them.
+
+The task is `:generator:run` and not a bare `run` because the Phase 3 build is
+multi-project.

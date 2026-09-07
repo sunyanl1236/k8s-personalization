@@ -1498,13 +1498,9 @@ have been green with the typo in place.
 
 ---
 
-The nine sections below were written together during Task 5, from questions
-asked while writing `manifests/flink/blue/`. They are grouped by topic rather
-than by the order the confusion arrived: the labels on the document, then the
-document itself, then one field family inside it, then the network out of the
-JobManager, then the network into MinIO, then how its pods are placed across
-Zones, then how they are allowed to go away, then how selectors are spelled,
-then how state survives a restart, then why one job spans three pods.
+The sections below were written together during Task 5, from questions asked
+while writing `manifests/flink/blue/` and `manifests/argocd-apps/flink-job-blue.yaml`.
+They are grouped by topic rather than by the order the confusion arrived.
 
 Every observed value in them was read from this cluster on 2026-09-06.
 
@@ -1592,6 +1588,82 @@ different places, at three different times, and each one says where to look.
 flinkVersion: v2_2                     (the FlinkDeployment)
 FROM flink:2.2.0                       (the Dockerfile)
 flinkVersion = '2.2.0'                 (build.gradle)
+```
+
+| Pair | Checked by | When |
+|---|---|---|
+| `build.gradle` 2.2.0 vs the API the code calls | the Java compiler | build time, loudly |
+| `build.gradle` 2.2.0 vs `FROM flink:2.2.0` | **nothing** | never |
+| `flinkVersion: v2_2` vs `FROM flink:2.2.0` | **nothing** | never |
+
+The second row follows from `build.gradle` declaring almost everything
+`compileOnly`:
+
+```groovy
+compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
+runtimeOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
+```
+
+`compileOnly` means "compile against this, do not put it in the jar", which is
+correct because `flink:2.2.0` already ships those classes in `/opt/flink/lib`.
+That is also why the Shadow jar is 24 mb and carries only two allowlisted
+dependencies. The consequence is that the job compiles against 2.2.0 classes and
+then runs against whatever classes the image holds.
+
+**Change those three together, always.** They are one decision written in three
+files, and no tool reports it if only two are edited.
+
+### The second row, observed for real on 2026-09-07
+
+The first deploy of `flink-job-blue` crash-looped both JobManagers twelve times.
+The whole diagnosis is one line of the stack trace:
+
+```
+java.lang.UnsupportedClassVersionError: lab/personalization/pipeline/PersonalizationJob
+has been compiled by a more recent version of the Java Runtime (class file
+version 65.0), this version of the Java Runtime only recognizes class file
+versions up to 61.0
+```
+
+Class file version **65 is Java 21**. Class file version **61 is Java 17**.
+
+| Side | Value | Where it is set |
+|---|---|---|
+| built with | Java 21 | `apps/pipeline/build.gradle:11`, `javaVersion = '21'`, and the same toolchain in `apps/domain` and `apps/generator` |
+| runs on | Java 17 | `apps/pipeline/Dockerfile`, `FROM flink:2.2.0`, whose JVM is Temurin 17.0.19 |
+
+**Nothing caught it, exactly as the table above predicts.** The Gradle build
+succeeded. The Shadow jar was produced. The image built. `kind load` worked. The
+server-side dry run passed. ArgoCD reported Synced and Healthy. The failure
+appeared only when a JVM tried to load the class.
+
+**And `:pipeline:run` against `MiniCluster` still works**, because that runs on
+the host's Java 21. The local run never exercises this seam. That is what makes
+the seam unchecked: the two sides only meet inside the container.
+
+The fix that fits this phase's constraints is the image side, not the build
+side. `apps/domain` is bundled into the Shadow jar (`bundled project(':domain')`
+at `apps/pipeline/build.gradle:79`), so compiling for Java 17 would mean editing
+`apps/domain/build.gradle` too, which the global constraints forbid. Apache
+publishes per-JDK image variants, all confirmed present on 2026-09-07:
+
+```
+flink:2.2.0-java21   exists
+flink:2.2.0-java17   exists
+flink:2.2.0-java11   exists
+```
+
+One word in `apps/pipeline/Dockerfile` closes it, with no Java changes at all.
+
+**The lesson generalises past Java.** A base image pins a JDK, a JVM, a libc, and
+a set of system libraries. None of those appear in `build.gradle`, and no tool in
+the chain compares them.
+
+Verifying the agreement, once pods are healthy:
+
+```bash
+kubectl exec -n personalization-blue deploy/personalization -- flink --version
+kubectl exec -n personalization-blue deploy/personalization -- java -version
 ```
 
 ## The anatomy of a `FlinkDeployment`
@@ -2814,3 +2886,437 @@ For this lab, isolation is the point:
 Three is what makes Drill C legible: drain one Zone and exactly one third of the
 slots go, visibly. With one TaskManager there is nothing to observe, because
 draining its Zone takes everything.
+
+## The Application does not contain the manifests. It contains their address.
+
+### The idea
+
+`manifests/argocd-apps/flink-job-blue.yaml` is twenty lines and mentions none of
+the three files it deploys. What it holds is a **three-part coordinate**:
+
+```yaml
+source:
+  repoURL: https://github.com/sunyanl1236/k8s-personalization   # WHICH repo
+  targetRevision: HEAD                                          # WHICH commit
+  path: manifests/flink/blue                                    # WHICH directory
+```
+
+Everything else is ArgoCD following that pointer. Nothing reads the working
+tree. `targetRevision: HEAD` means the repository's **default branch**, not the
+locally checked-out one, which is the trap recorded at the end of this section.
+
+### Step 1: `repo-server` turns a directory into a list of objects
+
+```
+repo-server:
+  git clone <repoURL>
+  git checkout <the commit targetRevision resolves to>
+  cd <path>
+```
+
+Then it asks what kind of directory this is:
+
+| If it finds | It runs |
+|---|---|
+| `Chart.yaml` | `helm template` |
+| `kustomization.yaml` | `kustomize build` |
+| **neither** | **plain directory mode** |
+
+`manifests/flink/blue/` holds `flinkdeployment.yaml`, `pdb.yaml`, and
+`rest-nodeport.yaml`, with no `Chart.yaml` and no `kustomization.yaml`. So
+"rendering" means nothing more than reading every `.yaml` recursively and
+parsing each document. Three objects out, byte for byte what was written, no
+templating.
+
+This is why `flink-operator.yaml` looks so different: it points at a Helm repo,
+so the same step runs `helm template` with its `valuesObject`. One step, three
+possible tools, chosen by what is in the directory.
+
+### Step 2: `application-controller` diffs
+
+```
+desired = the objects from step 1
+live    = what the API server currently holds for those names
+diff    = desired - live
+```
+
+### Step 3: `application-controller` applies
+
+It calls the Kubernetes API for each differing object, the same operation
+`kubectl apply` performs from a different client. Two things happen to the
+manifests on the way through.
+
+**A missing namespace is filled in** from `destination.namespace`. An object
+that declares its own namespace keeps it. This is why `pdb.yaml` would have
+worked without its `namespace:` line under ArgoCD, and why relying on that was
+still wrong: a hand `kubectl apply` would have put it in `default`.
+
+**A tracking annotation is stamped.** Observed on this cluster, 2026-09-06:
+
+```
+argocd.argoproj.io/tracking-id: minio-tenant:/Service:minio-tenant/minio-s3-api
+                                └────┬─────┘ └──┬──┘ └───────┬────────────┘
+                                  app name    kind      namespace/name
+```
+
+**That annotation is how `prune: true` works.** Delete `pdb.yaml` from Git and
+the next sync asks the cluster what carries a `tracking-id` for this app, finds
+a PodDisruptionBudget no longer in the desired list, and deletes it. Without the
+stamp it could not tell this app's objects from anyone else's.
+
+### Which identity does the applying
+
+```bash
+kubectl get statefulset argocd-application-controller -n argocd \
+  -o jsonpath='{.spec.template.spec.serviceAccountName}'
+```
+
+Read 2026-09-06: **`argocd-application-controller`**, in the `argocd` namespace.
+`repo-server` runs as a different ServiceAccount, `argocd-repo-server`, and
+never touches the cluster's API at all. It only reads Git.
+
+What that identity is allowed to do:
+
+```bash
+kubectl get clusterrole argocd-application-controller \
+  -o jsonpath='{range .rules[*]}apiGroups={.apiGroups} resources={.resources} verbs={.verbs}{"\n"}{end}'
+```
+
+```
+apiGroups=["*"] resources=["*"] verbs=["*"]
+```
+
+**Cluster-admin in all but name**, through a `ClusterRoleBinding` of the same
+name. That is not an accident of this install. A GitOps controller must be able
+to create arbitrary kinds in arbitrary namespaces, because the whole point is
+that a new file in Git can introduce a kind nobody anticipated.
+
+The consequence worth stating plainly: **write access to the watched Git
+repository is equivalent to cluster-admin on this cluster.** The `project:
+default` field is where that would be narrowed in a real deployment, by an
+`AppProject` restricting which repos, namespaces, and kinds an Application may
+touch. This project leaves it at `default`, which permits everything. See "What
+the Application's own fields decide" earlier in this file.
+
+### Step 4: the ordinary controllers take over
+
+ArgoCD's job ends when the object is in etcd:
+
+```
+Service              -> endpoints controller builds the EndpointSlice
+                     -> kube-proxy on every node writes the forwarding rules
+PodDisruptionBudget  -> the disruption controller starts counting healthy pods
+FlinkDeployment      -> the Flink operator reconciles it into pods
+```
+
+### The whole path
+
+```
+laptop
+   git push
+      │
+      ▼
+   GitHub                      <- the only copy anything reads
+      │
+      │  repo-server: clone, checkout, cd into path,
+      ▼                        detect the tool, produce a list of objects
+   [FlinkDeployment] [Service] [PDB]
+      │
+      │  application-controller: diff against live, then apply as
+      ▼                        argocd-application-controller, filling in
+   Kubernetes API server       namespace and stamping tracking-id
+      │
+      ▼  etcd
+   endpoints controller, kube-proxy, disruption controller, Flink operator
+```
+
+### Why there are two Application files at all
+
+**One installs the machine. The other gives the machine work to do.**
+
+```
+flink-operator     installs the thing that knows HOW to run Flink jobs
+flink-job-blue     says WHICH job to run
+```
+
+Four reasons to keep them apart.
+
+**They change at different speeds.** The operator is upgraded maybe twice a
+year. The job changes every time the code changes. As one Application, every
+code push would also be an operator upgrade.
+
+**One machine, many jobs.** Phase 7 adds `flink-job-green`, using the same
+operator. If the operator were bundled inside `flink-job-blue`, green would need
+a second operator, and two operators watching the same namespace fight each
+other.
+
+**Order matters.** The `FlinkDeployment` kind does not exist until the
+operator's CRD is installed. Two Applications make that dependency visible. One
+Application would try to apply the CRD and the `FlinkDeployment` together and
+fail, because the second names a kind the cluster has not learned yet.
+
+**Deleting them means different things.** Delete `flink-job-blue` and the job
+stops. Delete `flink-operator` and the CRDs go, which garbage-collects every
+`FlinkDeployment` in the cluster. Very different actions, and they should not
+share one switch.
+
+This is the pattern every component in this project follows:
+
+```
+minio-operator    +  minio-tenant
+strimzi           +  strimzi-kafka-cluster
+flink-operator    +  flink-job-blue
+```
+
+Left side installs a controller. Right side hands it something to control.
+
+### Two Applications, same schema, different everything else
+
+| | `flink-operator.yaml` | `flink-job-blue.yaml` |
+|---|---|---|
+| Source kind | a **Helm repository** | a **Git directory** |
+| `repoURL` | `https://downloads.apache.org/flink/flink-kubernetes-operator-1.15.0/` | this project's own repo |
+| Needs `chart:` | yes, `flink-kubernetes-operator` | no |
+| `targetRevision` | `1.15.0`, a pinned chart version | `HEAD`, the default branch |
+| Needs `path:` | no | yes, `manifests/flink/blue` |
+| Step 1 runs | `helm template` with `valuesObject` | plain YAML parsing |
+| What it installs | the **controller**: an operator Deployment, CRDs, webhooks, RBAC | the **custom resources** that controller reconciles |
+| `CreateNamespace=true` | yes, it creates `flink-operator` | **no**, Task 3 created the namespace by hand |
+| `ServerSideApply=true` | yes, the CRD's `last-applied-configuration` was at 166871 of 262144 bytes | no, three small manifests |
+| `ServerSideDiff=true` | yes, the chart omits `priority` on printer columns and the API server defaults it | no, no such field |
+
+**Why `targetRevision` differs is the sharpest line in that table.** A pinned
+version is right for a third-party chart, where an unannounced upgrade is a
+risk. `HEAD` is right for the repository that is the source of truth, where the
+whole point of GitOps is that a push deploys. `root.yaml` records the same
+reasoning for itself.
+
+This pairing, one Application for the controller and one for its resources, is
+the convention every component in this project follows: `minio-operator` with
+`minio-tenant`, `strimzi` with `strimzi-kafka-cluster`, `flink-operator` with
+`flink-job-blue`.
+
+### The trap: `HEAD` is not your branch
+
+Observed 2026-09-06, while `flink-job-blue` was failing to appear at all:
+
+```
+root.yaml targetRevision:     HEAD
+root last synced revision:    86a77e6
+
+origin/master     86a77e6      <- what ArgoCD was reading
+origin/phase-2    e018cbd
+local HEAD        b0705e0      <- where the work actually was
+```
+
+`git status` was clean, so everything **was** committed. It was committed to a
+branch nothing watches. `targetRevision: HEAD` resolves to the repository's
+default branch, which is `master`. Committing to a feature branch forever
+deploys nothing, and produces no error anywhere: the Application simply never
+gets created, because `root` never sees the file.
+
+### What Kustomize is, and when this project will want it
+
+`repo-server` picks its tool by looking for `Chart.yaml` or `kustomization.yaml`.
+Neither exists in `manifests/flink/blue/`, so plain directory mode wins. Here is
+what the missing third option would have done.
+
+**The problem.** You have a folder of YAML that works. Soon you need a second
+folder that is almost identical. Phase 7 needs a `green` copy of `blue`. Only
+the namespace and a couple of paths change.
+
+Copy the folder, and there are now two files to fix every time you fix a bug.
+One will get forgotten.
+
+**What Kustomize does.** You keep one copy. You write a small file that says
+"same as that folder, but change these two things."
+
+```
+base/          the three files, unchanged
+blue/          "use base, but namespace = personalization-blue"
+green/         "use base, but namespace = personalization-green"
+```
+
+The `green` change file lists only what differs:
+
+```yaml
+kind: FlinkDeployment
+metadata:
+  name: personalization
+spec:
+  flinkConfiguration:
+    execution.checkpointing.dir: s3://checkpoints/phase-7-green
+```
+
+Kustomize matches that to the base by `kind` plus `name`, then merges by
+structure. Anything not mentioned stays as the base has it.
+
+**Why it is not Helm.** Helm turns the YAML into a template full of `{{ }}`
+holes. After that `kubectl apply -f` no longer works on the file, because it is
+not real YAML until Helm fills the holes.
+
+Kustomize never edits the source files. The Kustomize glossary states the design
+goal directly:
+
+> Kustomize is a command-line tool designed for **template-free, structured
+> customization** of declarative configuration for Kubernetes-style objects.
+
+and its overview adds the consequence:
+
+> customizing Kubernetes resource configuration without relying on templates or
+> DSLs... leaving the original source files **untouched and usable as-is**.
+
+So `base/flinkdeployment.yaml` stays a normal file that `kubectl apply -f`
+accepts.
+
+**One line each:**
+
+```
+Helm       text templating.  {{ .Values.x }} -> render -> YAML
+Kustomize  structured merge. valid YAML + valid YAML -> merged YAML
+```
+
+**When to revisit this.** Plain directory mode is right for Phase 5: one
+environment, three files, nothing to deduplicate. The moment Phase 7 creates
+`green/` as a near-copy of `blue/`, plain directories mean two files kept in sync
+by hand. Kustomize is built into `kubectl` as `kubectl apply -k` and
+`kubectl kustomize`, so adopting it adds no tooling to the machine, which matters
+under this project's no-permanent-machine-state constraint.
+
+## What port-forward is
+
+**It is a running program that copies bytes between two sockets.** Nothing more.
+It is not a setting, not a rule, not a configuration. It is a process.
+
+### Start from the toy
+
+Forget Kubernetes. Two plain programs on your own machine.
+
+**The shop** is a web server on port 8000. It holds one file.
+
+```
+$ curl http://localhost:8000/note.txt
+hello from the shop
+```
+
+**Port 9999 is empty.** Nothing listens there.
+
+```
+$ curl http://localhost:9999/note.txt
+exit 7, nothing there
+```
+
+Now start `relay.py`, 16 lines, no libraries:
+
+```python
+listener = socket.create_server(("127.0.0.1", 9999))
+while True:
+    client, _ = listener.accept()
+    shop = socket.create_connection(("127.0.0.1", 8000))
+    threading.Thread(target=pipe, args=(client, shop), daemon=True).start()
+    threading.Thread(target=pipe, args=(shop, client), daemon=True).start()
+```
+
+Read those five lines as English:
+
+1. Listen on port 9999.
+2. When someone connects, open a second connection to the shop on 8000.
+3. Copy everything the caller says into the shop.
+4. Copy everything the shop says back to the caller.
+
+And `pipe` is just a copy loop:
+
+```python
+data = a.recv(4096)
+b.sendall(data)
+```
+
+With that program alive:
+
+```
+$ curl http://localhost:9999/note.txt
+hello from the shop
+```
+
+Port 9999 now "has" the shop. It does not. The shop is still only on 8000. A
+program in the middle is carrying the bytes.
+
+Kill the relay, and only the relay:
+
+```
+$ curl http://localhost:9999/note.txt     ->  exit 7, gone
+$ curl http://localhost:8000/note.txt     ->  hello from the shop
+```
+
+The shop never noticed. It was never told about port 9999. It has no idea the
+relay existed.
+
+**That relay is exactly what `kubectl port-forward` is.**
+
+### Now map it back
+
+The same shape, observed against this cluster's MinIO Console on 2026-09-06:
+
+| Toy | This cluster |
+|---|---|
+| the shop on port 8000 | the Console pod, port 9090 |
+| `relay.py` on port 9999 | `kubectl port-forward`, PID 1789845 |
+| `curl localhost:9999` worked | `curl localhost:9090` gave HTTP 200 |
+| kill the relay, 9999 empty | kill kubectl, `localhost:9090` empty |
+| the shop kept running | the Console pod kept running |
+
+One difference, and it is the only interesting one.
+
+### The one difference
+
+The toy relay could open its second connection itself, with
+`socket.create_connection(("127.0.0.1", 8000))`. The host cannot do that. A
+`curl` straight at the Console's ClusterIP, `10.96.64.25:9090`, times out after
+4s with `HTTP 000`, because the host's default gateway has never heard of
+`10.96.0.0/12`.
+
+So kubectl cannot make the second connection directly. It asks the API server to
+make it instead:
+
+```
+your host                          |  inside the cluster
+                                   |
+curl -> :9090                      |
+          |                        |
+     kubectl process               |
+          |                        |
+          +--- HTTPS to the API server ---+
+                                   |      |
+                                   |   kubelet on the pod's node
+                                   |      |
+                                   |   Console pod :9090
+```
+
+The copy loop is split across the boundary. Your half runs in the `kubectl`
+process. The other half runs inside the cluster, where `10.96.64.25` is a real
+address.
+
+kubectl reaches the API server through `https://127.0.0.1:37855`, the external
+load balancer. That connection already works, because the kubeconfig is built on
+it. Port-forward rides on a road that is already open.
+
+### Why the port numbers in the command
+
+```bash
+kubectl port-forward svc/personalization-console -n minio-tenant 9090:9090
+```
+
+- Left `9090`: the port the relay opens **on your host**. Your choice, freely.
+- Right `9090`: the port it connects to **on the pod**. Fixed by the pod.
+
+They are equal here only by habit. `8080:9090` would work identically, and you
+would open `http://localhost:8080`.
+
+### The two consequences worth remembering
+
+1. **It dies when the process dies.** Ctrl+C, a closed terminal, a restarted
+   pod. There is no reconnect, because there is no configuration anywhere that
+   remembers it existed.
+2. **Its traffic goes through the API server.** That is the control plane, not a
+   data path. Fine for a browser session. Wrong for the pipeline's checkpoint
+   writes, which is why `minio-s3-api` is a NodePort on 30014 instead.

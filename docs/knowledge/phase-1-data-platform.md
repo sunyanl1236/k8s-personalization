@@ -195,6 +195,110 @@ Kafka clients never connect in one step:
   address actually reachable through the same `extraPortMappings` tunnel from
   Phase 0.
 
+## The three port numbers: two ways in, one way out
+
+Three numbers on one Service, all called some kind of "port". The shortcut that
+makes them stop blurring:
+
+**`targetPort` is the only number that describes reality. The other two are
+numbers you invented.**
+
+| Number | A fact, or a choice? |
+|---|---|
+| `targetPort` | **a fact.** The process really listens there. You are reporting it, not deciding it |
+| `nodePort` | **a choice.** A door number. Kubernetes opens whatever you say, in 30000-32767 |
+| `port` | **a choice.** Another door number, on the ClusterIP |
+
+### Why there are three
+
+A Service is a rewrite rule. It has **two entrances** and **one exit**.
+
+```
+ENTRANCE 1 (from outside the cluster)
+   <any node IP> : 30011           <- nodePort
+        │
+        └──────────┐
+                   │
+ENTRANCE 2 (from inside the cluster)                    EXIT
+   <ClusterIP> : 8081              <- port      ──▶  <pod IP> : 8081   <- targetPort
+        │                                              the process
+        └──────────┘                                   really listening here
+```
+
+Both entrances lead to the same exit. `targetPort` sits at the exit, which is
+why it is the only one that must be true.
+
+There is **no process listening on the ClusterIP**. `kube-proxy` programs the
+rules into every node's iptables or nftables, so nothing ever "arrives" at the
+ClusterIP to be forwarded onward. `nodePort` and `port` are two separate keys in
+the same rewrite table, not two hops in one path. Both keys name the same
+right-hand side, which is `targetPort`.
+
+### Traced with the Phase 5 Flink dashboard Service
+
+From a browser on the host:
+
+```
+localhost:30011
+  └─▶ kind published host port 30011 into the node container
+        └─▶ kube-proxy rule on that node:
+              "anything arriving on :30011"  ->  rewrite dst to <podIP>:8081
+              └─▶ JobManager, listening on 8081
+```
+
+From another pod in the cluster:
+
+```
+curl http://personalization-flink-dashboard.personalization-blue.svc:8081
+  └─▶ DNS resolves to the ClusterIP, say 10.96.5.20
+        └─▶ kube-proxy rule:
+              "dst 10.96.5.20:8081"  ->  rewrite dst to <podIP>:8081
+              └─▶ JobManager, listening on 8081
+```
+
+Two different rules. Both end at `<podIP>:8081`.
+
+### The test that makes it click: change each one
+
+| Change | What happens |
+|---|---|
+| `targetPort: 8081` -> `9999` | **Broken.** Both rules now rewrite to `<podIP>:9999`. Nothing listens there. Connection refused, from the host and from inside |
+| `nodePort: 30011` -> `30012` | **Broken, differently.** Kubernetes opens 30012 on every node, but `kind` only published **30011** to the host, fixed at cluster creation. `localhost:30011` hits a closed port and `localhost:30012` was never published. The cluster would have to be recreated |
+| `port: 8081` -> `80` | **Nothing changes.** In-cluster callers would use `:80`. Nothing in this project calls that Service from inside the cluster |
+
+That last row answers "why does `port` exist here at all". It is a door you are
+required to number but will never walk through.
+
+### Then why is `port` required?
+
+Because **a NodePort Service is a ClusterIP Service with an extra door.**
+Kubernetes always allocates the ClusterIP, so it always needs the ClusterIP's
+port number. Setting `port` equal to `targetPort` is simply the choice that
+avoids a third distinct number to remember.
+
+The MinIO Services in this project show both conventions side by side, on the
+same pod:
+
+| Service | `port` | `targetPort` | Written by |
+|---|---|---|---|
+| `minio-s3-api` | 9000 | 9000 | this repo, matching for simplicity |
+| `minio` | **80** | **9000** | the MinIO Operator, deliberately different |
+
+That mismatch is the clearest proof that `port` and `targetPort` are
+independent numbers.
+
+### The failure this does not catch
+
+A correct `targetPort` with a wrong `selector` produces a Service created
+without error that routes nowhere. The endpoint list is what separates the two:
+
+```bash
+kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=<service>
+```
+
+An empty result is a selector problem. A populated one printing
+`podIP:targetPort` proves the exit is real, before `curl` is ever run.
+
 ## NodePort, corrected: not one pod per node, not one Service per node
 
 - A pod runs on exactly one node, never all six. What exists on every node is
