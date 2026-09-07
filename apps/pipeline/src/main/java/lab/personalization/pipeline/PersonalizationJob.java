@@ -13,6 +13,7 @@ import org.apache.flink.cep.CEP;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.configuration.PipelineOptions;
+import org.apache.flink.core.plugin.PluginUtils;
 import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -204,7 +205,15 @@ public class PersonalizationJob {
             flinkConfig.set(StateRecoveryOptions.SAVEPOINT_PATH, config.restoreFrom());
         }
 
-        FileSystem.initialize(flinkConfig, null);
+        // The PluginManager is not optional on Kubernetes. ADR 0001 moved
+        // flink-s3-fs-hadoop out of opt/ into its own plugins/ subfolder, so in the
+        // image s3 exists ONLY as a plugin and /opt/flink/lib holds no s3 jar. A null
+        // PluginManager rebuilds the filesystem registry with no plugins, discarding
+        // the s3 filesystem the entrypoint had already registered, and the JobMaster
+        // then dies on UnsupportedFileSystemSchemeException for scheme 's3'.
+        // Locally there is no plugins/ directory, so this finds nothing and the
+        // runtimeOnly classpath copy is used exactly as before.
+        FileSystem.initialize(flinkConfig, PluginUtils.createPluginManagerFromRootFolder(flinkConfig));
         return flinkConfig;
     }
 
