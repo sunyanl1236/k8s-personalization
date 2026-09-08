@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
@@ -966,7 +966,99 @@ was designed and `status.md` records what was built.
 `kcat -b localhost:30016 -L | head -5`.
 
 
-## Phase 6: Autoscaling — ⬜ not started
+## Phase 6: Autoscaling — 🟡 in progress
+
+Design and plan both written:
+[design](../specs/2026-09-07-autoscaling-design.md),
+[implementation plan](2026-09-07-phase-6-autoscaling.md). The plan runs 10 tasks;
+check its Progress table for the live position. A
+[knowledge doc](../../knowledge/phase-6-autoscaling.md) exists already, written
+ahead of the Drills rather than after them.
+
+**Scope changed from the phase plan.** Phase 6 is 6a plus Karpenter. The
+Standalone Variant and KEDA are **dropped by decision**, not deferred. The lab
+loses external-metric-driven autoscaling, which was ADR 0005's stated reason for
+keeping KEDA. Nothing in Phase 7 depends on it, since ADR 0006 runs blue/green on
+the Native Variant. **ADR 0005's Decision still needs amending**; its analysis
+stays correct and is load-bearing.
+
+- ✅ Task 0: Baseline capture, 2026-09-08. Read-only, and every later gate compares
+  against it. 9 vertices at `PAR 6` / `MAXPAR 128`, seven of nine names carrying
+  `Sink: Print to Std. Out`, the overrides field empty, and **5.0 Clicks/sec
+  measured from partition offsets** rather than read off `--click-rate`.
+  **Two facts the design did not have.** Host headroom has **halved** since the
+  spec was written: 6.7 GiB then, 2.5 GiB now, with TaskManagers at 1105/1036/1116
+  Mi against the 887-946 Mi Phase 5 recorded. The design's rejection of
+  parallelism 8 is safer than written; the margin behind the accepted plan is
+  thinner. And **Zone spread has drifted**: TaskManagers sit on `worker` (1) and
+  `worker3` (2), none on `worker2`. Pod names `taskmanager-2-7`, `-2-8`, `-3-1`
+  show replacements since Phase 5's recorded 1/1/1. Expected under
+  `whenUnsatisfiable: ScheduleAnyway`, and re-verification is out of scope, but
+  the Phase 5 record is stale.
+- ✅ Task 1: The generator's 1000/sec ceiling removed, 2026-09-08.
+  `SkewedEventStream.start` now fixes the period at 10 ms and varies the batch,
+  instead of one tick per Click with `Math.max(1, ...)` flooring the period at 1 ms.
+  The ticker stays single-threaded, because event-time ordering depends on ticks
+  firing sequentially, and `Instant.now()` stays inside `tick()`.
+  **Gate: 2507.9 Clicks/sec against a requested 2500**, measured from offsets.
+  **The first measurement was wrong and the failure is worth keeping.** It read
+  3311.6/sec for a requested 2500, a 32% overshoot that looked like a bug in the
+  batching. It was two generators running at once: a `pkill` had reported success
+  without killing anything, so an 800/sec run was still live. 800 + 2500 = 3300.
+  **Check the process list before believing a rate measurement.**
+- ✅ Task 2: Key cardinality, 2026-09-08. `Catalog`'s constants became
+  `shopperIds(n)` and `productIds(n)`; `GeneratorConfig` gained `--shopper-count`
+  (2000) and `--product-count` (200). `ClickFactory` and `ProductChangeFactory`
+  were untouched, since both already take `List<String>`.
+  Gate: **2000 distinct Shoppers** (max index 2000) and **200 distinct Products**
+  (max index 200), uniform.
+  **A measurement trap worth keeping.** Reading the last 20,000 messages of
+  `product-change` reported only **85** distinct Products. That was not a defect:
+  15,466 of those 20,000 were pre-change messages over the old P1..P10 catalogue,
+  because the topic's tail spans both eras. Consuming **live** traffic for 15
+  seconds gave 200. On a compacted-history topic, sample the present, not the tail.
+  **A coupling that is now live in the defaults.** Session length is
+  `e^(6 × clickRate ÷ shopperCount)`. At the old `--click-rate=5` default with
+  2000 Shoppers that is `e^0.015`, so every Session is one Click and the window
+  branch emits almost nothing. **Running the generator bare now produces a
+  pipeline that looks broken.** Hold `shopperCount ≈ 2.5 × clickRate`.
+- ✅ Task 3: The `FlinkDeployment` config changes, 2026-09-08. Eight autoscaler
+  keys with `scaling.enabled: "false"`, `pipeline.max-parallelism: "120"`,
+  `--debug-prints=false`, parallelism 6 to 2, the three `phase-6` state prefixes,
+  and `upgradeMode: stateless` travelling in the same edit because alone it is an
+  `IGNORE`-level diff and triggers no reconciliation at all.
+  Verified locally: `--dry-run=server` reports `configured`, and 27 pipeline tests
+  pass, read from the XML report.
+  **`jobmanager.scheduler: Adaptive` was already set**, at
+  `flinkdeployment.yaml:31`, put there in Phase 5 for an unrelated reason. It is
+  also the autoscaler's hard prerequisite. The enum is `Default` / `Adaptive` /
+  `AdaptiveBatch`, so the capital is correct despite the operator docs writing it
+  lowercase.
+  **The deployment now sits at `upgradeMode: stateless` until Drill F restores
+  `savepoint`.** Any other spec edit in that window discards state silently.
+  **Not yet pushed to `master`,** so the three deploy gates in the plan's Task 3
+  Step 9 have not run. The job is still the Phase 5 one at parallelism 6 with
+  print sinks chained onto every vertex.
+- ⬜ Tasks 4 to 9: Drills E, F, G, Karpenter, Drill H, Documents.
+
+**`apps/pipeline/conf/config.yaml` does not exist, and three documents were
+corrected to say so.** Task 5 of Phase 5 deleted it in commit `b0705e0`, 15
+lines, when the configuration moved into `spec.flinkConfiguration`. The Phase 5
+design's rule that it and `spec.flinkConfiguration` are "two lists that must not
+drift" therefore has one side left, and the Phase 5 plan's constraint forbidding
+its edit is satisfied vacuously. A consequence that predates Phase 6: a bare
+`:pipeline:run` against `MiniCluster` throws
+`IllegalStateException("no config.yaml loaded from conf")` unless the developer
+supplies their own copy. `:pipeline:test` does not touch that path.
+
+**The one question the design could not settle** is still open, and it can only
+be answered after the first scaling event in Drill F: does the autoscaler's
+computed parallelism reach the live CR's `spec.flinkConfiguration` as
+`pipeline.jobvertex-parallelism-overrides`? Task 0 recorded the field empty, so
+the comparison is meaningful. Drill D's removal means this is now GitOps hygiene
+rather than protection of a Drill, but Phase 7 and Phase 8 inherit the
+Application.
+
 
 ## Phase 7: Blue/green and OTel — ⬜ not started
 
