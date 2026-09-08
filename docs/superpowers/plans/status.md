@@ -970,8 +970,8 @@ was designed and `status.md` records what was built.
 
 Design and plan both written:
 [design](../specs/2026-09-07-autoscaling-design.md),
-[implementation plan](2026-09-07-phase-6-autoscaling.md). The plan runs 10 tasks;
-check its Progress table for the live position. A
+[implementation plan](2026-09-07-phase-6-autoscaling.md). The plan runs 10 tasks, and
+its Progress table is kept in step with this file. A
 [knowledge doc](../../knowledge/phase-6-autoscaling.md) exists already, written
 ahead of the Drills rather than after them.
 
@@ -1036,10 +1036,38 @@ stays correct and is load-bearing.
   lowercase.
   **The deployment now sits at `upgradeMode: stateless` until Drill F restores
   `savepoint`.** Any other spec edit in that window discards state silently.
-  **Not yet pushed to `master`,** so the three deploy gates in the plan's Task 3
-  Step 9 have not run. The job is still the Phase 5 one at parallelism 6 with
-  print sinks chained onto every vertex.
-- ⬜ Tasks 4 to 9: Drills E, F, G, Karpenter, Drill H, Documents.
+  **Pushed to `master` on 2026-09-08** as `git push origin phase-2:master`, and
+  all three Step 9 deploy gates were run and passed: empty
+  `upgradeSavepointPath` beside `RUNNING`, `MAXPAR 120` / `PAR 2` with no
+  `Sink: Print to Std. Out` vertex, and one TaskManager with checkpoints under
+  `s3://checkpoints/phase-6/`.
+- ✅ Task 4: Drill E, 2026-09-08. Ran at `--click-rate=800
+  --product-change-rate=400`. **Gate passed.**
+  [Runbook](../../runbooks/phase-6-drill-e-dry-run.md).
+  Two `SCALINGREPORT` events, fifteen seconds apart, both carrying
+  `Scaling execution disabled by config`, which is the dry run naming itself.
+  **CepOperator** asked for `2 -> 5`, then `2 -> 6`. **Interval Join** asked for
+  `2 -> 3` twice. Both take every Click and both sit under a `keyBy`, which is
+  what the gate wanted. One TaskManager throughout, `RESTARTS 0`, `AGE` 7m59s to
+  16m.
+  **The session window asked for nothing, and that is the best result in the
+  Drill.** It reads from the same `keyBy(shopperId)` as CepOperator, so both get
+  identical Clicks at an identical rate. They differ only in cost per Click: CEP
+  runs a state machine, `SessionAggregator` appends to window state and defers
+  the work to the session gap. An autoscaler reading input rate would have scaled
+  both the same. One reading busy time separates them. It separated them.
+  **Still confirm `LOAD` on `c9235a26…` is under 0.6** before Drill F.
+  **`2 -> 6` is exactly `job.autoscaler.vertex.max-parallelism: "6"`.** It may be
+  the number wanted or the largest number allowed; the report cannot tell you
+  which. In Drill F a job pinned at the ceiling looks like a stuck autoscaler and
+  is not one.
+  **The report's own numbers do not rebuild its recommendation.** 850.59 over
+  utilization 0.6 needs 3 subtasks, not 5. The missing term is
+  `catch-up.duration: 5m`, which adds capacity to clear backlog.
+  **Vertex IDs must be captured before a restart**, since the report names
+  vertices by hex ID only and the IDs change with the job graph. Reading the
+  mapping is now step 3 of the runbook's procedure.
+- ⬜ Tasks 5 to 9: Drills F, G, Karpenter, Drill H, Documents.
 
 **`apps/pipeline/conf/config.yaml` does not exist, and three documents were
 corrected to say so.** Task 5 of Phase 5 deleted it in commit `b0705e0`, 15

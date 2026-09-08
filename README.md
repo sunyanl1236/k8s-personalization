@@ -66,6 +66,22 @@ Credentials are never written into this file, only how to fetch them.
    kubectl -n argocd delete secret argocd-initial-admin-secret
    ```
 
+### Flink UI
+
+The dashboard is the JobManager's own web server. It ships no authentication,
+so there is no credential to fetch.
+
+1. Open http://localhost:30011
+2. Open **Running Jobs**, then the job. Its name is set in the job code, not
+   in the FlinkDeployment.
+
+If port 30011 does not answer, forward the operator's own ClusterIP Service
+instead. Leave it running, then use http://localhost:8081:
+
+```bash
+kubectl port-forward svc/personalization-rest -n personalization-blue 8081:8081
+```
+
 ### MinIO S3 API
 
 | Item | Value |

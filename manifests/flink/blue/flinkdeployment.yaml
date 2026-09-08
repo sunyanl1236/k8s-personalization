@@ -32,7 +32,7 @@ spec:
     taskmanager.numberOfTaskSlots: "2"
 
     job.autoscaler.enabled: "true"
-    job.autoscaler.scaling.enabled: "false" # dry run. Drill E reads the recommendation before anything acts
+    job.autoscaler.scaling.enabled: "true"
     job.autoscaler.metrics.window: 3m
     job.autoscaler.stabilization.interval: 1m
     job.autoscaler.target.utilization: "0.6"
@@ -108,12 +108,9 @@ spec:
   job: # application mode
     jarURI: local:///opt/flink/usrlib/pipeline.jar
     parallelism: 2
-    upgradeMode: stateless # for this one transition only; Drill F restores savepoint
+    upgradeMode: savepoint
     state: running
     args:
       - "--bootstrap-servers=personalization-kafka-bootstrap.kafka.svc.cluster.local:9092"
       - "--debug-prints=false"
-      # The clean start renames every other piece of prior-run identity to phase-6.
-      # Left at phase-3 the sink inherits the cancelled job's open transactions and
-      # spins its abort loop at 100% CPU without ever converging.
       - "--transactional-id-prefix=personalization-phase-6"

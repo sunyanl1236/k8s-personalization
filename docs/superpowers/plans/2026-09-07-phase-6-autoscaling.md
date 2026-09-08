@@ -49,17 +49,18 @@ Phase 5 closed on 2026-09-07. Drill D was removed by decision on the same day, s
 therefore GitOps hygiene rather than protection of a Drill, and it is still worth
 running because Phase 7 and Phase 8 inherit the Application.
 
-The job is running at parallelism 6 on image `0.1-0bd7f52`.
+When this plan was written the job was running at parallelism 6 on image
+`0.1-0bd7f52`. Task 3 has since replaced that; see the Progress table.
 
 ## Progress
 
 | # | Task | Status |
 |---|---|---|
-| 0 | Baseline capture | not started |
-| 1 | Generator: remove the 1000/sec ceiling | not started |
-| 2 | Generator: key cardinality | not started |
-| 3 | The `FlinkDeployment` config changes, and the clean start | not started |
-| 4 | Drill E: dry run under a Load Ramp | not started |
+| 0 | Baseline capture | ✅ done, 2026-09-08 |
+| 1 | Generator: remove the 1000/sec ceiling | ✅ done, 2026-09-08 |
+| 2 | Generator: key cardinality | ✅ done, 2026-09-08 |
+| 3 | The `FlinkDeployment` config changes, and the clean start | ✅ done, 2026-09-08 |
+| 4 | Drill E: dry run under a Load Ramp | ✅ done, 2026-09-08 |
 | 5 | Drill F: enable scaling, and the overrides gate | not started |
 | 6 | Drill G: scale down | not started |
 | 7 | Karpenter: install, NodePool, Decoy Workload | not started |
@@ -69,6 +70,17 @@ The job is running at parallelism 6 on image `0.1-0bd7f52`.
 Tasks 1 and 2 both live in `:generator` and depend on nothing. Task 3 needs
 neither, but Drill E needs all three. Tasks 4, 5 and 6 are strictly sequential.
 Task 7 depends on nothing and can be done at any point; Task 8 needs 7.
+
+**Per-task measurements and the traps they exposed live in
+[status.md](status.md), not here.** This table carries position only.
+
+**Next: Task 5, Drill F.** Tasks 3 and 4 both closed on 2026-09-08 with their
+gates read. Drill E's [runbook](../../runbooks/phase-6-drill-e-dry-run.md)
+carries the transcript. The deployment still sits at `upgradeMode: stateless`
+until Task 5 Step 1 restores `savepoint`. Any other spec edit in that window
+throws away state without warning. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
+restores `savepoint`; any other spec edit in that window discards state
+silently.
 
 ## Global constraints
 
@@ -144,7 +156,7 @@ plausible but wrong result. "MAXPAR is 120" only means something if you saw 128
 first. Read-only, five minutes, and it is the difference between a Drill that
 proves something and one that asserts it.
 
-- [ ] **Step 1: The job graph as it stands.**
+- [x] **Step 1: The job graph as it stands.**
 
 ```bash
 JID=$(curl -s localhost:30011/jobs | python3 -c "import sys,json;print(json.load(sys.stdin)['jobs'][0]['id'])")
@@ -158,7 +170,7 @@ for v in json.load(sys.stdin)['vertices']:
 Expect 9 vertices, `PAR 6`, `MAXPAR 128`, and `Sink: Print to Std. Out` in most
 names. Keep this output. Task 3's gate is the same command.
 
-- [ ] **Step 2: Pods and their real memory.**
+- [x] **Step 2: Pods and their real memory.**
 
 `metrics-server` is not installed, so `kubectl top` returns
 `Metrics API not available`. The kubelet computes the number anyway:
@@ -181,7 +193,7 @@ free -h
 `workingSetBytes` is what the kubelet uses for eviction, so it is the honest
 figure. Expect five pods around 0.9 GiB each against a 2 GiB limit.
 
-- [ ] **Step 3: The overrides field, before anything.**
+- [x] **Step 3: The overrides field, before anything.**
 
 ```bash
 kubectl -n personalization-blue get flinkdeployment personalization \
@@ -191,7 +203,7 @@ kubectl -n personalization-blue get flinkdeployment personalization \
 Expect empty. Task 5 Step 6 runs this again after a scaling event, and the
 comparison is the whole gate.
 
-- [ ] **Step 4: The generator's achieved rate at today's settings.**
+- [x] **Step 4: The generator's achieved rate at today's settings.**
 
 Do not read this off `--click-rate`. Sample the topic's end offsets ten seconds
 apart and divide:
@@ -233,7 +245,7 @@ fall-behind does not. `scheduleAtFixedRate` never runs a tick concurrently with
 itself, so if one batch takes longer than the period, ticks simply lag. That is
 why Step 3 measures rather than trusts.
 
-- [ ] **Step 1: Rewrite `start`.**
+- [x] **Step 1: Rewrite `start`.**
 
 Skeleton, not a finished method:
 
@@ -256,13 +268,13 @@ Three constraints, each with a reason:
    arithmetic changes.
 3. **Leave `tick()` itself alone.** Only `start` changes.
 
-- [ ] **Step 2: Build.**
+- [x] **Step 2: Build.**
 
 ```bash
 apps/gradlew -p apps :generator:build
 ```
 
-- [ ] **Step 3: Measure the achieved rate. This is the gate.**
+- [x] **Step 3: Measure the achieved rate. This is the gate.**
 
 Run the generator against a high rate and sample the topic, exactly as in Task 0
 Step 4:
@@ -320,7 +332,7 @@ own `recommendationCatalogue` of P1..P10, and it must stay that way.
 `DeterministicMockClient.answerFor` hashes any `candidateProductId` into it, so
 it is an answer set, not a key set. Do not touch `:pipeline`.
 
-- [ ] **Step 1: Turn `Catalog`'s constants into a factory.**
+- [x] **Step 1: Turn `Catalog`'s constants into a factory.**
 
 ```java
 public static List<String> ids(String prefix, int count) {
@@ -333,7 +345,7 @@ public static List<String> ids(String prefix, int count) {
 Note the existing ids are `shopper-1` and `P1`, two different shapes. Keep both
 shapes so nothing downstream is surprised, or change both deliberately and say so.
 
-- [ ] **Step 2: Add two options to `GeneratorConfig`.**
+- [x] **Step 2: Add two options to `GeneratorConfig`.**
 
 Two record components, two defaults, two `case` arms in the existing `switch`:
 
@@ -346,20 +358,20 @@ Defaults `2000` and `200`. The record's canonical constructor is package-private
 and its component list is positional, so adding components means updating the
 `new GeneratorConfig(...)` call at the end of `parse`.
 
-- [ ] **Step 3: Build the lists in `Generator`.**
+- [x] **Step 3: Build the lists in `Generator`.**
 
 `Generator.java:37-38` already constructs the factories with `Catalog.SHOPPER_IDS`
 and `Catalog.PRODUCT_IDS`. Replace those two references with calls to the new
 factory method, sized from the config. `ClickFactory` and `ProductChangeFactory`
 both already take `List<String>`, so neither changes.
 
-- [ ] **Step 4: Build.**
+- [x] **Step 4: Build.**
 
 ```bash
 apps/gradlew -p apps :generator:build
 ```
 
-- [ ] **Step 5: Count distinct keys on the topic. This is the gate.**
+- [x] **Step 5: Count distinct keys on the topic. This is the gate.**
 
 Do not trust the flag:
 
@@ -405,7 +417,7 @@ operator IDs changed.
 **The failure mode to watch for.** The restore error names state mapping, which
 reads like a Flink fault rather than a decision you made.
 
-- [ ] **Step 1: Add the autoscaler keys to `spec.flinkConfiguration`.**
+- [x] **Step 1: Add the autoscaler keys to `spec.flinkConfiguration`.**
 
 ```yaml
     job.autoscaler.enabled: "true"
@@ -426,7 +438,7 @@ reason. Do not add it again, and do not lowercase it: the enum is `Default`,
 `job.autoscaler.vertex.max-parallelism: "6"` is the only thing standing between a
 Load Ramp and the host. See the global constraints.
 
-- [ ] **Step 2: Fix the divisor trap.**
+- [x] **Step 2: Fix the divisor trap.**
 
 ```yaml
     pipeline.max-parallelism: "120"
@@ -441,7 +453,7 @@ lists not drifting, but `apps/pipeline/conf/config.yaml` was deleted in commit
 one list now. Do not recreate that file to satisfy a rule that no longer has two
 sides.
 
-- [ ] **Step 3: Silence the debug prints.**
+- [x] **Step 3: Silence the debug prints.**
 
 ```yaml
   job:
@@ -455,7 +467,7 @@ a code change. Without it, busy time measures `System.out.println` through the
 container log pipe rather than the session window, and the autoscaler sizes for a
 bottleneck that is stdout on a WSL2 disk.
 
-- [ ] **Step 4: Drop the starting parallelism.**
+- [x] **Step 4: Drop the starting parallelism.**
 
 ```yaml
   job:
@@ -466,7 +478,7 @@ One TaskManager at 2 slots. The Load Ramp drives it to 6, which is three
 TaskManagers, which is exactly the footprint Phase 5 already proved. No new
 memory risk.
 
-- [ ] **Step 5: Move the state prefixes.**
+- [x] **Step 5: Move the state prefixes.**
 
 ```yaml
     execution.checkpointing.dir: s3://checkpoints/phase-6
@@ -477,7 +489,7 @@ memory risk.
 Phase 5's Drill runbooks cite checkpoints under `phase-5` and those must stay
 readable.
 
-- [ ] **Step 6: Set `upgradeMode: stateless`, in this same edit.**
+- [x] **Step 6: Set `upgradeMode: stateless`, in this same edit.**
 
 ```yaml
   job:
@@ -493,7 +505,7 @@ other spec edit in between, because an upgrade in that window discards state
 silently. Task 5 Step 1 restores it, riding along with a change that is not
 ignored.
 
-- [ ] **Step 7: Verify locally before pushing.**
+- [x] **Step 7: Verify locally before pushing.**
 
 ```bash
 kubectl apply --dry-run=server -f manifests/flink/blue/flinkdeployment.yaml
@@ -506,7 +518,7 @@ not exist. `:pipeline:test` must stay green, which is the Phase 5 constraint
 that survives. Nothing under `:pipeline` changed, so this confirms rather than
 proves.
 
-- [ ] **Step 8: Commit and push to `master`.**
+- [x] **Step 8: Commit and push to `master`.**
 
 ```bash
 git push origin phase-2:master
@@ -522,7 +534,7 @@ kubectl -n argocd exec argocd-application-controller-0 -- \
   argocd --core app get flink-job-blue --refresh
 ```
 
-- [ ] **Step 9: Prove the clean start. Three gates, all of them.**
+- [x] **Step 9: Prove the clean start. Three gates, all of them.**
 
 ```bash
 # 1. clean start, not a silent restore
@@ -574,7 +586,7 @@ is **correct**. `job.autoscaler.metrics.window: 3m` means it will not decide
 before it has three minutes of history. The most common "the autoscaler is
 broken" report is someone watching for ninety seconds.
 
-- [ ] **Step 1: Start the Load Ramp.**
+- [x] **Step 1: Start the Load Ramp.**
 
 ```bash
 apps/gradlew -p apps :generator:run \
@@ -586,10 +598,10 @@ Click is `productChangeRate × 4s ÷ productCount`, so 400 over 200 Products giv
 8 comparisons per Click against today's 0.4. That is pure CPU in the operator's
 own task thread, which is exactly what `busyTimeMsPerSecond` measures.
 
-- [ ] **Step 2: Wait out the metrics window.** Three minutes, plus the
+- [x] **Step 2: Wait out the metrics window.** Three minutes, plus the
   stabilization interval if the job restarted recently. Do not intervene.
 
-- [ ] **Step 3: Read the recommendation per vertex.**
+- [x] **Step 3: Read the recommendation per vertex.**
 
 The autoscaler exports metrics named
 `[prefix].Autoscaler.[jobVertexID].[ScalingMetric].Current`. Read them from the
@@ -603,7 +615,7 @@ kubectl -n flink-operator logs deploy/flink-kubernetes-operator -c flink-kuberne
 
 Map each `jobVertexID` back to a name with the job graph command from Task 0.
 
-- [ ] **Step 4: The gate, and it is specific.**
+- [x] **Step 4: The gate, and it is specific.**
 
 `RECOMMENDED_PARALLELISM` must rise on **the three Click-consuming vertices**: the
 session window, the CEP operator, and the interval join. Those are the only
@@ -651,7 +663,7 @@ Note this is a spec change, so `upgradeMode` applies. At this point in the plan
 it is still `stateless` from Task 3, so the job restarts from empty. That is
 acceptable during Drill E, which has no state to preserve.
 
-- [ ] **Step 5: Confirm nothing moved.**
+- [x] **Step 5: Confirm nothing moved.**
 
 ```bash
 kubectl -n personalization-blue get pods
@@ -660,7 +672,7 @@ kubectl -n personalization-blue get pods
 Still one TaskManager. `scaling.enabled` is `"false"`, so a recommendation is all
 that should exist.
 
-- [ ] **Step 6: Write the runbook.**
+- [x] **Step 6: Write the runbook.**
 
 Follow the pattern Phase 5 set in `docs/runbooks/phase-5-drill-a-taskmanager-kill.md`:
 what is being exercised, the procedure with a rationale per command, and an
