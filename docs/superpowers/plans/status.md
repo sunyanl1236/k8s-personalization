@@ -1067,7 +1067,55 @@ stays correct and is load-bearing.
   **Vertex IDs must be captured before a restart**, since the report names
   vertices by hex ID only and the IDs change with the job graph. Reading the
   mapping is now step 3 of the runbook's procedure.
-- ⬜ Tasks 5 to 9: Drills F, G, Karpenter, Drill H, Documents.
+- 🟡 Task 5: Drill F, 2026-09-08. **Scaling gates passed.**
+  [Runbook](../../runbooks/phase-6-drill-f-scale-up.md). **Three rescales.**
+  CepOperator `2 -> 6` at 16:03:57, then Interval Join `1 -> 4` and
+  Co-Keyed-Process `1 -> 2` at 16:08:14, 4m17s later. Three TaskManagers, and
+  `taskmanager-1-1` kept its name, its 112 minute age and `RESTARTS 0`. Proof it
+  was scaling and not a failover: the operator logged `In-place scaling
+  triggered` twice, checkpoints show 3 restores, and the exception history is
+  **empty**. A failover cannot restore without leaving an exception.
+  **The third rescale created no pod, and that is worth remembering.** Slots
+  needed is the largest parallelism of any one vertex, still 6 from CepOperator,
+  so parallelism 4 and 2 fit inside the existing slots by slot sharing. Watching
+  `kubectl get pods` alone would have missed the rescale entirely.
+  **Step 6 answered: the overrides field is EMPTY.** The autoscaler used
+  `PUT /jobs/:jobid/resource-requirements` and never wrote to the CR. Git owns
+  the spec, the autoscaler owns runtime state, so no `ignoreDifferences` is
+  needed in `flink-job-blue.yaml`. Its own memory lives in the
+  `autoscaler-personalization` ConfigMap. **Consequence for Phase 7:**
+  `spec.job.parallelism` is still 2, so any full restart drops the job back to 2
+  and the autoscaler must climb again.
+  **Step 4's instrument does not exist on Flink 2.2.0.**
+  `GET /jobs/:jobid/rescales/history` is a Flink **2.3** feature and 404s here,
+  so `web.adaptive-scheduler.rescale-history.size: "10"` from Task 3 is inert.
+  Flink ignores unknown config keys silently. The plan's Task 5 Step 4 now
+  carries the correction.
+  **Drill E's load was too low to force a real scale-up.** At 800 Clicks/sec in
+  steady state the job wants parallelism 1 to 2, and the autoscaler had scaled
+  *down* to 1 before this Drill. Drill E's `2 -> 5` was a **catch-up**
+  recommendation, driven by Kafka backlog on a cold JVM, not by steady load.
+  CepOperator's per-subtask capacity was 551/sec then and about 1250/sec once
+  warm. Scale-up needed `--click-rate=4000 --shopper-count=10000`.
+  **Raise `--shopper-count` with `--click-rate` every time.** Session length is
+  `e^(6 × clickRate ÷ shopperCount)`; 4000 Clicks over 2000 Shoppers is `e^12`.
+  **The generator tops out near 2650 Clicks/sec.** Asked for 4000, delivered
+  2648, measured off the source vertex. Task 1 removed the 1000/sec ceiling and
+  verified 2507.9; a real ceiling remains just above that.
+  **CepOperator is pinned at the ceiling**, parallelism 6 and **100.0%** busy
+  against a 0.6 target. Capped, not stalled. Every other vertex settled inside
+  target. Since CepOperator is saturated it cannot keep up, so Kafka lag on
+  `clickstream` will grow while the Load Ramp runs. **Drill G must drain that
+  backlog before parallelism falls**, so expect the scale-down to start later
+  than the configured interval alone predicts.
+  **The autoscaler's linear projection was 2.4x optimistic.** It predicted
+  capacity 2187.86 to 6992.00 for `2 -> 6`; measured was about 2950. Likely host
+  CPU saturation, since three TaskManagers now share one host with 6 kind nodes,
+  Kafka, MinIO and the generator. Reasoning from deployment shape, not measured.
+  **Outstanding: Step 7's gap check never ran.** It needs a `before.txt` snapshot
+  taken ahead of a rescale, and both rescales happened first. Fold it into Drill
+  G rather than forcing an extra rescale.
+- ⬜ Tasks 6 to 9: Drill G, Karpenter, Drill H, Documents.
 
 **`apps/pipeline/conf/config.yaml` does not exist, and three documents were
 corrected to say so.** Task 5 of Phase 5 deleted it in commit `b0705e0`, 15

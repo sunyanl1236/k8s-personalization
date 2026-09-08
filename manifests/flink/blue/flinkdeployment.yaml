@@ -39,6 +39,7 @@ spec:
     job.autoscaler.catch-up.duration: 5m
     job.autoscaler.vertex.max-parallelism: "6"
     web.adaptive-scheduler.rescale-history.size: "10"
+    job.autoscaler.scale-down.interval: 5m
 
     pipeline.max-parallelism: "120" # divisors 2,3,4,5,6. The default 128 offers only 1,2,4,8
     # ClusterIP because Flink cannot pin a NodePort number (pin localhost, same machine); rest-nodeport.yaml does that instead

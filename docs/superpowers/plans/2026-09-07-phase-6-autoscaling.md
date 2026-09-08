@@ -61,7 +61,7 @@ When this plan was written the job was running at parallelism 6 on image
 | 2 | Generator: key cardinality | ✅ done, 2026-09-08 |
 | 3 | The `FlinkDeployment` config changes, and the clean start | ✅ done, 2026-09-08 |
 | 4 | Drill E: dry run under a Load Ramp | ✅ done, 2026-09-08 |
-| 5 | Drill F: enable scaling, and the overrides gate | not started |
+| 5 | Drill F: enable scaling, and the overrides gate | 🟡 scaling gates passed, gap check outstanding |
 | 6 | Drill G: scale down | not started |
 | 7 | Karpenter: install, NodePool, Decoy Workload | not started |
 | 8 | Drill H: provision and consolidate | not started |
@@ -74,11 +74,9 @@ Task 7 depends on nothing and can be done at any point; Task 8 needs 7.
 **Per-task measurements and the traps they exposed live in
 [status.md](status.md), not here.** This table carries position only.
 
-**Next: Task 5, Drill F.** Tasks 3 and 4 both closed on 2026-09-08 with their
-gates read. Drill E's [runbook](../../runbooks/phase-6-drill-e-dry-run.md)
-carries the transcript. The deployment still sits at `upgradeMode: stateless`
-until Task 5 Step 1 restores `savepoint`. Any other spec edit in that window
-throws away state without warning. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
+**Next: Task 6, Drill G,** with Task 5 Step 7's gap check folded into it. Tasks
+3, 4 and 5 all ran on 2026-09-08. Drill E and Drill F both have runbooks with
+real transcripts. `upgradeMode` is back to `savepoint`. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
 restores `savepoint`; any other spec edit in that window discards state
 silently.
 
@@ -694,7 +692,7 @@ carries real output.
 **Goal.** Watch parallelism go 2 to 6 and the pod count 1 to 3, and prove it was
 the autoscaler rather than a crash.
 
-- [ ] **Step 1: Flip scaling on, and restore `upgradeMode` in the same edit.**
+- [x] **Step 1: Flip scaling on, and restore `upgradeMode` in the same edit.**
 
 ```yaml
     job.autoscaler.scaling.enabled: "true"
@@ -710,15 +708,25 @@ Phase 7's Promotion runbook depends on `savepoint` being in place.
 
 Push to `master`, per the global constraints.
 
-- [ ] **Step 2: Restart the Load Ramp** with the Task 4 Step 1 arguments.
+- [x] **Step 2: Restart the Load Ramp** with the Task 4 Step 1 arguments.
 
-- [ ] **Step 3: Wait.** The metrics window is 3 minutes. After the first rescale,
+- [x] **Step 3: Wait.** The metrics window is 3 minutes. After the first rescale,
   the autoscaler's `stabilization.interval` (1m) and the scheduler's
   `cooldown-after-rescaling` both block a further change, so scaling to 6 may
   take two or three rescales and several minutes. That is the design, not a
   stall.
 
-- [ ] **Step 4: Read the rescale history. This is the real instrument.**
+- [x] **Step 4: Read the rescale history. This is the real instrument.**
+
+> **Corrected on 2026-09-08. This step cannot be run on Flink 2.2.0.** The real
+> path is `GET /jobs/:jobid/rescales/history`, and it arrives in **Flink 2.3**.
+> All four candidate paths return 404 on this cluster.
+> `web.adaptive-scheduler.rescale-history.size: "10"`, added in Task 3, is
+> therefore inert; Flink ignores unknown configuration keys without complaint.
+> Use the substitute in
+> [the Drill F runbook](../../runbooks/phase-6-drill-f-scale-up.md): zero entries
+> in `/jobs/:jobid/exceptions` beside a checkpoint restore proves no failover,
+> and the operator's `In-place scaling triggered` audit line names the trigger.
 
 Pod counts cannot distinguish a scaling event from a failover.
 `web.adaptive-scheduler.rescale-history.size: "10"` was set in Task 3 precisely
@@ -745,7 +753,7 @@ A pod count change looks identical for both, which is why this check exists.
 The `schedulerStates` array times each state transition, so it also tells you
 where the pause went.
 
-- [ ] **Step 5: Confirm the derived pod count.**
+- [x] **Step 5: Confirm the derived pod count.**
 
 ```bash
 kubectl -n personalization-blue get pods -w
@@ -758,7 +766,7 @@ Note what does **not** happen: the original TaskManager is not replaced. Its nam
 age and restart count are unchanged. Its subtasks were cancelled and redeployed
 underneath it.
 
-- [ ] **Step 6: The gate this design could not settle.**
+- [x] **Step 6: The gate this design could not settle.**
 
 ```bash
 kubectl -n personalization-blue get flinkdeployment personalization \
@@ -779,7 +787,7 @@ Compare against Task 0 Step 3, which should have been empty.
 Either way, **write down which it was.** An unrecorded answer means the next
 person runs the probe again.
 
-- [ ] **Step 7: Check for gaps.**
+- [x] **Step 7: Check for gaps.**
 
 A rescale restores from a checkpoint, so Phase 5's instrument applies unchanged:
 
@@ -792,7 +800,7 @@ A rescale restores from a checkpoint, so Phase 5's instrument applies unchanged:
 Same trap as Drills A to C: suppression is not a gap. The script compares the
 topic against itself for that reason.
 
-- [ ] **Step 8: Write the runbook,** same shape as Task 4 Step 6.
+- [x] **Step 8: Write the runbook,** same shape as Task 4 Step 6.
 
 **Done when** you have a `COMPLETED` rescale record with
 `triggerCause: UPDATE_REQUIREMENT`, three TaskManagers, a recorded answer to Step
