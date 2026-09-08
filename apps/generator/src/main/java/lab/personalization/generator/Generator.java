@@ -1,6 +1,7 @@
 package lab.personalization.generator;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.Executors;
@@ -34,8 +35,10 @@ public class Generator {
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
         SkewedPublisher publisher = new SkewedPublisher(producer, scheduler);
 
-        ClickFactory clickFactory = new ClickFactory(Catalog.SHOPPER_IDS, Catalog.PRODUCT_IDS, random);
-        ProductChangeFactory productChangeFactory = new ProductChangeFactory(Catalog.PRODUCT_IDS, random);
+        List<String> shopperIds = Catalog.shopperIds(config.shopperCount());
+        List<String> productIds = Catalog.productIds(config.productCount());
+        ClickFactory clickFactory = new ClickFactory(shopperIds, productIds, random);
+        ProductChangeFactory productChangeFactory = new ProductChangeFactory(productIds, random);
         PromoRuleFactory promoRuleFactory = new PromoRuleFactory(random);
 
         SkewedEventStream<Click> clicks = new SkewedEventStream<>(

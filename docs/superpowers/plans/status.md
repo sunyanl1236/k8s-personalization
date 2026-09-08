@@ -1,13 +1,13 @@
 # Implementation status
 
-Last updated: 2026-09-06
+Last updated: 2026-09-07
 
 Live tracker: what's actually done right now, not the design (that's
 [the phase plan](2026-08-10-implementation-phases.md)) and not how things work
 (that's [the knowledge docs](../../knowledge/)). Update this file as work
 lands, don't let it go stale.
 
-Status legend: ✅ done · 🟡 in progress · ⬜ not started
+Status legend: ✅ done · 🟡 in progress · ⬜ not started · ❌ removed by decision
 
 ## Phase 0: Cluster floor — ✅ done (sync-wave deferred)
 
@@ -525,7 +525,7 @@ a dedicated configuration or an explicit exclusion set. Separately,
 `flink-s3-fs-hadoop` was confirmed to live in `opt/`, not `lib/`, which is the
 plugin-directory move ADR 0001 predicted.
 
-## Phase 5: Operator and HA — 🟡 in progress
+## Phase 5: Operator and HA — ✅ done
 
 Design and plan both written and approved:
 [design](../specs/2026-08-30-operator-and-ha-design.md),
@@ -665,43 +665,300 @@ check.
   `kubectl -n argocd exec argocd-application-controller-0 -- argocd --core app diff <app>`.
   The binary ships in the image. The `argocd-server` pod's ServiceAccount lacks
   the RBAC for it; the application controller's does not.
-- 🟡 Task 5: the `FlinkDeployment`, the Service, the PDB. **In progress.**
-  Steps 1 and 2 are written into `manifests/flink/blue/flinkdeployment.yaml`:
-  the top level block (`image`, `imagePullPolicy: IfNotPresent`,
-  `flinkVersion: v2_2`, `mode: native`, `serviceAccount: flink`) and the whole
-  of `spec.flinkConfiguration`. `s3.access-key` and `s3.secret-key` are absent
-  on purpose and carry the comment that says so, because their absence is what
-  makes Hadoop S3A fall through to `EnvironmentVariableCredentialsProvider` and
-  pick up the four environment variables Step 3 adds.
-  Steps 3 to 14 are open: the shared `podTemplate`, the two role blocks with
-  their Zone spread constraints, the `job` block, the NodePort Service, the
-  PodDisruptionBudget, the ArgoCD Application, and every verification.
-  `manifests/flink/blue/rest-nodeport.yaml`, `manifests/flink/blue/pdb.yaml`,
-  and `manifests/argocd-apps/flink-job-blue.yaml` exist as **empty** files.
-  Nothing of this task has reached the cluster. Nothing is committed either;
-  `manifests/flink/blue/` and `manifests/argocd-apps/flink-job-blue.yaml` are
-  both untracked, and ArgoCD reads GitHub rather than the working tree, so an
-  uncommitted Application is invisible to it.
-  **The environment is up** as of 2026-09-06. Six Applications Synced and
-  Healthy, operator 2/2 Running, Kubernetes server v1.34.8.
-  **`resource` versus `resources`, settled from the installed CRD.** Upstream
-  docs on the operator's `main` branch mark `spec.jobManager.resource`
-  deprecated in favour of `resources`. That field does not exist on operator
-  1.15.0's CRD, whose `jobManager` properties are exactly
-  `['podTemplate', 'replicas', 'resource']`. The plan's shape is the only one
-  available. Same discipline as Task 4 Step 5: read the installed CRD, not the
-  docs for a later release.
-  **A global constraint is currently broken.** `apps/pipeline/conf/config.yaml`
-  is deleted in the working tree. The phase requires `:pipeline:run` against
-  `MiniCluster` to keep working unchanged through Phase 6 and Phase 7. The file
-  is intact in `HEAD`, so `git checkout -- apps/pipeline/conf/config.yaml`
-  restores it. The image is unaffected, since the Dockerfile never copied
-  `conf/`.
-  **`scripts/build-image.sh` changed, uncommitted.** The dirty check narrowed
-  from the whole tree to `apps/` only. Image contents depend on `apps/` alone,
-  so an uncommitted manifest no longer renames the image. The tag now promises
-  clean image inputs rather than a clean tree.
-- ⬜ Tasks 6 to 11
+- ✅ Task 5: the `FlinkDeployment`, the Service, the PDB. **All fourteen steps
+  verified on the cluster.** The job reached `RUNNING` / `STABLE` on 2026-09-07
+  on image `0.1-0bd7f52`.
+  Five pods, and the Zone spread held on both rules: JobManagers on `zone-c` and
+  `zone-a`, TaskManagers 1/1/1 across all three Zones. The selectors guessed in
+  Step 4 were right, confirmed from live labels
+  `app=personalization,component=jobmanager`. A third label exists,
+  `type=flink-native-kubernetes`, useful for finding everything Flink created.
+  Nine vertices RUNNING at parallelism 6. Checkpoints landing at
+  `s3://checkpoints/phase-5/<jobid>/chk-4`, which is the single fact proving the
+  whole S3 chain: plugin loaded, credentials found, MinIO reachable in-cluster,
+  bucket writable. One checkpoint `failed`, almost certainly the first attempt at
+  startup, still to be looked at. `HTTP 200` on `localhost:30011`. PDB reports
+  `ALLOWED DISRUPTIONS: 1`.
+  **The Service name matters.** Flink creates `personalization-rest` itself, from
+  `kubernetes.cluster-id`. The hand written NodePort Service is
+  `personalization-flink-dashboard`, deliberately not that name. Both exist side
+  by side and select the same pods, which is fine, because a Service selector is
+  a filter and not a claim of ownership.
+  **Three runtime failures, all in the same category.** Each lives in a seam that
+  only closes inside the container. Gradle passed, the image built,
+  `--dry-run=server` passed, and ArgoCD said `Synced` and `Healthy` through all
+  three. None could fail under `MiniCluster`.
+  1. `UnsupportedClassVersionError`, class file 65.0 against a runtime reading up
+     to 61.0. `apps/` compiles at Java 21 and `flink:2.2.0` ships Temurin 17.
+     Fixed with `FROM flink:2.2.0-java21`, because `:domain` is bundled into the
+     Shadow jar and targeting Java 17 would have meant editing
+     `apps/domain/build.gradle`.
+  2. `MalformedURLException: unknown protocol: local`, thrown from
+     `env.execute()`. The operator renders `job.jarURI` into the same
+     `config.yaml` the job re-reads, as
+     `pipeline.jars=local:///opt/flink/usrlib/pipeline.jar`. Handing that back to
+     Flink makes `ExecutionConfigAccessor.getJars` call `new URL()` on a scheme
+     `java.net.URL` does not know. Fixed with
+     `flinkConfig.removeConfig(PipelineOptions.JARS)`.
+  3. `UnsupportedFileSystemSchemeException` for scheme `s3`, while initialising
+     the HA checkpoint store. `FileSystem.initialize(config, null)` rebuilds the
+     filesystem registry loading **no plugins**, and ADR 0001 put
+     `flink-s3-fs-hadoop` in `plugins/` where it is the only copy: `/opt/flink/lib`
+     holds no s3 jar. The `null` discarded the filesystem the entrypoint had
+     already registered. Fixed with
+     `PluginUtils.createPluginManagerFromRootFolder(flinkConfig)`.
+  **A global constraint was amended, not broken quietly.** The plan said "no file
+  under `apps/` changes except `apps/pipeline/build.gradle`". Two lines of
+  `PersonalizationJob.java` changed, both inside `flinkConfiguration()`, both
+  no-ops under `MiniCluster`, `:pipeline:test` green after each. The constraint
+  now reads: no change may alter the job graph, the operators, or their
+  semantics. The plan records the amendment and the reason.
+  **A workflow trap.** `root.yaml` uses `targetRevision: HEAD`, which resolves to
+  the repository's **default branch**, `master`, not the locally checked out
+  branch. Work committed to `phase-2` deploys nothing and reports no error
+  anywhere: the Application simply never appears. Push with
+  `git push origin phase-2:master`. ArgoCD then polls on its own schedule, so
+  `Synced` beside a stale revision is normal for a few minutes. Always read the
+  revision beside the status, and force a refresh with
+  `kubectl -n argocd exec argocd-application-controller-0 -- argocd --core app get <app> --refresh`.
+  **Step 12, HA metadata, checked separately from checkpoints.** Both sides carry
+  data: the `personalization-cluster-config-map` in Kubernetes, and
+  `s3://checkpoints/phase-5-ha/` in MinIO. The split is not incidental. A
+  ConfigMap is small and a JobGraph is not, so Flink persists the metadata to
+  `high-availability.storageDir` and stores **only a pointer** in Kubernetes.
+  Checking one and assuming the other would let Drill B pass while proving
+  nothing, since a fresh JobManager starting an empty job also reaches `RUNNING`.
+  **Step 13, Recommendations from the cluster.** Present on the topic, with
+  `reason` values `price-drop` and `cart-abandoned`, so at least two operators
+  are producing.
+  **Two facts about the `recommendation` topic that Task 6 must handle.**
+  1. Offsets step by **2**, not 1. Every other offset is a transaction commit
+     marker: it takes an offset but is not a record. That is the `EXACTLY_ONCE`
+     sink. A snapshot that counts offsets rather than records is wrong by a
+     factor of two, and `-X isolation.level=read_committed` is not optional.
+  2. The log start offsets are **not zero**: 102, 103, and 86 against end offsets
+     108, 109, and 92. So `kcat -o -20` asks for an offset below the log start,
+     gets `Broker: Offset out of range`, silently resets to END, and prints
+     nothing. Confirmed as real log start offsets rather than transaction
+     filtering, because `read_uncommitted` reports the same first offsets. The
+     topic has no custom retention and the brokers use `jbod` storage, so the
+     cause is **not yet established**. Worth answering before Task 6, whose
+     instrument reads this topic.
+- ✅ Task 6: the gap check instrument. `scripts/recommendation-snapshot.sh`, two
+  modes: `snapshot <out>` and `compare <before> <after>`. Calibrated with the
+  generator live on 2026-09-07: 158 identities then 159, zero gaps, zero
+  duplicates, exit 0. The growth case is the one that matters and it is proven,
+  `comm -23` ignores identities that appear only in AFTER.
+  **The identity is `(shopperId, generatedAt)`**, read straight off the Kafka
+  record with `kcat -f '%k %T\n'`. No JSON parsing.
+  `RecommendationSerializationSchema` puts `shopperId` in the key and
+  `generatedAt` in the record timestamp. `generatedAt` is the Browsing Session's
+  window end, an event-time value, so replaying the same input reproduces the
+  same pair.
+  **The topic is compared against itself, never against the input.** The pipeline
+  suppresses output twice on purpose, out-of-stock at 9.6% and `UNMATCHED`
+  candidates dropped, so comparing against closed Browsing Sessions would make
+  correct suppression read as a Drill failure.
+  **A correction to the plan's Step 2.** The plan wrote the snapshot with
+  `sort -u` and then looked for duplicates with
+  `cut -d' ' -f1,2 "$AFTER" | sort | uniq -d`. `%k %T` is two fields, so that
+  `cut` is the whole line, and on a deduplicated file the check can never fire.
+  It would have reported "no duplicates" on a Drill that genuinely broke
+  exactly-once. The script writes `sort` instead and takes both views from the
+  one file: `comm -23 <(uniq before) <(uniq after)` for the gap, `uniq -d after`
+  for duplicates. `snapshot` prints records and identities separately so a
+  divergence shows immediately.
+  `export LC_ALL=C` on both `sort` and `comm`, because `comm` compares byte for
+  byte and rejects input sorted under another collation.
+  **Two rules every Drill inherits.** The generator must be running, or a killed
+  TaskManager has nothing in flight to lose and a zero gap proves nothing. And
+  Kafka offsets must never be reset to replay: identity is derived from event
+  time, so a replay writes a genuine duplicate that stays in the topic and fails
+  every later Drill. Flink ignores a consumer-group reset anyway, since source
+  offsets live in checkpoint state and restored state overrides any configured
+  initial position.
+  **One sensitivity concern, open.** Only one Recommendation appeared in the 30
+  second calibration window against roughly 50 Clicks per 10 seconds. Session
+  windows need a 6 second silent gap per Shopper, which rarely arrives under
+  continuous load. A gap check is only as sensitive as the identities produced
+  during the Drill window, so read the per-operator counts at `localhost:30011`
+  before Drill A.
+- ✅ Task 7: Drill A, kill a TaskManager. Runbook at
+  [phase-5-drill-a-taskmanager-kill.md](../../runbooks/phase-5-drill-a-taskmanager-kill.md).
+  Two runs on 2026-09-07. Restored from `chk-784` then `chk-809`, `is_savepoint`
+  false both times, **15 seconds recovery in both runs**. Gap 0, duplicates 0,
+  identities 506 to 530. Zone spread survived: the replacement TaskManagers
+  landed one per worker.
+  **Why the whole job fails, not just the dead pod.** The surviving TaskManagers
+  hold state from a later point in time than a fresh one would, so resuming from
+  mixed vintages would silently corrupt every windowed aggregate. Flink restarts
+  every task from the last checkpoint instead. The 10 second interval bounds the
+  replay, and the 15 second wall clock is dominated by pod scheduling and
+  TaskManager registration rather than by replay.
+  **`ScheduleAnyway` earned its place.** With `DoNotSchedule` on the TaskManager
+  spread constraint, a replacement pod could have been left `Pending` and blocked
+  the recovery this Drill exists to observe.
+  **Three corrections, folded back into the plan.**
+  1. `kubectl delete pod -l component=taskmanager ... | head -1` deletes
+     **every** matching pod. `head -1` truncates kubectl's output, not the
+     deletion, and the API calls are already made when the pipe runs. Both
+     recorded runs killed two pods this way. Select the target first with
+     `-o name | head -1`, then delete by name.
+  2. Read the restore from the REST API, `/jobs/<jid>/checkpoints` field
+     `latest.restored`, not from the log. The log is fragile three ways at a 10s
+     checkpoint interval: `--tail=300` does not reach back far enough, only the
+     **leader** JobManager logs the restore so half of a
+     `-l component=jobmanager` fetch is standby noise, and a restarted
+     JobManager loses its previous container's log.
+  3. **The gap direction is structurally near-untriggerable.** Committed Kafka
+     records do not disappear, so `comm -23 BEFORE AFTER` is empty whatever
+     happens, barring retention. The restore record and the duplicate check are
+     what actually prove recovery. A clean `no gap` line is a regression guard,
+     not evidence. This applies to Drills B and C too.
+  **The PDB is not involved and that is correct.** `kubectl delete pod` is an
+  involuntary disruption. A PodDisruptionBudget constrains the eviction API,
+  which is `kubectl drain`. `ALLOWED DISRUPTIONS` stayed at 1 throughout. Drill C
+  is where the PDB is exercised.
+  **Sensitivity, measured before the Drill.** Roughly **2 Recommendations per
+  minute**: 10964 Clicks became 173 through two deliberate chokepoints, the 6
+  second session window at 24 to 1 and Phase 4's suppressions at 34 to 1. The
+  generator was left at its default `click-rate=5.0`, on the grounds that every
+  Drill should run against the same workload and that more volume would not make
+  the gap direction any more sensitive.
+- ✅ Task 8: Drill B, kill the leader JobManager. Runbook at
+  [phase-5-drill-b-jobmanager-kill.md](../../runbooks/phase-5-drill-b-jobmanager-kill.md).
+  Killed the leader `zctrk` on 2026-09-07. `leaderTransitions` went 1 to 2,
+  `holderIdentity` changed, the previous standby `hw6ct` took over, and a
+  replacement standby `p62r4` landed on a different worker so `DoNotSchedule`
+  held. **The job id was unchanged**, `ccf3abb44f948e42142eaac8a5edd1a4`,
+  restored from `chk-920`. Recovery 15 seconds. Gap 0, duplicates 0, identities
+  602 to 626.
+  **The job id is the primary evidence, not the pod count.** If the survivor had
+  started a fresh job, two healthy JobManager pods would still be listed and the
+  Drill would have proved nothing.
+  **The TaskManagers survived.** The new leader logged
+  `Recovered worker personalization-taskmanager-2-8 ... registered` and re-adopted
+  the existing pods. None was killed or rescheduled. That is the sharpest
+  contrast with Drill A, where every slot was rebuilt.
+  **Drill B's signature log line** is `Job <jobid> was recovered successfully`,
+  which Drill A never produces, because Drill A never lost the coordinator. The
+  `KubernetesCheckpointRecoveryFactory.createRecoveredCompletedCheckpointStore`
+  frame beside it is the HA store being rebuilt from `phase-5-ha`.
+  **Identifying the leader is harder than the plan assumed, and the plan is now
+  corrected.** `holderIdentity` in the lease annotation is a UUID Flink generates
+  per JobManager **process**. It matches neither pod's UID. Grepping the logs for
+  it fails too, because the standby observes the election and logs the winner as
+  well, measured at 1 line against 3. What works: the leader is the only
+  JobManager running the `CheckpointCoordinator`, so
+  `kubectl logs <pod> --tail=-1 | grep -c "Completed checkpoint"` is non-zero on
+  exactly one pod. In k9s, filter the log view on `Completed checkpoint` rather
+  than `was granted leadership`, since the latter is written once at election
+  time and is usually outside any tail. The pods view itself is no help: both
+  JobManagers carry identical labels and no leader marker.
+  **`leaseDuration: PT15S`** is why the standby cannot act for up to 15 seconds.
+  The observed sequence was 10 seconds from kill to the job noticing, then 15
+  seconds to running. **15 seconds is now the recovery figure in all three Drill
+  runs**, dominated by TaskManager registration and re-scheduling rather than by
+  replay.
+  **`leaderTransitions` is cumulative.** It read 1 before this Drill, from a
+  leadership change earlier in the day during the image rollouts. Record the
+  before value rather than assuming 0.
+- ✅ Task 9: Drill C, drain a Zone. Runbook at
+  [phase-5-drill-c-zone-drain.md](../../runbooks/phase-5-drill-c-zone-drain.md).
+  Drained `personalization-lab-worker2`, Zone `zone-b`, on 2026-09-07. Gap 0,
+  duplicates 0, identities 725 to 801. **The job stayed `RUNNING` throughout**:
+  only one of six slots moved, and Flink redeployed that subtask without failing
+  the job. No restart, no checkpoint restore.
+  **The plan's prediction was wrong, and the arithmetic says why.** It expected
+  `personalization-pdb` to refuse an eviction and the drained Zone's JobManager
+  to sit `Pending`. Neither can happen at 2 replicas across 3 Zones:
+  `ALLOWED DISRUPTIONS` is `2 - 1 = 1` so the budget has slack, and a spare Zone
+  always exists so `maxSkew: 1` stays satisfiable. The replacement scheduled onto
+  `worker` in zone-a. The plan is corrected in place.
+  **The refusal came from Strimzi, not from Flink**, and is captured verbatim:
+  `Cannot evict pod as it would violate the pod's disruption budget`, repeating
+  every 5 seconds forever.
+  **A genuine drain deadlock, which is the better finding.**
+  `personalization-kafka` has `minAvailable: 5` over 6 pods. `brokers-4` was
+  evicted first, allowed because 6 minus 1 is 5. It then could not reschedule:
+  its PersistentVolume is pinned to `worker2` by `kind`'s local-path provisioner,
+  and `worker2` was cordoned by the drain itself. `FailedScheduling` accounted
+  for all six nodes: 1 unschedulable, 2 failing PV node affinity, 3 tainted
+  control planes. With `brokers-4` Pending, available fell to 5,
+  `ALLOWED DISRUPTIONS` became 0, and `brokers-5` could never be evicted.
+  **A strict PDB plus node-local storage makes a node undrainable**, not slow.
+  Only `uncordon` breaks it.
+  **`minAvailable` is a rule about the state after the eviction**, not about the
+  state now. A budget can be satisfied and immovable at the same time.
+  **`ScheduleAnyway` earned its place.** The evicted TaskManager's replacement
+  landed on `worker3`, which already had one, making the distribution 2/0/1.
+  `DoNotSchedule` would have left it `Pending` and stalled the recovery this
+  Drill exists to observe. `DoNotSchedule` on the JobManagers held: two pods, two
+  Zones, none Pending.
+  **`drain` evicts every pod on the node, not one.** Ten pods lived on `worker2`.
+  Record `kubectl get pdb -A`, not one namespace: the refusal came from a
+  namespace the plan never mentioned.
+  **A Phase 1 defect this Drill exposed.** `brokers-4` and `brokers-5` shared
+  `worker2`, so one drain removed two thirds of the Kafka cluster and left it at
+  exactly `min.insync.replicas: 2` with no margin.
+  `manifests/strimzi/kafka-cluster.yaml` carries **no**
+  `topologySpreadConstraints`, while the `FlinkDeployment` carries them on both
+  roles. Worth fixing in the Phase 1 manifests. After `uncordon`, Kafka caught
+  `brokers-4` back up on its own with no under-replicated partitions.
+- ❌ Drill D, ArgoCD Lua actions and drift, formerly Task 10. **Removed by decision on
+  2026-09-07**, not attempted. It was the only item in this phase testing the
+  GitOps control loop rather than Flink recovery, and its expensive half was
+  ArgoCD Lua plumbing. Two consequences, both real and both carried forward:
+  `automated.selfHeal: false` is now set on every Application without ever being
+  validated, and `upgradeMode: savepoint` has never been exercised, so
+  `s3://checkpoints/phase-5-savepoints/` is expected to be empty and every
+  restore so far read `is_savepoint: false`. **Phase 7's Promotion suspends with
+  a savepoint**, so it should prove that operation before building on it:
+  `kubectl patch flinkdeployment personalization -n personalization-blue
+  --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'`.
+  The design spec's coverage map still lists Drill D and the three Lua actions,
+  so the spec and the plan now disagree until the documents task reconciles them.
+- ✅ Task 10: Documents, renumbered from 11. Knowledge doc, ADR 0007 amendment,
+  four new `CONTEXT.md` terms, the runbook index, and this section.
+
+**What Phase 6 and Phase 7 need from here.**
+
+- **Parallelism is 6 with `taskmanager.numberOfTaskSlots: "2"`, giving exactly 3
+  TaskManagers, one per Zone.** Phase 6's autoscaler changes parallelism, and
+  that changes the pod count by the same division. The `256mb` network buffer
+  setting is the headroom it must stay inside: 8192 buffers at a 32kb segment
+  size, against a requirement that grows with the **square** of parallelism
+  because every upstream subtask needs a channel to every downstream one.
+- **`upgradeMode: savepoint` is set and both namespaces exist**, so Phase 7's
+  Promotion has what it needs declared. **It has never been exercised.** Drill D
+  was removed, every restore in this phase read `is_savepoint: false`, and
+  `s3://checkpoints/phase-5-savepoints/` is expected to be empty. Prove it before
+  building Promotion on it:
+  `kubectl patch flinkdeployment personalization -n personalization-blue
+  --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'`.
+- **The operator chart ships a `FlinkBlueGreenDeployment` CRD**, one of the four
+  installed. Phase 7 must evaluate it against
+  [ADR 0006](../../adr/0006-blue-green-native-mode.md) rather than assume the
+  hand-rolled Promotion is the only option.
+- **The image tag must move on every code change.** `scripts/build-image.sh` tags
+  `0.1-<short sha>` and appends `-dirty` when `apps/` has uncommitted changes.
+  A stale tag with new code is the failure that looks like a Flink bug, because
+  `imagePullPolicy: IfNotPresent` means the node keeps what it already has. Commit
+  first, rebuild, then update `spec.image`.
+- **`kind load` overwrites by tag, and a rebuild produces a different digest for
+  the same tag.** Observed 2026-08-31 as `dbc3f08` then `79c7cf38`. Docker builds
+  are not byte-reproducible. A tag is a label, not an identity.
+
+**One open defect, from Drill C.** `manifests/strimzi/kafka-cluster.yaml` carries
+no `topologySpreadConstraints`, so `brokers-4` and `brokers-5` shared `worker2`.
+One drain removed two thirds of the Kafka cluster and left it at exactly
+`min.insync.replicas: 2`. The `FlinkDeployment` above it is Zone-spread on both
+roles. Fix belongs in the Phase 1 manifests.
+
+**One documentation divergence.** The design spec's coverage map still lists
+Drill D and the three ArgoCD Lua actions. The plan no longer does. The spec is
+the older document and was not rewritten, on the grounds that a spec records what
+was designed and `status.md` records what was built.
 
 
 **One step still open from Task 0.** Step 5, re-confirming the host-side

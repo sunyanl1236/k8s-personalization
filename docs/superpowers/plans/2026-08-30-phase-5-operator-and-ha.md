@@ -55,72 +55,52 @@ Nothing in Phase 4 remains open. This plan has no cross-phase dependency.
 |---|---|---|
 | 0 | Kafka internal listener | done 2026-08-31, listener `plain`, 3 brokers reachable on 9092 from an in-cluster pod |
 | 1 | Shadow fat jar, allowlist scoped | done 2026-08-31, 24MB jar, five content checks pass, 27 tests green |
-| 2 | The image, and loading it into `kind` | done 2026-08-31, tag `0.1-b606416-dirty`, both files verified in-image, present on all 3 workers |
+| 2 | The image, and loading it into `kind` | done 2026-08-31, revised 2026-09-07 to `FROM flink:2.2.0-java21`. Current tag `0.1-0bd7f52`, both files verified in-image, present on all 3 workers |
 | 3 | Namespaces and the credentials Secret | done 2026-08-31, idempotence proven by a second run, both Secrets match the source |
 | 4 | The operator, as an ArgoCD Application | done 2026-09-02, Synced/Healthy, operator 2/2, `v2_2` on the installed CRD, RBAC in both namespaces |
-| 5 | The `FlinkDeployment`, the Service, the PDB | in progress 2026-09-06, Steps 1 and 2 written, Steps 3 to 14 open |
-| 6 | The gap check instrument | not started |
-| 7 | Drill A: kill a TaskManager | not started |
-| 8 | Drill B: kill the leader JobManager | not started |
-| 9 | Drill C: drain a Zone | not started |
-| 10 | Drill D: ArgoCD Lua actions and drift | not started |
-| 11 | Documents | not started |
+| 5 | The `FlinkDeployment`, the Service, the PDB | done 2026-09-07, job RUNNING/STABLE, Zone spread 1/1/1, checkpoints at `phase-5/<jobid>/chk-N`, HA metadata under `phase-5-ha/`, Recommendations on the topic |
+| 6 | The gap check instrument | done 2026-09-07, calibrated with the generator live: 158 -> 159 identities, zero gaps, zero duplicates |
+| 7 | Drill A: kill a TaskManager | done 2026-09-07, restored from chk-784 then chk-809, 15s recovery both runs, zero gaps, zero duplicates, runbook written |
+| 8 | Drill B: kill the leader JobManager | done 2026-09-07, leaderTransitions 1->2, job id unchanged, restored from chk-920, 15s recovery, TaskManagers re-adopted, runbook written |
+| 9 | Drill C: drain a Zone | done 2026-09-07, PDB refusal captured verbatim from Strimzi's PDB, drain deadlock found, ScheduleAnyway proven, gap 0, runbook written |
+| 10 | Documents | done 2026-09-07, knowledge doc, ADR 0007 amended, 4 CONTEXT.md terms, runbook index, status.md closed |
 
 Tasks 0, 1, and 3 depend on nothing and can run in any order. Task 2 needs 1.
-Task 4 needs 3. Task 5 needs 0, 2, and 4. Tasks 6 to 10 are strictly sequential
+Task 4 needs 3. Task 5 needs 0, 2, and 4. Tasks 6 to 9 are strictly sequential
 after 5.
 
 ### Where to resume
 
-**Next: Task 5, Step 3.** Steps 1 and 2 are written into
-`manifests/flink/blue/flinkdeployment.yaml`: the top level block and the whole of
-`spec.flinkConfiguration`, including the deliberate absence of `s3.access-key`
-and `s3.secret-key` with the comment that says so. Steps 3 to 14 are open.
+**Phase 5 is done, 2026-09-07.** Nothing here is open. Continue at Phase 6,
+Autoscaling.
 
-Three files named by this task exist but are **empty**:
-`manifests/flink/blue/rest-nodeport.yaml`, `manifests/flink/blue/pdb.yaml`, and
-`manifests/argocd-apps/flink-job-blue.yaml`. An empty file is not an absent file.
-`prune: true` on the Application will not remove an empty document, but ArgoCD
-also cannot render one, so write them before Step 8 rather than after.
+What this phase delivered:
 
-**The environment is up** as of 2026-09-06. All six ArgoCD Applications are
-Synced and Healthy, and the operator pod is 2/2 Running.
+```
+the job          RUNNING/STABLE on kind, image lab/personalization-pipeline:0.1-0bd7f52
+                 2 JobManagers, 3 TaskManagers, parallelism 6, 2 slots each
+placement        JobManagers 2 Zones (DoNotSchedule), TaskManagers 1/1/1 (ScheduleAnyway)
+state            checkpoints s3://checkpoints/phase-5, HA metadata s3://checkpoints/phase-5-ha
+GitOps           flink-operator + flink-job-blue, both Synced and Healthy
+instrument       scripts/recommendation-snapshot.sh, calibrated
+Drills           A, B, C all pass. D removed by decision.
+```
 
-**One field question settled from the installed CRD.** Upstream docs on the
-operator's `main` branch mark `spec.jobManager.resource` deprecated in favour of
-`resources`. That field **does not exist** on the CRD this cluster has. The
-`jobManager` properties are exactly `['podTemplate', 'replicas', 'resource']`.
-Step 4's `resource: {memory, cpu}` is correct and is the only option.
+**Three things Phase 6 and Phase 7 inherit**, recorded in full in
+[status.md](status.md):
 
-**Two things to settle before Step 8 syncs anything.**
+1. `upgradeMode: savepoint` is declared and **never exercised**. Prove it before
+   Phase 7's Promotion depends on it.
+2. `manifests/strimzi/kafka-cluster.yaml` has no `topologySpreadConstraints`, so
+   two of three brokers shared a node. Drill C exposed it. The fix belongs in the
+   Phase 1 manifests.
+3. The operator chart ships a `FlinkBlueGreenDeployment` CRD. Phase 7 must
+   evaluate it against [ADR 0006](../../adr/0006-blue-green-native-mode.md)
+   rather than assume the hand-rolled Promotion.
 
-1. `apps/pipeline/conf/config.yaml` is **deleted** in the working tree. That
-   breaks a global constraint of this phase: `:pipeline:run` against
-   `MiniCluster` must keep working unchanged through Phase 6 and Phase 7. The
-   file is unmodified in `HEAD` (`a34e204`), so
-   `git checkout -- apps/pipeline/conf/config.yaml` restores it. The Dockerfile
-   does not copy `conf/`, so the deletion never affected the image. It only
-   affects the local run.
-
-2. `spec.image` currently reads `lab/personalization-pipeline:0.1-86a77e6`, and
-   `HEAD` is `86a77e6`, so the tag is clean and correct **as written**. It is
-   unverified against the nodes, because the cluster is down. Confirm with
-   `docker exec personalization-lab-worker crictl images | grep personalization`
-   once the cluster is up. Note that restoring `config.yaml` also restores a
-   clean `apps/` tree, so a rebuild would produce the same tag rather than a
-   `-dirty` one.
-
-`scripts/build-image.sh` was changed on 2026-09-06 and the change is
-uncommitted: the dirty check narrowed from `git status --porcelain` to
-`git status --porcelain -- apps/`. The reasoning is sound, since the image
-contents depend on `apps/` alone, and an uncommitted manifest or document should
-not rename an image. It does mean the tag no longer promises a clean tree, only
-clean image inputs.
-
-Note also that rebuilding produces a **different image digest for the same tag**,
-observed on 2026-08-31 as `dbc3f08` then `79c7cf38`. Docker builds are not
-byte-reproducible. `kind load` overwrites by tag, so the nodes stay correct, but
-a tag is a label and not an identity.
+**Known divergence.** The design spec's coverage map still lists Drill D and the
+three ArgoCD Lua actions. The plan no longer does. The spec records what was
+designed; `status.md` records what was built.
 
 ## Global constraints
 
@@ -129,14 +109,36 @@ Copied verbatim from the spec. Every task inherits these.
 - **Flink 2.2.0** and **Operator 1.15.0**. The CRD enum value is `v2_2`.
 - **No credential may enter Git.** Not in a manifest, not in a values file, not
   in a comment. The `FlinkDeployment` carries a Secret **name** only.
-- **No file under `apps/` changes except `apps/pipeline/build.gradle`.** The job
-  graph is frozen and the Java is correct as it stands.
-- **`apps/pipeline/conf/config.yaml` is not edited.** `:pipeline:run` against
-  `MiniCluster` must keep working unchanged through Phase 6 and Phase 7.
+- **The job graph is frozen.** Originally written as "no file under `apps/`
+  changes except `apps/pipeline/build.gradle`". **Amended 2026-09-07**, after
+  three runtime failures proved the Java was not correct as it stood for a
+  containerised runtime. The constraint now reads: no change may alter the job
+  graph, the operators, or their semantics. Two lines of
+  `PersonalizationJob.java` changed, both inside `flinkConfiguration()`, both
+  no-ops under `MiniCluster`. See "The Java that did have to change" below.
+- **`apps/pipeline/conf/config.yaml` is not edited.** Originally written as
+  above, with the rider that `:pipeline:run` against `MiniCluster` must keep
+  working unchanged through Phase 6 and Phase 7. **Corrected 2026-09-08**: that
+  file no longer exists. Task 5 deleted it in commit `b0705e0`, 15 lines, when
+  the configuration moved into `spec.flinkConfiguration`, which the operator
+  renders into `/opt/flink/conf/config.yaml` in every pod. The constraint is now
+  satisfied vacuously and no later phase should treat it as a live restriction.
+  Two consequences follow. The Phase 5 design's rule that
+  `conf/config.yaml` and `spec.flinkConfiguration` are "two lists that must not
+  drift" has only one side left, so there is nothing to keep in step. And a bare
+  `:pipeline:run` against `MiniCluster` now throws
+  `IllegalStateException("no config.yaml loaded from conf")` from
+  `PersonalizationJob.flinkConfiguration` unless the developer supplies their own
+  copy, because `flinkConfDir` defaults to the relative path `conf`. The rider
+  above was therefore already false when this plan closed. `:pipeline:test` does
+  not touch that path and is unaffected.
 - **The `external` Kafka listener is not modified.** The generator and every
   `kcat` check on the host use it. The internal listener is added beside it.
-- `automated.selfHeal` stays **`false`** on every Application. Drill D depends on
-  it.
+- `automated.selfHeal` stays **`false`** on every Application, per
+  [ADR 0004](../../adr/0004-gitops-from-phase-0.md). Drill D was to be the thing
+  that validated it. **Drill D was removed on 2026-09-07**, so this setting is
+  now carried untested. Keep it: reversing it is a separate decision, and Phase 7
+  needs the same property.
 - Correct Flink 2.2 config keys, verified by `javap` on `flink-dist-2.2.0.jar`:
   `high-availability.type`, `high-availability.storageDir`,
   `jobmanager.scheduler`, `execution.checkpointing.savepoint-dir`,
@@ -152,13 +154,12 @@ Copied verbatim from the spec. Every task inherits these.
 | Path | Responsibility |
 |---|---|
 | `apps/pipeline/build.gradle` | Shadow plugin, the `bundled` allowlist configuration, the `shadowJar` task |
-| `apps/pipeline/Dockerfile` | Move the S3 plugin, place the job jar. Build context is `apps/pipeline` |
+| `apps/pipeline/Dockerfile` | Move the S3 plugin, place the job jar. Build context is `apps/pipeline`. **Amended:** `FROM flink:2.2.0-java21`, not the default image |
+| `apps/pipeline/src/.../PersonalizationJob.java` | **Added 2026-09-07**, two lines in `flinkConfiguration()`. Job graph untouched |
 | `scripts/build-image.sh` | Build, tag with the git sha, load into `kind` |
 | `scripts/bootstrap-flink-secret.sh` | Copy the MinIO credentials into both job namespaces |
 | `scripts/recommendation-snapshot.sh` | The gap check instrument, used by Drills A, B, C |
-| `scripts/bootstrap-phase0.sh` | Modified: ArgoCD helm install gains a values file |
 | `manifests/strimzi/kafka-cluster.yaml` | Modified: a second, internal listener |
-| `manifests/argocd/flink-actions-values.yaml` | The three Lua resource actions |
 | `manifests/argocd-apps/flink-operator.yaml` | Application: the operator Helm chart |
 | `manifests/argocd-apps/flink-job-blue.yaml` | Application: the job manifests |
 | `manifests/flink/namespaces.yaml` | `personalization-blue` and `personalization-green` |
@@ -853,12 +854,38 @@ RocksDB state and write the checkpoint data to MinIO, and they never run your
 That is why the configuration moves to `spec.flinkConfiguration`. The operator
 renders it into `/opt/flink/conf/config.yaml` in **every** pod.
 
-**Why no Java changes.** The image working directory is `/opt/flink`.
-`PipelineConfig` defaults `flinkConfDir` to the relative path `conf`, so
-`GlobalConfiguration.loadConfiguration("conf")` resolves to `/opt/flink/conf` and
-reads exactly the file the operator wrote. The guard at
+**Why the config file needs no Java change.** The image working directory is
+`/opt/flink`. `PipelineConfig` defaults `flinkConfDir` to the relative path
+`conf`, so `GlobalConfiguration.loadConfiguration("conf")` resolves to
+`/opt/flink/conf` and reads exactly the file the operator wrote. The guard at
 `PersonalizationJob.java:187` still works: with no `state.backend.type` present
-the job throws instead of silently running on defaults.
+the job throws instead of silently running on defaults. All of that held.
+
+**The Java that did have to change.** This plan originally claimed no Java change
+at all. That was wrong, and it took three deploys to find out. Both changes are
+inside `flinkConfiguration()`. Neither touches the job graph. Both are no-ops
+under `MiniCluster`, and `:pipeline:test` passes after each.
+
+| Line added | Why | Symptom without it |
+|---|---|---|
+| `flinkConfig.removeConfig(PipelineOptions.JARS);` | the operator renders `job.jarURI` into the same `config.yaml` as `pipeline.jars=local:///...`. Re-reading the file hands that scheme back to Flink, and `ExecutionConfigAccessor.getJars` calls `new URL()` on it | `MalformedURLException: unknown protocol: local`, thrown from `env.execute()` |
+| `PluginUtils.createPluginManagerFromRootFolder(flinkConfig)` in place of `null` | [ADR 0001](../../adr/0001-plugin-directory-move.md) moved `flink-s3-fs-hadoop` into its own `plugins/` subfolder, so in the image s3 exists **only** as a plugin and `/opt/flink/lib` holds no s3 jar. A `null` PluginManager rebuilds the filesystem registry with no plugins, discarding the s3 filesystem the entrypoint had already registered | `UnsupportedFileSystemSchemeException: Could not find a file system implementation for scheme 's3'` while initialising the HA checkpoint store |
+
+Both are invisible locally. `pipeline.jars` does not exist under `MiniCluster`,
+and there is no `plugins/` directory on the host, so the `runtimeOnly` classpath
+copy of the s3 filesystem is used exactly as before.
+
+**A third failure, on the image rather than the Java.** The first deploy
+crash-looped both JobManagers on
+`UnsupportedClassVersionError: class file version 65.0 ... up to 61.0`. `apps/`
+compiles at Java 21 and `flink:2.2.0` ships Temurin 17. Fixed by
+`FROM flink:2.2.0-java21`, because `:domain` is bundled into the Shadow jar and
+targeting Java 17 would have meant editing `apps/domain/build.gradle`.
+
+**What the three have in common.** Every one lives in a seam that only closes
+inside the container. Gradle passed, the image built, `kubectl apply
+--dry-run=server` passed, and ArgoCD reported `Synced` and `Healthy` through all
+three. None could fail under `MiniCluster`.
 
 **Why four environment variables from two Secret keys.** `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` are what the **TaskManagers** need, because they write
@@ -952,7 +979,7 @@ New in this phase:
 `s3.access-key` and `s3.secret-key` are **absent on purpose**. Add a comment
 saying so, because their absence looks like an oversight and is the opposite.
 
-- [ ] **Step 3: Write the shared `podTemplate` with the four environment variables.**
+- [x] **Step 3: Write the shared `podTemplate` with the four environment variables.**
 
 The container name must be exactly `flink-main-container`. The operator matches
 on that name to merge your template into the pod it generates. Any other name
@@ -974,7 +1001,7 @@ adds a second container instead of configuring the one that matters.
 Three more in the same shape: `AWS_SECRET_ACCESS_KEY` from `secret-key`,
 `MINIO_ACCESS_KEY` from `access-key`, `MINIO_SECRET_KEY` from `secret-key`.
 
-- [ ] **Step 4: Write the two role blocks with their spread constraints.**
+- [x] **Step 4: Write the two role blocks with their spread constraints.**
 
 ```yaml
   jobManager:
@@ -1013,7 +1040,7 @@ The operator labels the pods it creates with `app: <deployment name>` and
 Step 9 before trusting the selectors, because a selector that matches nothing
 produces no error and no spreading.
 
-- [ ] **Step 5: Write the `job` block.**
+- [x] **Step 5: Write the `job` block.**
 
 ```yaml
   job:
@@ -1035,7 +1062,7 @@ place for the two environments to silently diverge later.
 `upgradeMode: savepoint` is here for Phase 7's Promotion, which suspends with a
 savepoint. It is why `execution.checkpointing.savepoint-dir` is set in Step 2.
 
-- [ ] **Step 6: Write the NodePort Service.**
+- [x] **Step 6: Write the NodePort Service.**
 
 Flink cannot pin a NodePort number. `KubernetesConfigOptions` has
 `kubernetes.rest-service.exposed.type` and `.exposed.node-port-address-type`, and
@@ -1046,7 +1073,7 @@ So write a plain Service, in the shape `manifests/minio/s3-nodeport.yaml` alread
 uses for MinIO on 30014: `type: NodePort`, `nodePort: 30011`, `port: 8081`,
 `targetPort: 8081`, selecting `app: personalization` and `component: jobmanager`.
 
-- [ ] **Step 7: Write the PodDisruptionBudget.**
+- [x] **Step 7: Write the PodDisruptionBudget.**
 
 `minAvailable: 1`, selecting the same two labels. The operator does not create
 one.
@@ -1055,17 +1082,17 @@ It has no effect on `kubectl delete pod`, which is an involuntary disruption.
 It has effect on `kubectl drain`, which is Drill C. Say that in a comment, so
 Drill A and B do not look like the PDB failing.
 
-- [ ] **Step 8: Write the ArgoCD Application and sync it.**
+- [x] **Step 8: Write the ArgoCD Application and sync it.**
 
 `manifests/argocd-apps/flink-job-blue.yaml`, with `metadata.name: flink-job-blue`.
-Task 10 addresses it by that exact name, so a different one breaks Drill D.
+Nothing addresses it by name any more, since Drill D was removed on 2026-09-07, but keep the name stable: Phase 7's green Application pairs with it.
 
 A Git source pointing at `manifests/flink/blue/`, destination namespace
 `personalization-blue`, `selfHeal: false`, `prune: true`. No
 `CreateNamespace=true`, because Task 3 already created it and this Application
 should not own its lifecycle.
 
-- [ ] **Step 9: Watch it come up, and read the labels.**
+- [x] **Step 9: Watch it come up, and read the labels.**
 
 ```bash
 kubectl get flinkdeployment personalization -n personalization-blue -w
@@ -1076,7 +1103,7 @@ Expected: `JOB STATUS: RUNNING`. Five pods: two JobManagers, three TaskManagers.
 Read the labels and confirm they are what Step 4 and Step 6 select on. If they
 differ, fix the selectors now, before any Drill depends on them.
 
-- [ ] **Step 10: Confirm the Zone spread actually happened.**
+- [x] **Step 10: Confirm the Zone spread actually happened.**
 
 ```bash
 kubectl get pods -n personalization-blue -o custom-columns=\
@@ -1086,7 +1113,7 @@ kubectl get pods -n personalization-blue -o custom-columns=\
 Expected: the three TaskManagers on three different workers, and the two
 JobManagers on two different workers. All three Zones carry work.
 
-- [ ] **Step 11: Confirm the plugin loaded, which is the whole of Task 2's point.**
+- [x] **Step 11: Confirm the plugin loaded, which is the whole of Task 2's point.**
 
 ```bash
 kubectl exec -n personalization-blue deploy/personalization -- \
@@ -1105,14 +1132,14 @@ look about a minute later. An empty bucket with a Running job means the
 filesystem never registered, and the JobManager log will say
 `UnsupportedFileSystemSchemeException`.
 
-- [ ] **Step 12: Confirm HA metadata exists, separately.**
+- [x] **Step 12: Confirm HA metadata exists, separately.**
 
 Look under the `phase-5-ha` prefix. It is not the same thing as checkpoints, and
 Drill B depends only on this one. An empty `phase-5-ha` prefix means
 `high-availability.type` did not take effect, and Drill B would then quietly
 prove nothing.
 
-- [ ] **Step 13: Confirm Recommendations are being produced from the cluster.**
+- [x] **Step 13: Confirm Recommendations are being produced from the cluster.**
 
 Start the generator on your host as usual, then:
 
@@ -1125,7 +1152,7 @@ Expected: recent Recommendations. `read_committed` is not optional, for the
 reason Phase 3 Task 8 recorded: without it you read uncommitted transactional
 records and the counts will not reconcile.
 
-- [ ] **Step 14: Open the UI.**
+- [x] **Step 14: Open the UI.**
 
 `http://localhost:30011`. Expected: the job graph, five operators, no failed
 tasks, and a checkpoint history with successful entries.
@@ -1173,7 +1200,7 @@ read uncommitted transactional records. Those can be aborted later, so the
 "before" snapshot picks up identities that were never really published, and every
 Drill then reports a false gap.
 
-- [ ] **Step 1: Write the snapshot mode.**
+- [x] **Step 1: Write the snapshot mode.**
 
 ```bash
 kcat -b localhost:30016 -t recommendation -C -e \
@@ -1185,7 +1212,7 @@ kcat -b localhost:30016 -t recommendation -C -e \
 default for `-C` and is what you want: the check reads the whole topic each time,
 not a tail.
 
-- [ ] **Step 2: Write the compare mode.**
+- [x] **Step 2: Write the compare mode.**
 
 Two things must be reported separately, because they mean different things:
 
@@ -1203,7 +1230,7 @@ cannot be signed off by misreading the output.
 
 Note that the snapshot is already `sort -u`, which `comm` requires.
 
-- [ ] **Step 3: Take two snapshots with no Drill in between.**
+- [x] **Step 3: Take two snapshots with no Drill in between.**
 
 ```bash
 ./scripts/recommendation-snapshot.sh snapshot /tmp/rec-1.txt
@@ -1245,29 +1272,36 @@ there, read the JobManager log before touching anything. The common cause is a
 replacement TaskManager that cannot be scheduled, and the reason will be in
 `kubectl describe pod`, not in Flink.
 
-- [ ] **Step 1: Snapshot before.**
+- [x] **Step 1: Snapshot before.**
 
 ```bash
 ./scripts/recommendation-snapshot.sh snapshot /tmp/drill-a-before.txt
 ```
 
-- [ ] **Step 2: Note the current checkpoint id, from the UI or the log.**
+- [x] **Step 2: Note the current checkpoint id, from the UI or the log.**
 
 You want to be able to say afterwards which checkpoint the job restored from.
 "It recovered" is weaker than "it restored from `chk-N`".
 
-- [ ] **Step 3: Kill one TaskManager.**
+- [x] **Step 3: Kill one TaskManager.**
+
+**Corrected 2026-09-07.** The command below was originally written as
+`kubectl delete pod -l component=taskmanager ... | head -1`. That deletes
+**every** matching pod: `head -1` truncates kubectl's output, not the deletion,
+and the API calls are already made by the time the pipe runs. Both recorded runs
+killed two pods this way. `head -1` must select the target first:
 
 ```bash
-kubectl delete pod -n personalization-blue \
-  -l component=taskmanager --field-selector status.phase=Running \
-  --wait=false | head -1
+POD=$(kubectl get pods -n personalization-blue -l component=taskmanager \
+        --field-selector status.phase=Running -o name | head -1)
+echo "killing $POD"
+kubectl delete -n personalization-blue "$POD" --wait=false
 ```
 
 Delete exactly one. Deleting all three is a different Drill and tests less, since
 there is no partial-failure recovery path to observe.
 
-- [ ] **Step 4: Watch the job fail and come back.**
+- [x] **Step 4: Watch the job fail and come back.**
 
 ```bash
 kubectl get flinkdeployment personalization -n personalization-blue -w
@@ -1276,13 +1310,29 @@ kubectl get flinkdeployment personalization -n personalization-blue -w
 Expected sequence: `RUNNING`, then a restarting state, then `RUNNING` again. A
 replacement TaskManager pod appears. Record the wall-clock duration.
 
-- [ ] **Step 5: Confirm it restored from a checkpoint rather than starting empty.**
+- [x] **Step 5: Confirm it restored from a checkpoint rather than starting empty.**
 
-In the JobManager log, look for the restore line naming a checkpoint path under
-`s3://checkpoints/phase-5`. A job that started from scratch would produce no such
-line, and the topic gap check in Step 6 would then be the only thing catching it.
+**Read this from the REST API, not the log.** Amended 2026-09-07.
 
-- [ ] **Step 6: Snapshot after, and compare.**
+```bash
+curl -s "http://localhost:30011/jobs/$JID/checkpoints" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['latest']['restored'])"
+```
+
+Expected: `id`, `restore_timestamp`, `is_savepoint: False`, and an
+`external_path` under `s3://checkpoints/phase-5`. **`restored: None` is the
+failure this step catches**, meaning the job started from empty state.
+
+The log works but is fragile three ways: `--tail=300` does not reach back far
+enough at a 10s checkpoint interval, only the **leader** JobManager logs the
+restore so half of a `-l component=jobmanager` fetch is standby noise, and a
+restarted JobManager loses its previous container's log entirely.
+
+**This step carries more weight than the gap check.** Committed Kafka records do
+not disappear, so `comm -23 BEFORE AFTER` is structurally near-empty whatever
+happens. The restore record and the duplicate check are what prove recovery.
+
+- [x] **Step 6: Snapshot after, and compare.**
 
 ```bash
 sleep 60
@@ -1293,7 +1343,7 @@ sleep 60
 Expected: **zero gaps, zero duplicates.** A pause in output during the restart is
 expected and is not a gap. A lost identity is a gap.
 
-- [ ] **Step 7: Write the runbook.**
+- [x] **Step 7: Write the runbook.**
 
 Follow `docs/runbooks/phase-3-late-click-drill.md` in shape: the goal, the
 rationale per command, and an **Observed result** section holding the real
@@ -1335,25 +1385,49 @@ from a fresh state instead of resuming, `phase-5-ha` was empty and Task 5 Step 1
 did not really pass. The Drill would still look like a success on the pod listing
 and would have proved nothing.
 
-- [ ] **Step 1: Identify the current leader.**
+- [x] **Step 1: Identify the current leader.**
+
+**Corrected 2026-09-07. `holderIdentity` does not identify a pod.** It is a UUID
+Flink generates per JobManager **process**, and it matches neither pod's UID.
+Grepping the logs for it also fails, because the standby observes the election
+and logs the winner too, measured at 1 line against 3.
+
+Read the lease for the **transition count**, which is the real before/after
+value:
 
 ```bash
-kubectl get configmap -n personalization-blue | grep -i personalization
-kubectl get configmap <the leader configmap> -n personalization-blue \
-  -o jsonpath='{.metadata.annotations}'
+kubectl get configmap personalization-cluster-config-map -n personalization-blue \
+  -o jsonpath='{.metadata.annotations.control-plane\.alpha\.kubernetes\.io/leader}'
 ```
 
-The holder identity is in the lease annotation. Match it to a pod name and write
-that name down. Without this step you cannot tell afterwards whether leadership
-actually moved.
+Write down `holderIdentity` and `leaderTransitions`. `leaseDuration: PT15S` is
+why the standby cannot act for up to 15 seconds after the kill.
 
-- [ ] **Step 2: Snapshot before.**
+Then find the leader pod. The leader is the only JobManager running the
+`CheckpointCoordinator`:
+
+```bash
+for p in $(kubectl get pods -n personalization-blue -l component=jobmanager -o name); do
+  echo -n "$p  completed-checkpoint lines: "
+  kubectl logs -n personalization-blue "$p" --tail=-1 2>/dev/null | grep -c "Completed checkpoint"
+done
+```
+
+In k9s: `:po`, highlight a JobManager, `l` for logs, `/` and filter on
+`Completed checkpoint`. Use that phrase rather than `was granted leadership`,
+which is written once at election time and is usually outside any tail.
+
+**Also record the job id** with `curl -s http://localhost:30011/jobs`. A changed
+job id after the kill is this Drill's failure mode, and without the before value
+there is nothing to compare.
+
+- [x] **Step 2: Snapshot before.**
 
 ```bash
 ./scripts/recommendation-snapshot.sh snapshot /tmp/drill-b-before.txt
 ```
 
-- [ ] **Step 3: Kill the leader specifically.**
+- [x] **Step 3: Kill the leader specifically.**
 
 ```bash
 kubectl delete pod <the leader pod> -n personalization-blue
@@ -1362,18 +1436,31 @@ kubectl delete pod <the leader pod> -n personalization-blue
 Killing the standby instead tests nothing, and it is an easy mistake because
 both pods look identical in `kubectl get pods`.
 
-- [ ] **Step 4: Watch leadership move.**
+- [x] **Step 4: Watch leadership move.**
 
 Re-read the lease annotation. Expected: a **different** holder identity, matching
 the pod that was previously the standby.
 
-- [ ] **Step 5: Confirm the job resumed rather than restarted from empty.**
+- [x] **Step 5: Confirm the job resumed rather than restarted from empty.**
 
-In the new leader's log, look for the recovery line naming the HA storage
-directory. Expected: it reads the pointer from `s3://checkpoints/phase-5-ha` and
-restores from a checkpoint under `phase-5`.
+**The job id must be unchanged.** That is the primary evidence, and it is what
+the pod listing cannot tell you.
 
-- [ ] **Step 6: Confirm a replacement standby appeared.**
+```bash
+JID=$(curl -s http://localhost:30011/jobs \
+      | python3 -c "import sys,json;print(json.load(sys.stdin)['jobs'][0]['id'])")
+echo "$JID"
+curl -s "http://localhost:30011/jobs/$JID/checkpoints" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['latest']['restored'])"
+```
+
+In the new leader's log, the signature line is
+`Job <jobid> was recovered successfully`, which Drill A never produces because
+Drill A never lost the coordinator. The
+`KubernetesCheckpointRecoveryFactory.createRecoveredCompletedCheckpointStore`
+frame is the HA store being rebuilt from `phase-5-ha`.
+
+- [x] **Step 6: Confirm a replacement standby appeared.**
 
 ```bash
 kubectl get pods -n personalization-blue -l component=jobmanager \
@@ -1384,7 +1471,7 @@ Expected: two JobManagers again, on two different workers. If both land on the
 same worker, the `DoNotSchedule` constraint from Task 5 Step 4 is not matching,
 and Drill C will then not test what it claims to.
 
-- [ ] **Step 7: Snapshot after, compare, write the runbook.**
+- [x] **Step 7: Snapshot after, compare, write the runbook.**
 
 Same commands and same standard as Drill A. Zero gaps, zero duplicates, and a
 runbook carrying the real transcript, including both lease holder identities.
@@ -1413,10 +1500,25 @@ decisions but is not a real failure domain, since every node is a container on
 one host. This Drill therefore tests the scheduler and the disruption budget
 honestly, and does not claim to test datacentre resilience.
 
-**What each spread constraint should do here.** The drained Zone's JobManager
-has nowhere to go, because `DoNotSchedule` with `maxSkew: 1` across the two
-remaining Zones is already satisfied by the surviving JobManager. Expect it to
-sit **Pending**, and expect that to be correct rather than a fault. The drained
+**Corrected 2026-09-07. The JobManager does NOT go Pending, and
+`personalization-pdb` cannot refuse.** This paragraph originally predicted both.
+The arithmetic says otherwise:
+
+```
+PDB minAvailable 1, 2 JobManagers Ready   ->  ALLOWED DISRUPTIONS = 2 - 1 = 1
+evict one  ->  1 remains  ->  1 >= 1  ->  ALLOWED
+
+JM counts after eviction   zone-a: 0  zone-b: 0  zone-c: 1
+place in zone-a            zone-a: 1  zone-b: 0  zone-c: 1   skew 1, allowed
+```
+
+**Two replicas across three Zones always leaves a spare Zone**, so `maxSkew: 1`
+stays satisfiable and the replacement schedules. `minAvailable: 1` keeps slack,
+so the budget permits the eviction. To see this PDB refuse, both other Zones
+would have to be cordoned first.
+
+**The refusal came from Strimzi's PDB instead**, and produced a better finding.
+See the runbook. The drained
 Zone's TaskManager has `ScheduleAnyway`, so it lands on a remaining worker even
 though that worker then carries two.
 
@@ -1424,7 +1526,7 @@ though that worker then carries two.
 stays unschedulable, Phase 6's autoscaling then behaves strangely, and the cause
 is three days behind you.
 
-- [ ] **Step 1: Snapshot before, and record the current placement.**
+- [x] **Step 1: Snapshot before, and record the current placement.**
 
 ```bash
 ./scripts/recommendation-snapshot.sh snapshot /tmp/drill-c-before.txt
@@ -1435,7 +1537,7 @@ kubectl get pods -n personalization-blue -o custom-columns=\
 Choose the worker that currently carries **both** a JobManager and a TaskManager.
 That is the drain with something to observe.
 
-- [ ] **Step 2: Cordon it first, as a separate step.**
+- [x] **Step 2: Cordon it first, as a separate step.**
 
 ```bash
 kubectl cordon personalization-lab-worker2
@@ -1444,7 +1546,7 @@ kubectl cordon personalization-lab-worker2
 Cordon marks it unschedulable but evicts nothing. Doing it separately makes the
 next step's output attributable to eviction alone.
 
-- [ ] **Step 3: Drain it, and watch the PDB refuse.**
+- [x] **Step 3: Drain it, and watch the PDB refuse.**
 
 ```bash
 kubectl drain personalization-lab-worker2 \
@@ -1456,7 +1558,7 @@ disruption budget`, repeated while it retries. **This message is the Drill
 succeeding, not failing.** Capture it verbatim. It is the single most important
 line in this runbook.
 
-- [ ] **Step 4: Confirm the end state.**
+- [x] **Step 4: Confirm the end state.**
 
 ```bash
 kubectl get pods -n personalization-blue -o wide
@@ -1467,7 +1569,7 @@ Expected: the JobManager from the drained Zone is **Pending**, and
 TaskManager has moved to a remaining worker. The job is RUNNING throughout, or
 returns to RUNNING after a restart from checkpoint.
 
-- [ ] **Step 5: Uncordon and confirm the Pending pod schedules.**
+- [x] **Step 5: Uncordon and confirm the Pending pod schedules.**
 
 ```bash
 kubectl uncordon personalization-lab-worker2
@@ -1477,161 +1579,14 @@ kubectl get pods -n personalization-blue -o wide -w
 Expected: the Pending JobManager schedules onto the restored worker, and the
 spread returns to one JobManager per Zone.
 
-- [ ] **Step 6: Snapshot after, compare, write the runbook.**
+- [x] **Step 6: Snapshot after, compare, write the runbook.**
 
 Zero gaps, zero duplicates. The runbook must include the eviction refusal message
 from Step 3 and the scheduling reason from Step 4, both verbatim.
 
 ---
 
-## Task 10: Drill D: ArgoCD Lua actions and drift
-
-**Files:**
-- Create: `manifests/argocd/flink-actions-values.yaml`
-- Modify: `scripts/bootstrap-phase0.sh`, the `install_argocd` function
-- Create: `docs/runbooks/phase-5-drill-d-argocd-drift.md`
-
-**Interfaces consumed:** Task 5's running job.
-
-**The concept.** GitOps means Git is the declared truth and a controller
-continuously drives the cluster toward it. That is easy to say and hard to
-*observe*, because a controller doing its job leaves nothing to look at.
-
-This Drill makes it observable by breaking it on purpose. You change the live
-resource so it no longer matches Git, look at the divergence while it exists, and
-then let a sync erase it.
-
-**Why `selfHeal: false` is load-bearing.** [ADR 0004](../../adr/0004-gitops-from-phase-0.md)
-set it in Phase 0 specifically for this Drill, and every Application since has
-carried it. With `selfHeal: true`, ArgoCD reverts the patch within seconds,
-you never see the intermediate state, and the Drill silently proves nothing while
-appearing to pass.
-
-**Why a Lua action rather than `kubectl patch`.** Both would patch the field. The
-Lua action is the ArgoCD-native form, it is what the design spec's coverage map
-claims, and it makes the operation available from the UI where the drift is
-visible in the same place. Defining it also exercises `argocd-cm` resource
-customization, which is a real ArgoCD mechanism this lab otherwise never touches.
-
-**Why a values file rather than another `--set`.** `install_argocd` currently
-passes three `--set` flags. Lua is multi-line, so `--set` becomes unreadable
-escaping. A `-f manifests/argocd/flink-actions-values.yaml` keeps it legible and
-keeps the actions in a tracked file.
-
-**The failure mode to watch for.** The key under `configs.cm` is
-`resource.customizations.actions.<group>_<Kind>`. The separator between group and
-kind is an **underscore**, and the group contains dots. Get it wrong and nothing
-errors: the action simply never appears, because ArgoCD found no customization
-for that resource type.
-
-- [ ] **Step 1: Write the values file.**
-
-```yaml
-configs:
-  cm:
-    resource.customizations.actions.flink.apache.org_FlinkDeployment: |
-      discovery.lua: |
-        actions = {}
-        actions["suspend"] = {}
-        actions["resume"] = {}
-        actions["restart"] = {}
-        return actions
-      definitions:
-      - name: suspend
-        action.lua: |
-          obj.spec.job.state = "suspended"
-          return obj
-      - name: resume
-        action.lua: |
-          obj.spec.job.state = "running"
-          return obj
-```
-
-Write `restart` yourself. It sets `spec.restartNonce` to a new value, which is
-the field the operator watches for a forced restart. Read the CRD if you want to
-confirm the field name before writing it.
-
-- [ ] **Step 2: Add the values file to `install_argocd` and re-run it.**
-
-```bash
-./scripts/bootstrap-phase0.sh argocd
-```
-
-`helm upgrade --install` is already idempotent, which is why the function can be
-re-run rather than rewritten.
-
-- [ ] **Step 3: Confirm the actions are discoverable.**
-
-```bash
-kubectl get configmap argocd-cm -n argocd \
-  -o jsonpath='{.data.resource\.customizations\.actions\.flink\.apache\.org_FlinkDeployment}'
-```
-
-Expected: your Lua, verbatim. An empty result means the key is wrong, and Step 4
-would then show no actions with no error to explain it.
-
-- [ ] **Step 4: Record the pre-Drill state.**
-
-```bash
-kubectl get flinkdeployment personalization -n personalization-blue \
-  -o jsonpath='{.spec.job.state}'
-argocd app get flink-job-blue
-```
-
-Expected: `running`, and the Application `Synced`.
-
-- [ ] **Step 5: Run the `suspend` action.**
-
-From the ArgoCD UI on `localhost:30010`, on the `FlinkDeployment` resource, or:
-
-```bash
-argocd app actions run flink-job-blue suspend \
-  --kind FlinkDeployment --resource-name personalization
-```
-
-- [ ] **Step 6: Observe the drift. This is the step the phase is graded on.**
-
-```bash
-kubectl get flinkdeployment personalization -n personalization-blue \
-  -o jsonpath='{.spec.job.state}'; echo
-argocd app get flink-job-blue
-```
-
-Expected: the live value reads **`suspended`**, and the Application reads
-**`OutOfSync`**. Git still says `running`.
-
-Capture both outputs now. The phase's done criterion says this intermediate state
-must be *observed*, not inferred from the fact that it was later reverted. If you
-read this after the sync, you have no evidence and the Drill has to be re-run.
-
-- [ ] **Step 7: Confirm the operator acted on the patch.**
-
-```bash
-kubectl get pods -n personalization-blue
-```
-
-Expected: the job is suspending or suspended, with a savepoint taken because
-`upgradeMode: savepoint` is set. Look for the savepoint under
-`s3://checkpoints/phase-5-savepoints`. This is also a free rehearsal of the
-Phase 7 Promotion's first step.
-
-- [ ] **Step 8: Sync, and watch it revert.**
-
-```bash
-argocd app sync flink-job-blue
-```
-
-Expected: `spec.job.state` returns to `running`, the Application returns to
-`Synced`, and the job restarts from the savepoint it just took.
-
-- [ ] **Step 9: Write the runbook.**
-
-It must contain the Step 6 outputs verbatim. Everything else in this Drill can be
-re-derived. That one cannot.
-
----
-
-## Task 11: Documents
+## Task 10: Documents
 
 **Files:**
 - Create: `docs/knowledge/phase-5-operator-and-ha.md`
@@ -1644,7 +1599,7 @@ re-derived. That one cannot.
 is why Phase 5 could be designed without rediscovering the network buffer
 problem. Facts that only exist in a terminal you have closed are lost.
 
-- [ ] **Step 1: Write the knowledge doc.**
+- [x] **Step 1: Write the knowledge doc.**
 
 One doc per phase, matching the existing four. The things a reader cannot
 reconstruct from the manifests:
@@ -1661,7 +1616,7 @@ reconstruct from the manifests:
 - The difference between Drill A, B, and C in one table: what each destroys, what
   recovers it, and what the evidence looks like.
 
-- [ ] **Step 2: Amend ADR 0007.**
+- [x] **Step 2: Amend ADR 0007.**
 
 Its "Confirmed working" section records the plugin loading from a Gradle
 classpath under `MiniCluster`. Add a dated Phase 5 section recording the second
@@ -1675,14 +1630,14 @@ required files, so it would mean maintaining a second mechanism for the job jar.
 Otherwise someone will re-evaluate this, exactly as the `flink-s3-fs-native`
 detour that created the ADR.
 
-- [ ] **Step 3: Add the missing Operations terms to `CONTEXT.md`.**
+- [x] **Step 3: Add the missing Operations terms to `CONTEXT.md`.**
 
 The phase introduced vocabulary the glossary does not have. At minimum: what a
 Drill's "no gap" means here, given that a correct suppression removes about 10%
 of Recommendations. Follow the existing entry shape, including the `_Avoid_`
 line.
 
-- [ ] **Step 4: Update `status.md`.**
+- [x] **Step 4: Update `status.md`.**
 
 Phase 5 moves to done. Follow the level of detail the Phase 3 and Phase 4
 sections set: not "Task 5 done", but what was learned, what was verified rather
@@ -1700,7 +1655,7 @@ least these, which Phase 6 and Phase 7 both need:
 - The image tag must move on every code change. A stale tag with new code is the
   failure that looks like a Flink bug.
 
-- [ ] **Step 5: Add the four runbooks to `docs/knowledge/README.md`.**
+- [x] **Step 5: Add the runbooks to `docs/knowledge/README.md`.**
 
 Alongside the existing index entries, so the Drills are findable without knowing
 their filenames.

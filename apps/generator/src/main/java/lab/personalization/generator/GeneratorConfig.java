@@ -16,7 +16,9 @@ record GeneratorConfig(
         Duration clickMaxSkew,
         double productChangeEventsPerSecond,
         Duration productChangeMaxSkew,
-        Duration promoRuleInterval
+        Duration promoRuleInterval,
+        int shopperCount,
+        int productCount
 ) {
     static GeneratorConfig parse(String[] args) {
         String bootstrapServers = "localhost:30016";
@@ -25,6 +27,8 @@ record GeneratorConfig(
         double productChangeRate = 1.0;
         Duration productChangeSkew = Duration.ofSeconds(2);
         Duration promoRuleInterval = Duration.ofSeconds(30);
+        int shopperCount = 2000;
+        int productCount = 200;
 
         for (String arg : args) {
             String[] parts = arg.replaceFirst("^--", "").split("=", 2);
@@ -40,11 +44,14 @@ record GeneratorConfig(
                 case "product-change-rate" -> productChangeRate = Double.parseDouble(value);
                 case "product-change-max-skew-seconds" -> productChangeSkew = Duration.ofSeconds(Long.parseLong(value));
                 case "promo-rule-interval-seconds" -> promoRuleInterval = Duration.ofSeconds(Long.parseLong(value));
+                case "shopper-count" -> shopperCount = Integer.parseInt(value);
+                case "product-count" -> productCount = Integer.parseInt(value);
                 default -> throw new IllegalArgumentException("Unknown option: --" + key);
             }
         }
 
         return new GeneratorConfig(bootstrapServers, clickRate, clickSkew,
-                productChangeRate, productChangeSkew, promoRuleInterval);
+                productChangeRate, productChangeSkew, promoRuleInterval,
+                shopperCount, productCount);
     }
 }

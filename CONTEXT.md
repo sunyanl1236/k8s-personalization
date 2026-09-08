@@ -106,6 +106,35 @@ a control-plane node, killing a TaskManager, killing the OTel Collector, forcing
 a promotion timeout.
 _Avoid_: Test, chaos, experiment
 
+**No Gap**:
+The Drill success criterion for the `recommendation` topic. It means every
+Recommendation identity present before a Drill is still present after it, and
+none appears twice. It does **not** mean the topic holds one Recommendation per
+closed Browsing Session: out-of-stock suppression removes about 9.6% and
+`UNMATCHED` candidates remove roughly a further fifth, both by design. The check
+therefore compares the topic against itself across the Drill, never against the
+input.
+_Avoid_: No data loss, complete, lossless
+
+**Recommendation Identity**:
+The pair `(shopperId, generatedAt)`, which is what makes a Recommendation
+comparable across a restart. `generatedAt` is the Browsing Session's window end,
+an event-time value, so replaying the same input reproduces the same pair. Read
+directly off the Kafka record as the key and the record timestamp.
+_Avoid_: Recommendation id, key, primary key
+
+**Involuntary Disruption**:
+A pod ending in a way no policy can refuse: `kubectl delete pod`, a node crash,
+an OOMKill, preemption. A PodDisruptionBudget is not consulted. Drills A and B
+are this kind.
+_Avoid_: Hard kill, crash, forced eviction
+
+**Voluntary Disruption**:
+A pod ending through the eviction API, which consults every PodDisruptionBudget
+selecting it: `kubectl drain`, a node upgrade, a cluster autoscaler scale-down.
+Drill C is this kind, and is the only Drill where a budget can refuse.
+_Avoid_: Soft kill, graceful shutdown, planned outage
+
 **Load Ramp**:
 A scripted increase in generator throughput used to provoke backpressure,
 consumer lag, and unschedulable pods.

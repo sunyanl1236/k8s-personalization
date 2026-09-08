@@ -109,6 +109,81 @@ One separate requirement, unrelated to plugin choice, is recorded in the spec:
 `FileSystem.initialize(flinkConfig, null)` must be called, because the filesystem
 registry is a process-wide static that the job's `Configuration` does not reach.
 
+## Confirmed working in a container, 2026-09-07
+
+Phase 5 recorded the second half of the story. Under `MiniCluster` the plugin
+registers from a plain Gradle `runtimeOnly` classpath entry. **In the image it
+does not, and cannot.**
+
+`apps/pipeline/Dockerfile` moves the jar out of `opt/`:
+
+```dockerfile
+RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop \
+ && cp /opt/flink/opt/flink-s3-fs-hadoop-2.2.0.jar /opt/flink/plugins/s3-fs-hadoop/
+```
+
+Three facts settled by this, all verified against `flink:2.2.0`:
+
+**`opt/` is on no list.** `bin/config.sh` builds the classpath from
+`$FLINK_LIB_DIR` alone:
+
+```bash
+done < <(find "$FLINK_LIB_DIR" ! -type d -name '*.jar' -print0 | sort -z)
+```
+
+The plugin manager separately scans `/opt/flink/plugins`. Nothing scans
+`/opt/flink/opt`. It is a shipping crate, so a jar left there produces no error
+and no effect.
+
+**The folder name is arbitrary**, because the plugin manager takes each
+subdirectory name as that plugin's id. The JobManager log confirms it:
+`Plugin loader with ID not found, creating it: s3-fs-hadoop`. What is not
+optional is the subdirectory itself. Each one gets its own classloader, and that
+isolation is required here because the shaded `flink-s3-fs-hadoop` jar carries
+`com.amazonaws.*` classes that are **not** relocated.
+
+**A `null` PluginManager throws the plugin away.** The note below about
+`FileSystem.initialize(flinkConfig, null)` was correct under `MiniCluster` and
+wrong in a container. With the jar reachable only through `plugins/`, passing
+`null` rebuilds the filesystem registry loading no plugins, discarding the s3
+filesystem the entrypoint had already registered. The JobMaster then dies with:
+
+```
+UnsupportedFileSystemSchemeException: Could not find a file system
+implementation for scheme 's3'
+```
+
+Fixed on 2026-09-07 by passing a real one:
+
+```java
+FileSystem.initialize(flinkConfig, PluginUtils.createPluginManagerFromRootFolder(flinkConfig));
+```
+
+Harmless locally, where there is no `plugins/` directory and the `runtimeOnly`
+classpath copy is used exactly as before.
+
+## `ENABLE_BUILT_IN_PLUGINS` was verified to work, and rejected anyway
+
+The 2.2.0 entrypoint supports it:
+
+```bash
+# /docker-entrypoint.sh
+35:  if [ -z "$ENABLE_BUILT_IN_PLUGINS" ]; then
+40:  for target_plugin in $(echo "$ENABLE_BUILT_IN_PLUGINS" | tr ';' ' '); do
+```
+
+It moves a named jar out of `opt/` into `plugins/` at container start, so it
+would replace the `RUN mkdir && cp` above.
+
+**Rejected because it handles one of the two files this image needs.** The job jar
+must be `COPY`ed in regardless. Using the environment variable would mean two
+different mechanisms for two files that arrive together, in exchange for removing
+two lines. One `RUN` and one `COPY` side by side in one file is easier to read
+than a Dockerfile plus an environment variable set somewhere else.
+
+Recorded explicitly so this is not re-evaluated, exactly as the
+`flink-s3-fs-native` detour that produced this ADR.
+
 ## Consequences
 
 The word "hadoop" appears in the build file and means nothing operationally. No

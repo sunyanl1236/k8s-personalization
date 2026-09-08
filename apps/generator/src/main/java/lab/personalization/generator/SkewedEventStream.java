@@ -41,9 +41,13 @@ public class SkewedEventStream<T> {
     }
 
     public void start(double eventsPerSecond) {
-        long periodMillis = Math.max(1, Math.round(1000.0 / eventsPerSecond));
-        // firing tick() on that fixed schedule for as long as the program runs
-        ticker.scheduleAtFixedRate(this::tick, 0, periodMillis, TimeUnit.MILLISECONDS);
+        long periodMillis = 10;
+        int perTick = (int) Math.max(1, Math.round(eventsPerSecond * periodMillis / 1000.0));
+        ticker.scheduleAtFixedRate(() -> {
+            for (int i = 0; i < perTick; i++) {
+                tick();
+            }
+        }, 0, periodMillis, TimeUnit.MILLISECONDS);
     }
 
     private void tick() {

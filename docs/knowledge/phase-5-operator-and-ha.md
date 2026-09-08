@@ -2766,6 +2766,43 @@ prohibits switching to stateless mode to avoid state loss". That sentence is
 about the operator never *choosing* stateless on its own for an unhealthy job.
 Written explicitly, it is obeyed.
 
+### Three events, and only one reaches the operator
+
+`upgradeMode` is a field on the `FlinkDeployment`, so it is easy to read it as
+governing every way the job can go down. It does not. It governs one of the
+three, and the other two never involve the operator at all.
+
+| Event | Who reacts | Restores from | `upgradeMode` involved? |
+|---|---|---|---|
+| TaskManager dies | Flink's restart strategy, inside the running job | last **checkpoint** | No |
+| Leader JobManager dies | Kubernetes HA, standby takes leadership | HA metadata + last **checkpoint** | No |
+| You edit the spec | the **operator**, via reconciliation | per `upgradeMode` | **Yes, only here** |
+
+Failure recovery is Flink's own job, and the operator never sees it. That is
+exactly what Drills A and B (Tasks 7 and 8) are built to observe.
+
+The operator reads the field in one place, `AbstractJobReconciler.getJobUpgrade()`,
+and the reconcile loop reaches that method only when the spec has changed:
+
+```java
+boolean specChanged =
+        DiffType.IGNORE != diffType || reconciliationState == ReconciliationState.UPGRADING;
+```
+
+Two consequences follow, and both matter later.
+
+**A spec edit on a running job is the trigger, not a failure.** Changing
+`spec.flinkConfiguration` or `spec.job.args` is enough. With `upgradeMode:
+savepoint` the operator then cancels with a savepoint and restores from it. Any
+edit that changes the job graph or the key group count makes that restore fail,
+and the error names state mapping, which reads like a Flink fault rather than a
+decision someone made.
+
+**Changing `upgradeMode` on its own triggers nothing.** The field is annotated as
+an `IGNORE`-level diff, so on its own `diffType` is `IGNORE`, `specChanged` is
+`false`, and no reconciliation runs. It takes effect only when it travels with a
+change that is not ignored.
+
 ### Three prefixes, three recovery paths
 
 | Event | Restores from | Prefix |
@@ -3320,3 +3357,410 @@ would open `http://localhost:8080`.
 2. **Its traffic goes through the API server.** That is the control plane, not a
    data path. Fine for a browser session. Wrong for the pipeline's checkpoint
    writes, which is why `minio-s3-api` is a NodePort on 30014 instead.
+
+## HA metadata is two objects, and only one of them is in Kubernetes
+
+### The problem it guards against
+
+Drill B kills the leader JobManager. The standby has to take over and resume the
+job. It can only do that if the JobGraph and the checkpoint pointers survived
+somewhere outside both JobManager processes.
+
+If that storage is empty, the standby has nothing to recover from. Drill B would
+still "pass" visually, because a fresh JobManager starting an empty job also ends
+up `RUNNING`. **You would prove nothing.**
+
+That is why Task 5 Step 12 checks the `phase-5-ha` prefix **separately** from
+`phase-5`, rather than treating one healthy-looking bucket as evidence for both.
+
+### Why the metadata is not in Kubernetes
+
+A ConfigMap is small. A JobGraph is not. The Flink 2.2.0 Kubernetes HA
+documentation states the split directly:
+
+> JobManager metadata is persisted in the file system
+> `high-availability.storageDir` and **only a pointer to this state is stored in
+> Kubernetes**.
+
+So HA is two objects working together.
+
+| | Holds | Where |
+|---|---|---|
+| `personalization-cluster-config-map` | the leader lease, and a pointer | Kubernetes |
+| `s3://checkpoints/phase-5-ha/` | the JobGraph and checkpoint metadata | MinIO |
+
+Both must be non-empty. **A present ConfigMap with an empty S3 prefix is the
+exact failure this step catches.**
+
+### The two checks
+
+**1. The ConfigMap side.**
+
+```bash
+kubectl get cm -n personalization-blue
+```
+
+Look for `personalization-cluster-config-map`. It also appears in the JobManager
+log, in the `KubernetesLeaderElector` lines at startup.
+
+**2. The S3 side, which is the one that matters.** Follow the README recipe:
+
+```bash
+kubectl port-forward svc/personalization-console -n minio-tenant 9090:9090
+```
+
+Then open `http://localhost:9090`, log in with the `storage-configuration`
+credentials, open the `checkpoints` bucket, and browse to `phase-5-ha/`.
+
+Expect a subdirectory named after the cluster-id, so
+`phase-5-ha/personalization/`. Flink stores HA artifacts under
+`HA_STORAGE_DIR/HA_CLUSTER_ID`, a layout that has been in place since 1.10.
+
+### What a pass looks like
+
+`phase-5-ha/personalization/` contains at least one blob. Not a `chk-N`
+directory. Those live under `phase-5/`. If the prefix does not exist at all,
+`high-availability.type: kubernetes` did not take effect and Drill B is not yet
+meaningful.
+
+**Verified on 2026-09-07.** Both sides carry data.
+
+## Cordon, drain, and why the Drill separates them
+
+### Cordon means "no new arrivals"
+
+```bash
+kubectl cordon personalization-lab-worker2
+```
+
+That sets `spec.unschedulable: true` on the node and adds the taint
+`node.kubernetes.io/unschedulable:NoSchedule`. The scheduler stops placing new
+pods there. **Every pod already running stays running.** Nothing moves.
+
+`kubectl get nodes` then shows:
+
+```
+personalization-lab-worker2   Ready,SchedulingDisabled
+```
+
+`uncordon` reverses it.
+
+### Drain is cordon plus eviction
+
+```
+cordon   no new arrivals
+drain    no new arrivals  +  everyone currently here leaves
+```
+
+`drain` performs the cordon itself, then evicts every pod. So `drain` includes
+`cordon`, and running `drain` alone leaves the node cordoned afterwards whether
+it finished or not.
+
+### Why Drill C makes you cordon as a separate step
+
+There are two separate claims to test:
+
+1. **Cordon moves nothing.** It only stops future placements.
+2. **Eviction is what moves pods.**
+
+Run `drain` alone and both happen in one burst of output. Pods move, but nothing
+in what you observed says which half of the command moved them.
+
+Run them separately and each claim gets its own verification:
+
+```bash
+kubectl cordon personalization-lab-worker2
+kubectl get nodes                                    # SchedulingDisabled
+kubectl get pods -n personalization-blue -o wide     # IDENTICAL. Claim 1 proven.
+
+kubectl drain personalization-lab-worker2 --ignore-daemonsets --delete-emptydir-data
+kubectl get pods -n personalization-blue -o wide     # now they have moved. Claim 2 proven.
+```
+
+Every movement in the second half is attributable to the eviction, because the
+first half already showed the cordon moving nothing.
+
+This is the plan's own standard applied to a two-part command:
+
+> A task is done when its verification command produces real output you have read.
+
+### The practical reason, which matters more in a hurry
+
+If a drain hangs on a PodDisruptionBudget refusal and you interrupt it, **the
+node stays cordoned**. Having typed the cordon yourself makes the cleanup
+obligation obvious: there is an `uncordon` owed.
+
+Run `drain` alone, interrupt it, and the cordon is a side effect you never typed.
+That is how a node ends up `SchedulingDisabled` for three days, with Phase 6's
+autoscaling behaving strangely and the cause well behind you.
+
+Check before walking away:
+
+```bash
+kubectl get nodes        # no SchedulingDisabled
+```
+
+## What the TaskManagers do during a JobManager failover
+
+**The pods survive. The work stops.** Those are two different things, and Drill B
+showed both.
+
+### The pods survive
+
+Observed after the 19:05 leader kill on 2026-09-07:
+
+```
+NAME                              RESTARTS   START
+personalization-taskmanager-2-7   0          2026-09-07T18:46:25Z
+personalization-taskmanager-2-8   0          2026-09-07T18:52:09Z
+personalization-taskmanager-2-9   0          2026-09-07T18:52:09Z
+```
+
+All three predate the kill and all have **0 restarts**. No TaskManager was
+killed, restarted, or rescheduled.
+
+The new leader re-adopted them rather than requesting new ones:
+
+```
+19:05:12,935  ActiveResourceManager - Recovered worker personalization-taskmanager-2-8 ... registered
+19:05:12,935  ActiveResourceManager - Recovered worker personalization-taskmanager-2-9 ... registered
+```
+
+### The work stops
+
+Inside those same surviving pods, every task was cancelled 5 seconds after the
+kill:
+
+```
+19:05:05,930  Attempting to cancel task Source: click-stream (2/6)#3
+19:05:05,931  Source: click-stream (2/6)#3 switched from RUNNING to CANCELING.
+19:05:05,933  Source: click-stream (2/6)#3 switched from CANCELING to CANCELED.
+19:05:05,935  Attempting to cancel task Source: click-stream (6/6)#3
+...
+```
+
+### Why the tasks cannot simply continue
+
+A TaskManager is a worker, not a decision maker. The JobMaster inside the
+JobManager is what:
+
+- injects checkpoint barriers into the sources
+- coordinates watermarks across subtasks
+- decides which subtask sends to which
+
+With no JobMaster, no checkpoint can complete. A pipeline that keeps consuming
+Kafka while unable to checkpoint is building state it can never recover from, so
+continuing would be worse than stopping.
+
+### The sequence
+
+```
+19:05:05   leader killed
+19:05:05   TaskManager POD alive, its tasks CANCELED        <- processing stops
+19:05:12   standby acquires the lease (leaseDuration PT15S)
+19:05:12   new leader re-adopts the same TaskManager pods
+19:05:15   tasks redeployed from chk-920                    <- processing resumes
+```
+
+About **15 seconds of no processing, and zero TaskManager restarts.**
+
+### Then what did HA actually buy?
+
+The job restarts either way, so the value is not "no restart".
+
+**Without HA the job would be gone.** No JobGraph, no record of the last
+completed checkpoint, nothing to resume from. Someone would have to resubmit by
+hand and pick a checkpoint path themselves.
+
+With HA, a standby that was already running acquired the lease, read the pointer
+from `s3://checkpoints/phase-5-ha`, and resumed the **same job id** in 15 seconds
+with no human involved. That is the difference, and it is why Task 5 Step 12
+checks the `phase-5-ha` prefix separately from `phase-5`.
+
+### The contrast with Drill A, in one table
+
+| | Drill A, TaskManager killed | Drill B, leader JobManager killed |
+|---|---|---|
+| TaskManager pods | rebuilt, new pods scheduled | **survive, 0 restarts, re-adopted** |
+| Tasks | cancelled and redeployed | cancelled and redeployed |
+| Job id | unchanged | unchanged |
+| Restored from | a checkpoint under `phase-5` | a checkpoint under `phase-5`, located via `phase-5-ha` |
+| Signature log line | `Restoring job ... from Checkpoint N` | `Job ... was recovered successfully` |
+| Recovery | 15 seconds | 15 seconds |
+
+Both restore from a checkpoint. Only Drill B goes through the HA store to find
+out **which** checkpoint.
+
+## Why `opt/` does not work, and why the folder name under `plugins/` is arbitrary
+
+### `opt/` is on no list
+
+The usual explanation is "Flink does not load from `opt/`", stated as a rule. It
+is not a rule. It is an absence.
+
+`bin/config.sh` builds the classpath from exactly one directory:
+
+```bash
+constructFlinkClassPath() {
+    ...
+    done < <(find "$FLINK_LIB_DIR" ! -type d -name '*.jar' -print0 | sort -z)
+```
+
+`$FLINK_LIB_DIR` is `/opt/flink/lib`. That `find` never looks anywhere else.
+
+Separately, the plugin manager scans `/opt/flink/plugins`, one subdirectory per
+plugin.
+
+```
+/opt/flink/lib/         scanned by constructFlinkClassPath
+/opt/flink/plugins/*/   scanned by the plugin manager
+/opt/flink/opt/         scanned by NOTHING
+```
+
+`opt/` is a shipping crate. The distribution puts optional jars there so they
+exist in the image without being active. Nothing loads from it, so a jar left
+there produces no error and no effect. That is why
+[ADR 0001](../adr/0001-plugin-directory-move.md) moves the file rather than
+configuring a path.
+
+### The folder name is arbitrary because it becomes the plugin id
+
+`apps/pipeline/Dockerfile` writes to `/opt/flink/plugins/s3-fs-hadoop/`. The name
+`s3-fs-hadoop` is not matched against anything. The plugin manager takes each
+subdirectory name as that plugin's **id**, which is why the JobManager log reads:
+
+```
+Plugin loader with ID not found, creating it: s3-fs-hadoop
+```
+
+Any directory name would work. What is **not** optional is that the jar sits in a
+subdirectory of its own rather than directly in `plugins/`. Each subdirectory
+gets its own classloader, and that isolation is the entire point here: the
+`flink-s3-fs-hadoop` shaded jar carries `com.amazonaws.*` classes that are **not**
+relocated. Loading them on a shared classpath is how they collide with anything
+else pulling the AWS SDK.
+
+### `ENABLE_BUILT_IN_PLUGINS` exists and was rejected anyway
+
+The 2.2.0 entrypoint does support it:
+
+```bash
+# /docker-entrypoint.sh
+35:  if [ -z "$ENABLE_BUILT_IN_PLUGINS" ]; then
+40:  for target_plugin in $(echo "$ENABLE_BUILT_IN_PLUGINS" | tr ';' ' '); do
+```
+
+It moves a named jar out of `opt/` into `plugins/` at container start. So it
+would replace the Dockerfile's `RUN mkdir && cp` for the S3 filesystem.
+
+It was still rejected, and the reason is worth recording so nobody re-evaluates
+it: **it handles one of the two files this image needs.** The job jar has to be
+`COPY`ed in regardless. Using the environment variable would mean maintaining two
+different mechanisms for two files that arrive at the same time, in exchange for
+removing two lines. One `RUN` and one `COPY`, side by side in the same file, is
+easier to read than a Dockerfile plus an environment variable set somewhere else.
+
+## The Shadow jar allowlist, and why an exclusion list fails silently
+
+### The problem
+
+A fat jar for a Flink job must contain your code and the few dependencies the
+runtime does not already ship. It must **not** contain Flink itself. `flink-dist`
+is already in `/opt/flink/lib`, and shipping a second copy inside the job jar
+gives two versions of every Flink class, resolved by classloader order rather
+than by intent.
+
+There are two ways to arrange that.
+
+### Exclusion list: name what to leave out
+
+```
+everything on the compile classpath, MINUS the things I listed
+```
+
+Add a dependency later and it is bundled by default. Nobody is told. The jar
+grows, a duplicate class ships, and the symptom arrives weeks later as a
+`NoSuchMethodError` or a subtly wrong classloader resolution.
+
+**The failure is silent and delayed**, and the thing that caused it, adding a
+dependency, looked completely routine.
+
+### Allowlist: name what to put in
+
+`apps/pipeline/build.gradle` declares its own configuration and Shadow reads only
+that:
+
+```groovy
+    dependencyScope('bundled')
+    resolvable('bundledClasspath') { extendsFrom configurations.bundled }
+    implementation.extendsFrom configurations.bundled
+    ...
+    configurations = [project.configurations.bundledClasspath]
+```
+
+Exactly two entries go in it:
+
+```groovy
+    bundled project(':domain')
+    bundled "org.apache.flink:flink-connector-kafka:${kafkaConnectorVersion}"
+```
+
+Everything else is `compileOnly` plus `runtimeOnly`, which compiles against a
+library without shipping it.
+
+Add a dependency later and it is **not** bundled. The build succeeds, and the job
+fails at class load with a `NoClassDefFoundError` naming the exact missing class.
+
+**The failure is loud and immediate**, and it names its own fix.
+
+### The trade, stated plainly
+
+Both lists require maintenance. The difference is what happens when you forget.
+
+| | Forgetting costs you |
+|---|---|
+| exclusion list | a silent duplicate, surfacing later as a runtime error that does not mention jars |
+| **allowlist** | a `NoClassDefFoundError` on the next deploy, naming the class |
+
+The 24 mb jar size is the visible result. A jar bundling Flink would be several
+times that.
+
+## Drill A, B, and C side by side
+
+Three Drills, three different things destroyed, three different recovery paths.
+All three observed on 2026-09-07.
+
+| | **A: TaskManager killed** | **B: leader JobManager killed** | **C: Zone drained** |
+|---|---|---|---|
+| Command | `kubectl delete pod` | `kubectl delete pod` | `kubectl drain` |
+| Disruption kind | involuntary | involuntary | **voluntary** |
+| PDB consulted | no | no | **yes** |
+| What is destroyed | a slice of RocksDB state | the coordinator | nothing, pods are moved |
+| Job status | RUNNING to CREATED to RUNNING | RUNNING to CREATED to RUNNING | **stays RUNNING** |
+| Restores from | a checkpoint under `phase-5` | a checkpoint, located via `phase-5-ha` | nothing, no restart |
+| TaskManager pods | rebuilt, new pods | **survive, 0 restarts, re-adopted** | one moved |
+| JobManager pods | untouched | one replaced, leadership moves | one moved |
+| Primary evidence | `latest.restored.id` | **job id unchanged** plus `leaderTransitions` +1 | the eviction refusal, and placement |
+| Signature log line | `Restoring job ... from Checkpoint N` | `Job ... was recovered successfully` | `Cannot evict pod ...` |
+| Recovery time | 15s, twice | 15s | no job interruption |
+| Gap / duplicates | 0 / 0 | 0 / 0 | 0 / 0 |
+
+### Reading the table
+
+**Only Drill C consults a PodDisruptionBudget.** A PDB constrains the eviction
+API. `kubectl delete pod` does not use it, so Drills A and B could not have been
+refused by any budget.
+
+**Only Drill B goes through the HA store.** Both A and B restore from a
+checkpoint under `phase-5`. The difference is how the checkpoint is **found**: A
+still has a JobMaster that knows, B has to read the pointer out of `phase-5-ha`.
+That is why Task 5 Step 12 checks the two prefixes separately.
+
+**Only Drill C left the job running.** One of six slots moved, and Flink
+redeployed that subtask without failing the job. A and B both lost something the
+job could not continue without.
+
+**The gap check was 0 in all three, and proves the least.** Committed Kafka
+records do not disappear, so `comm -23 BEFORE AFTER` is structurally near-empty
+whatever happens. The duplicate check and each Drill's own specific evidence are
+what carry the result.
