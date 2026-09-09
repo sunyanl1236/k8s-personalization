@@ -61,8 +61,8 @@ When this plan was written the job was running at parallelism 6 on image
 | 2 | Generator: key cardinality | ✅ done, 2026-09-08 |
 | 3 | The `FlinkDeployment` config changes, and the clean start | ✅ done, 2026-09-08 |
 | 4 | Drill E: dry run under a Load Ramp | ✅ done, 2026-09-08 |
-| 5 | Drill F: enable scaling, and the overrides gate | 🟡 scaling gates passed, gap check outstanding |
-| 6 | Drill G: scale down | not started |
+| 5 | Drill F: enable scaling, and the overrides gate | ✅ done, 2026-09-08 |
+| 6 | Drill G: scale down | ✅ done, 2026-09-08 |
 | 7 | Karpenter: install, NodePool, Decoy Workload | not started |
 | 8 | Drill H: provision and consolidate | not started |
 | 9 | Documents | not started |
@@ -74,9 +74,9 @@ Task 7 depends on nothing and can be done at any point; Task 8 needs 7.
 **Per-task measurements and the traps they exposed live in
 [status.md](status.md), not here.** This table carries position only.
 
-**Next: Task 6, Drill G,** with Task 5 Step 7's gap check folded into it. Tasks
-3, 4 and 5 all ran on 2026-09-08. Drill E and Drill F both have runbooks with
-real transcripts. `upgradeMode` is back to `savepoint`. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
+**Next: Task 7, Karpenter.** Tasks 3 to 6 all ran on 2026-09-08 and Drills E, F
+and G each have a runbook with a real transcript. Task 5's outstanding gap check
+was folded into Drill G and passed there. Task 7 depends on nothing above it. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
 restores `savepoint`; any other spec edit in that window discards state
 silently.
 
@@ -122,9 +122,14 @@ manifests/flink/blue/
 manifests/karpenter/                  Task 7, new directory
   nodepool.yaml                       NodePool + KWOKNodeClass
   decoy.yaml                          the Decoy Workload Deployment
+  Dockerfile.controller               builds the controller image upstream does not
+                                       publish; context is the gitignored
+                                       charts/karpenter, so it lives here and is
+                                       passed with -f
 
 scripts/
-  bootstrap-karpenter.sh              Task 7, new. Beside bootstrap-phase0.sh
+  bootstrap.sh                        Task 7 adds its `karpenter` stage; the four
+                                       bootstrap-* scripts merged into this on 2026-09-09
 
 docs/runbooks/
   phase-6-drill-e-dry-run.md          Task 4
@@ -140,7 +145,18 @@ docs/superpowers/plans/status.md                    Task 9
 ```
 
 Unchanged, and worth stating: `manifests/argocd-apps/flink-job-blue.yaml` is
-touched **only** if Task 5's gate comes back populated.
+touched **only** if Task 5's gate comes back populated. Task 5's gate came back
+**empty**, so it was not touched.
+
+**Added on 2026-09-09, beyond the plan:**
+`manifests/argocd-apps/karpenter-resources.yaml`, an Application for
+`manifests/karpenter/`. The controller cannot go into ArgoCD, because no image
+is published for the kwok provider and ArgoCD does not build images, but the
+NodePool, KWOKNodeClass and Decoy are hand-written YAML with no build step and
+belong under ADR 0004's pattern like every other custom resource in this repo.
+It carries `ignoreDifferences` on the Decoy's `spec.replicas` plus
+`RespectIgnoreDifferences=true`, because Drill H scales the Decoy by hand
+against a file that says `replicas: 0`.
 
 ---
 
@@ -830,8 +846,22 @@ Two independent reasons:
 
 Lingering pods immediately after a scale-down are expected and are not a failure.
 
-- [ ] **Step 1: Read the two settings from the live configuration.** Do not assume
+- [x] **Step 1: Read the two settings from the live configuration.** Do not assume
   defaults.
+
+> **Corrected on 2026-09-08. This step cannot be run as written.**
+> `/jobmanager/config` returns only the keys that were explicitly set, 62 on this
+> cluster. A default that was never overridden is indistinguishable from a key
+> that does not exist, and `job.autoscaler.*` keys never reach the JobManager at
+> all. Take defaults from the operator's configuration reference and take the
+> packing behaviour from what the pods do.
+>
+> **Two settings this task never named, and they govern the whole Drill:**
+> `job.autoscaler.scale-down.interval` defaults to **1 hour**, so Step 3's
+> "3 minutes plus stabilization plus cooldown" is wrong by roughly an hour. And
+> `job.autoscaler.scale-down.max-factor` defaults to **0.6**, so a vertex cannot
+> drop below 60% of its parallelism in one decision. Shrinking happens in steps.
+> See [the Drill G runbook](../../runbooks/phase-6-drill-g-scale-down.md).
 
 ```bash
 curl -s localhost:30011/jobmanager/config | python3 -m json.tool \
@@ -841,16 +871,16 @@ curl -s localhost:30011/jobmanager/config | python3 -m json.tool \
 Write both values into the runbook before you start, so the expected result is
 derived rather than guessed.
 
-- [ ] **Step 2: Stop the Load Ramp.** Leave the job running and idle.
+- [x] **Step 2: Stop the Load Ramp.** Leave the job running and idle.
 
-- [ ] **Step 3: Wait out the window.** Same 3 minutes, plus stabilization, plus
+- [x] **Step 3: Wait out the window.** Same 3 minutes, plus stabilization, plus
   cooldown.
 
-- [ ] **Step 4: Confirm parallelism fell, from the rescale history**, not from pod
+- [x] **Step 4: Confirm parallelism fell, from the rescale history**, not from pod
   counts. Another `triggerCause: UPDATE_REQUIREMENT` record, with
   `postRescaleParallelism` **below** `preRescaleParallelism`.
 
-- [ ] **Step 5: Then watch the pods**, for at least the idle timeout you read in
+- [x] **Step 5: Then watch the pods**, for at least the idle timeout you read in
   Step 1.
 
 ```bash
@@ -860,9 +890,9 @@ kubectl -n personalization-blue get pods -w
 If pods do not fall to one, check whether the subtasks spread rather than packed.
 That is a legitimate outcome and the runbook should say which happened and why.
 
-- [ ] **Step 6: Gap check** with `recommendation-snapshot.sh`, as in Task 5.
+- [x] **Step 6: Gap check** with `recommendation-snapshot.sh`, as in Task 5.
 
-- [ ] **Step 7: Write the runbook.**
+- [x] **Step 7: Write the runbook.**
 
 **Done when** the runbook records the parallelism drop from the rescale history,
 the pod behaviour, and the packing decision that explains it.
@@ -874,7 +904,7 @@ the pod behaviour, and the packing decision that explains it.
 **Files:**
 - Create `manifests/karpenter/nodepool.yaml`
 - Create `manifests/karpenter/decoy.yaml`
-- Create `scripts/bootstrap-karpenter.sh`
+- Add a `karpenter` stage to `scripts/bootstrap.sh`
 
 **Goal.** A real Karpenter controller, fake nodes, and a workload that cannot be
 placed on the real ones.
@@ -899,18 +929,82 @@ cannot rescue it either: every node advertises 23.5 GiB that does not exist.
 
 - [ ] **Step 1: Install, outside ArgoCD, and record why.**
 
+> **Expanded on 2026-09-08, after probing upstream at `02caf5a` (2026-09-02).**
+>
+> **There is no published Helm chart and no published controller image.** The
+> chart files exist, inside the repo at `kwok/charts`, so Helm is pointed at a
+> directory on disk instead of a URL. `kwok/charts/values.yaml` ships
+> `controller.image.repository: ""`, an empty string, which is upstream telling
+> you to supply your own image.
+>
+> **Two things share the name.** *kwok* is the node simulator that makes a fake
+> `Node` behave like a node. *Karpenter with the kwok provider* is the autoscaler
+> that decides to create nodes, using kwok as its pretend cloud. Both are needed,
+> in that order.
+>
+> **The order, and why each step must precede the next:**
+>
+> ```
+> Decoy pod unschedulable
+>         │  needs
+>         ▼
+> Karpenter controller ──needs──> container image (nobody publishes one)
+>         │  needs                └─ needs the Go source
+>         ├──> CRDs (NodePool, NodeClaim, KWOKNodeClass)
+>         │  needs
+>         ▼
+> kwok running ── makes a fake Node actually behave like a node
+>         │  needs
+>         ▼
+> the source repo ── holds the chart, the kwok installer, and the code
+> ```
+>
+> 1. **Clone `kubernetes-sigs/karpenter`.** The chart, the kwok installer and the
+>    Go source all live here and nowhere else.
+> 2. **`./hack/install-kwok.sh`.** Pure `curl` and `kubectl apply`, pinned at kwok
+>    `v0.8.0`. Without kwok, Karpenter creates nodes that never go `Ready`, and
+>    the Decoy stays `Pending` looking exactly like Karpenter failing.
+> 3. **Build the controller image and `kind load` it.** Skip this and the
+>    Deployment sits in `ImagePullBackOff`.
+> 4. **`kubectl apply -f kwok/charts/crds`.** The controller watches custom
+>    resources, so the API server must know the types first. The chart is
+>    installed with `--skip-crds`, so if you do not apply them, nobody does.
+> 5. **`helm upgrade --install karpenter kwok/charts -n kube-system --skip-crds`.**
+>    The Deployment, ServiceAccount and RBAC. Needs 3 and 4.
+> 6. **Then Steps 2 and 3 below:** NodePool first, Decoy second.
+>
+> **The host has neither `go` nor `make`.** Build the image in Docker rather than
+> installing a Go toolchain, matching `scripts/build-image.sh`'s build-then-`kind
+> load` pattern. `go.mod` requires **Go 1.26.6**. Nothing then touches the
+> machine, and deleting the image undoes it.
+>
+> **Facts read out of the upstream Makefile, not guessed:**
+>
+> - **`KARPENTER_NAMESPACE=kube-system`** (`Makefile:3`). This step's "record the
+>   namespace" can be answered now.
+> - **kwok is pinned to `v0.8.0`** in `hack/install-kwok.sh`. Pin it in
+>   `bootstrap.sh` too, as its `phase0` stage pins cert-manager and ArgoCD.
+> - **`--skip-crds` is required**, with the CRDs applied separately.
+> - **Feature gates are required values**, interpolated unconditionally at
+>   `kwok/charts/templates/deployment.yaml:104`. Upstream `HELM_OPTS` sets
+>   `settings.featureGates.nodeRepair`, `capacityBuffer` and `staticCapacity`
+>   all `true`, plus `logLevel=debug`.
+> - **Upstream requests 1 CPU / 1Gi and limits 2 CPU / 2Gi for the controller.**
+>   Task 0 recorded host headroom at 2.5 GiB and Drill F showed this host
+>   saturating. Consider halving these and record why in the script.
+
 The kwok provider lives in `kubernetes-sigs/karpenter` under `kwok/` and installs
 with `make install-kwok` then `make apply`. That is a source build needing a Go
 toolchain, and there is no published Helm chart.
 
 Per spec 9.3 this goes **outside** the app-of-apps tree, with the precedent being
 cert-manager and ArgoCD itself in Phase 0. Capture the commands in
-`scripts/bootstrap-karpenter.sh` beside `scripts/bootstrap-phase0.sh`, so a
-cluster rebuild is reproducible.
+`scripts/bootstrap.sh` as its `karpenter` stage, so a cluster rebuild is
+reproducible.
 
-Two things `bootstrap-phase0.sh` already teaches, worth carrying over: make the
-script idempotent, and remember that piping it to `tail` reports the pipeline's
-exit code, not the script's.
+Two things `bootstrap.sh`'s `phase0` stage already teaches, worth carrying over:
+make the stage idempotent, and remember that piping the script to `tail` reports
+the pipeline's exit code, not the script's.
 
 **Record the namespace the controller lands in.** The kwok provider's `make apply`
 chooses it, and Task 8 needs the name:
@@ -1072,7 +1166,7 @@ kubectl -n personalization-blue get pods -o wide
 Every TaskManager still on a real worker. No Flink pod on a kwok node, at any
 point.
 
-- [ ] **Step 7: Write the runbook.**
+- [x] **Step 7: Write the runbook.**
 
 **Done when** nodes appeared under load, went away under consolidation, and the
 runbook says plainly what the Drill does and does not prove.

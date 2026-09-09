@@ -1,0 +1,31 @@
+# The Karpenter resources you wrote yourself: NodePool, KWOKNodeClass, Decoy.
+# Same shape as strimzi-kafka-cluster.yaml, plain YAML from this repo.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: karpenter-resources
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sunyanl1236/k8s-personalization.git
+    targetRevision: HEAD
+    path: manifests/karpenter
+    directory:
+      include: '*.yaml' # skip Dockerfile.controller, which is not a manifest
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: karpenter-decoy
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: decoy
+      namespace: karpenter-decoy
+      jsonPointers:
+        - /spec/replicas
+  syncPolicy:
+    syncOptions:
+      - RespectIgnoreDifferences=true # make sync obey ignoreDifferences, not just the diff view
+    automated:
+      selfHeal: false # never undo a change made directly to the cluster
+      prune: true # delete resources that disappear from Git

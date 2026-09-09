@@ -1316,3 +1316,402 @@ and pods follow, Layer 2 changes pods and parallelism follows.
 **Why not autoscale on CPU?**
 Backpressure blocks threads, and a blocked thread burns no CPU. Utilisation
 falls exactly when you need to scale up, so the signal points the wrong way.
+
+**Why does Karpenter with kwok need a Docker build when AWS Karpenter does not?**
+A Helm chart points at an image by name; it does not contain the program. AWS's
+image is published, kwok's is not, because kwok is a test harness rather than a
+product. `kwok/charts/values.yaml` ships `repository: ""` to say so.
+
+**Why not reuse `apps/pipeline/Dockerfile`?**
+It starts `FROM flink:2.2.0-java21` and copies a Java jar that Gradle already
+built. Karpenter is Go, needs no JVM, and has nothing pre-built, so its
+Dockerfile must compile as well as package. One Dockerfile packages one program.
+
+## Karpenter
+
+### The problem, before the mechanism
+
+Installing Karpenter for a real cloud is two commands. Add the Helm repo, install
+the chart. Installing it with the kwok provider needs a compile step first, and
+nothing in the install instructions says why. The reason is worth understanding,
+because it is the same reason for every "there is no chart for this" tool.
+
+### Kubernetes cannot run source code
+
+Three facts stacked on each other:
+
+1. **Kubernetes runs containers.** That is the only unit it starts.
+2. **A container comes from an image**, which is the program already compiled and
+   packaged.
+3. **A Helm chart does not contain the program.** It is instructions: run *this
+   image*, with *these settings*, in *this namespace*. It refers to the image by
+   name.
+
+For the AWS or Azure providers, that image already exists in a public registry.
+Helm reads the name, Kubernetes pulls it, and nobody thinks about step 2.
+
+For the kwok provider, **the image does not exist anywhere.** kwok is a test
+harness rather than a product, so upstream never publishes one. Only the source
+does exist, in `kubernetes-sigs/karpenter` under `kwok/`.
+
+The chart states this outright. `kwok/charts/values.yaml`:
+
+```yaml
+controller:
+  image:
+    repository: ""
+```
+
+An empty string is not an oversight. It is the chart saying it needs an image and
+expects the operator to supply one.
+
+**So the missing step is turning source on disk into something Kubernetes can
+start.** Compile once, name the result, hand the name to Helm.
+
+### Why `apps/pipeline/Dockerfile` cannot be reused
+
+The obvious question is whether the project's existing Dockerfile can do it. It
+cannot, and the reasons name the difference between the two builds:
+
+```dockerfile
+FROM flink:2.2.0-java21                       # a Flink runtime, with a JVM
+COPY build/libs/pipeline-all.jar ...          # a jar Gradle already built
+```
+
+1. **Wrong base.** It starts from a Flink image, which supplies a JVM and the
+   Flink runtime. Karpenter is not a Flink job and needs neither.
+2. **Wrong language.** It copies a `.jar`, compiled Java. Karpenter is Go. There
+   is no jar, and a JVM cannot run Go.
+3. **It compiles nothing.** Gradle built the jar before Docker ran, so `COPY`
+   only moves a finished file in. Karpenter has nothing built yet, so its
+   Dockerfile must compile as well as package. That is why it needs two stages:
+   one to build, one to hold the result.
+
+A Dockerfile describes how to package **one** program. Two programs, two files.
+
+### The same shape, different ingredients
+
+| | Flink job | Karpenter with kwok |
+|---|---|---|
+| Compiled by | Gradle, on the host, before Docker | Go, inside the Docker build |
+| Packaged onto | `flink:2.2.0-java21` | `distroless/static`, an almost empty image |
+| Delivered by | `kind load docker-image` | `kind load docker-image` |
+| Referenced from | `spec.image` in the FlinkDeployment | `--set controller.image.repository` in Helm |
+
+The last two rows are identical, and that is the point. Once an image exists,
+Karpenter is installed like anything else. Everything unusual happens before
+that.
+
+### Why the compiler runs inside Docker
+
+`go.mod` requires **Go 1.26.6**, and this host has neither `go` nor `make`. A
+multi-stage build borrows a compiler from the `golang:1.26` image, uses it, and
+throws the container away. Nothing is installed on the machine and deleting the
+image undoes the whole thing.
+
+This matters beyond convenience. Everything else in this lab is installed in a
+scoped, reversible way, and a Go toolchain on the host would be the one piece
+that is not.
+
+### What a NodePool is
+
+- A file you write and apply, the same way you apply a Deployment.
+- It is **not a node**. Applying it does not create a node.
+- It is a set of rules. Karpenter reads them only when some pod cannot start.
+- The rules answer four questions:
+  - How much may I add in total? → `limits`
+  - What labels and taints should a new node carry? → `labels`, `taints`
+  - What kind of node may I pick? → `requirements`
+  - When should I delete the node again? → `disruption`
+- It never says **how to build the machine**. No image. No network. No login.
+
+### What a NodeClass is
+
+- The settings one cloud needs in order to build a real machine.
+- On AWS that means: which image to boot, which subnets and security groups to
+  join, which IAM role to use, how big the disk is.
+- It **decides nothing**. By the time anything reads it, Karpenter has already
+  decided a node is needed.
+- Each cloud has its own kind: `EC2NodeClass`, `AKSNodeClass`, `KWOKNodeClass`.
+- The kwok one is empty. A fake node has no image and no network, so there is
+  nothing to set.
+
+### How they differ
+
+Follow one round of provisioning:
+
+1. A pod cannot start. It sits `Pending`.
+2. Karpenter reads the **NodePool**. May I add a node? What should it look like?
+   Would the pod fit on it?
+3. Karpenter writes a `NodeClaim`. It means "I want one node like this".
+4. The cloud reads the **NodeClass** and builds the machine.
+5. The node joins, carrying the labels and taints from the NodePool. The pod
+   starts.
+6. Later the node is empty. The **NodePool** says when to delete it.
+
+- The NodePool is read at step 2 and step 6. **It decides.**
+- The NodeClass is read at step 4 only. **It builds.**
+- Short version: NodePool is *what and whether*. NodeClass is *how*.
+
+### Which file does a setting go in
+
+Ask one question: does this setting mean the same thing on another cloud?
+
+- **Yes → NodePool.** A label. A taint. `amd64`. A CPU ceiling.
+- **No → NodeClass.** An AMI id. A subnet id. An IAM role name. A disk type.
+
+### Why not one object
+
+1. **Portability.** Labels and taints mean the same thing on every cloud. AMI ids
+   do not. Keeping them apart lets one NodePool move to another cloud by editing
+   three lines.
+2. **Reuse.** Several NodePools can share one NodeClass. A `gpu` pool and a
+   `general` pool can differ in taints and requirements while using the same
+   image, subnets and IAM role.
+3. **Schema.** `EC2NodeClass` and `KWOKNodeClass` have no fields in common.
+   Merging them into one type would make that type a pile of every cloud's
+   settings.
+
+### The seam
+
+- **Seam**: a place where one implementation can be swapped for another without
+  changing anything around it.
+- Toy version: a lamp's socket. Swap the bulb; the lamp, wiring and switch are
+  untouched.
+- In a NodePool the seam is exactly three lines:
+
+```yaml
+      nodeClassRef:
+        group: karpenter.kwok.sh
+        kind: KWOKNodeClass
+        name: default
+```
+
+- Point them at an `EC2NodeClass` and the **byte-identical** NodePool provisions
+  real EC2 instances.
+- This is what lets the lab exercise Karpenter's real provisioning loop with no
+  cloud account.
+
+### This project's NodePool, field by field
+
+| Field | What it does | Why it matters here |
+|---|---|---|
+| `template.metadata.labels.node-role: decoy` | every created node gets this label | the Decoy selects on it; no real worker carries it, which is what makes the Decoy unschedulable and is the **only** thing that triggers Karpenter |
+| `template.spec.taints` `workload=flink:NoSchedule` | every created node gets this taint | keeps TaskManagers off fake nodes |
+| `template.spec.requirements` | the space of nodes Karpenter may pick from | on a real cloud this narrows instance types and zones; on kwok it only pins arch and OS |
+| `nodeClassRef` | the provider seam | see above |
+| `limits.cpu: "20"` | ceiling on the pool | nothing else bounds provisioning |
+| `disruption.consolidationPolicy` / `consolidateAfter: 10s` | the scale-down half | 10s makes Drill H's consolidation observable in seconds |
+
+- **A toleration is permission, not attraction.** The label attracts the Decoy;
+  the taint repels everything else. A Decoy that only tolerated the taint would
+  schedule onto a real worker, Karpenter would see nothing pending, and the Drill
+  would prove nothing.
+
+### `limits` is the whole pool, not one node
+
+- Karpenter's docs: *"Resource limits constrain the total size of the pool.
+  Limits prevent Karpenter from creating new instances once the limit is
+  exceeded."*
+- `cpu: "20"` = the **sum across every node this NodePool has created**, not a
+  per-node size.
+- At roughly 5 CPU per fake node that is about 4 nodes.
+- **`limits.nodes` also exists** and states the intent directly:
+
+```yaml
+  limits:
+    nodes: 4
+```
+
+- Prefer it when the intent is a node count. The CPU form carries a hidden
+  dependency on the per-node size.
+
+### KWOKNodeClass against EC2NodeClass
+
+```yaml
+# kwok: no spec at all
+apiVersion: karpenter.kwok.sh/v1alpha1
+kind: KWOKNodeClass
+metadata:
+  name: default
+```
+
+```yaml
+# AWS: infrastructure detail, abridged from the v1 API docs
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  role: "KarpenterNodeRole-my-cluster"
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - alias: al2023@v20240625
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "my-cluster"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "my-cluster"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+  metadataOptions:
+    httpTokens: required
+```
+
+- The `KWOKNodeClass` is empty because kwok invents nodes out of nothing: no
+  image to pick, no network to join, no role to assume.
+- It exists only so `nodeClassRef` has something to point at.
+- **The emptiness is the clearest demonstration of what the seam separates.**
+
+### Why an EC2NodeClass carries an IAM role
+
+- **The problem**: software on the node must call AWS APIs (ECR image pulls, CNI
+  attaching network interfaces, EKS registration). Baking an access key into the
+  AMI would put a long-lived secret on every machine.
+- **An IAM role is assumed by a principal, and an EC2 instance is one.** It is not
+  limited to people or services.
+- Toy version: a hotel gives the cleaner a badge that opens today's rooms and
+  expires at shift end, not a copy of every key.
+
+The chain:
+
+```
+IAM role ──wrapped in──> instance profile ──attached at launch──> EC2 instance
+                                                                       │
+                              instance metadata service (169.254.169.254)
+                              hands out temporary, auto-rotating credentials
+                                                                       │
+                                        kubelet, CNI and AWS SDKs pick them up
+```
+
+- An **instance profile** is a thin container whose only job is to carry one role
+  onto an instance. It exists because EC2 predates the modern IAM model.
+- The role's **trust policy** names `ec2.amazonaws.com` as the service allowed to
+  assume it. That service assumes the role on the instance's behalf.
+
+### `spec.role` against `spec.instanceProfile`
+
+- Exactly one must be set. Neither means the node has no identity; both is
+  ambiguous.
+- Karpenter's docs: *"The `role` field allows Karpenter to manage the instance
+  profile, while the `instanceProfile` field requires you to pre-provision and
+  manage the IAM instance profile yourself."*
+
+| | `role` | `instanceProfile` |
+|---|---|---|
+| Creates the instance profile | Karpenter, on the fly | you, beforehand |
+| Deletes it | Karpenter | you |
+| Needs `iam:CreateInstanceProfile` | yes | no |
+| Use when | the normal case | the org forbids controllers from creating IAM objects |
+
+- `status.instanceProfile` reports back what Karpenter built from the role named
+  in `spec`.
+- Upstream's stated reasoning for preferring `role`: instance profiles are an
+  EC2-specific oddity with weak tooling, roles are what people already understand,
+  so Karpenter absorbs the awkward step.
+
+### Three roles, and the question that separates them
+
+- **The question is not which machine. It is which process is making the AWS API
+  call.**
+
+One scenario, all three:
+
+1. Pod is `Pending`, nothing fits. Karpenter calls `ec2:RunInstances`.
+   → **controller role**
+2. The instance boots. kubelet calls `ecr:GetAuthorizationToken`, CNI calls
+   `ec2:CreateNetworkInterface`. → **node role** (`spec.role`)
+3. The pod starts and calls `s3:GetObject`. → **pod role** (IRSA / Pod Identity)
+
+**Two mechanisms, three purposes.** The controller role is mechanically a pod
+role, because Karpenter is itself a pod:
+
+| Mechanism | How credentials arrive | Who gets them |
+|---|---|---|
+| Instance profile | the metadata service at `169.254.169.254` | **everything** on that machine |
+| IRSA / Pod Identity | a projected token on the pod's ServiceAccount | **one** pod |
+
+| Role | Assumed by | Typical permissions |
+|---|---|---|
+| **Node** | the EC2 instance | `ecr:GetAuthorizationToken`, `ec2:CreateNetworkInterface`, `eks:DescribeCluster` |
+| **Controller** | the Karpenter pod | `ec2:RunInstances`, `ec2:TerminateInstances`, `iam:PassRole`, `iam:CreateInstanceProfile` |
+| **Pod** | one application pod | only what that app needs, e.g. `s3:GetObject` |
+
+- **Why not one role for everything**: anything on a node can reach
+  `169.254.169.254` and use the node role. A node role with S3 write hands S3
+  write to every pod on that node, including ones you did not write. That is why
+  IRSA exists and why the node role stays minimal.
+- **Where two of them meet**: the controller needs `iam:PassRole` for the node
+  role. Handing a role to a new instance is, in IAM's view, handing out
+  permissions, so it must be explicitly allowed. Without it Karpenter launches
+  nothing.
+
+### What this lab has instead
+
+| Role | Present here? | Why |
+|---|---|---|
+| Node | no | a kwok node runs no kubelet and pulls no images |
+| Pod | no | the Decoy is `pause`, which does nothing |
+| Controller | **yes, as Kubernetes RBAC** | the chart created a ServiceAccount, ClusterRole and ClusterRoleBinding in `kube-system`, granting the controller `NodeClaim` and `Node` permissions and nothing else |
+
+- Same shape, one cloud, one cluster.
+
+### The Decoy Workload is a Deployment, and a Deployment does not create pods
+
+- A Deployment never makes a pod itself. There is a middle object:
+
+```
+Deployment  ──creates──>  ReplicaSet  ──creates──>  Pod
+```
+
+- Three things follow from that, all visible with `kubectl get pod -o json`:
+  - **The pod name has two suffixes**, `decoy-<replicaset-hash>-<random>`. The
+    middle part names the ReplicaSet.
+  - **`ownerReferences` points at the ReplicaSet**, not at the Deployment.
+  - **The pod gains a `pod-template-hash` label you never wrote.** The ReplicaSet
+    adds it so that during a rollout it can tell its own pods apart from the
+    older ReplicaSet's pods.
+
+- A Deployment is used here rather than a bare Pod for one reason: **`kubectl
+  scale` works on it**. Drill H starts by scaling the Decoy up, and a bare Pod
+  cannot be scaled.
+
+### A Deployment has two `metadata` blocks, and only one reaches the pod
+
+- The top `metadata` describes the **Deployment**.
+- `spec.template.metadata` describes **each pod** it stamps out.
+- Measured on the `karpenter` Deployment in this cluster: 5 labels on the
+  Deployment, 2 on the template, and the pod ended up with **the template's 2
+  plus `pod-template-hash`**. The Deployment's own Helm labels never reached it.
+- From the top `metadata`, only two things affect the pod:
+  - `name`, used as a **prefix** for the pod name.
+  - `namespace`, which the pod inherits.
+- **Labels and annotations on the top `metadata` are not copied.** Putting a label
+  there and expecting it on the pods is a common mistake. It goes in
+  `spec.template.metadata.labels`.
+
+### Why `app: decoy` is written twice
+
+- `template.metadata.labels` is **what gets stamped onto** each pod.
+- `spec.selector` is **what the Deployment searches for**.
+- A Deployment keeps no list of the pods it made. On every pass it runs the
+  selector as a search and counts the results. Below `replicas`, it makes more.
+- So the stamp and the search must use the same label, or the search finds
+  nothing and the Deployment creates pods forever.
+- **Kubernetes does not copy it automatically on purpose.** `selector` is
+  immutable; the template is not. If the selector were derived from the template,
+  changing a label during a rollout would silently change which pods the
+  Deployment owns and orphan the running ones. The API server rejects a mismatch
+  at apply time instead.
+
+- Three label-shaped fields sit close together in `decoy.yaml`, and they do
+  different jobs:
+  - `spec.selector` searches for **pods**.
+  - `template.metadata.labels` is stamped onto **pods**.
+  - `template.spec.nodeSelector` searches for **nodes**. Only this one has
+    anything to do with Karpenter.

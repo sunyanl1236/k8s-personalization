@@ -72,8 +72,9 @@ root from the working directory rather than from the script's location.
 opinionated. Use `Shopper` not user, `Click` not event, `Recommendation` not
 offer, `Drill` not test, `Active Side` / `Standby Side` not blue / green.
 
-`scripts/` holds three scripts, see [README.md](README.md#scripts) for what
-each does and when to run it.
+`scripts/` holds five scripts, see [README.md](README.md#scripts) for what
+each does and when to run it. `bootstrap.sh` carries every one-time install that
+ArgoCD cannot do, and its `all` encodes the order they depend on.
 
 ## Authoritative decisions
 

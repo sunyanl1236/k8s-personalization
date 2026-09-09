@@ -1,0 +1,37 @@
+# if a pod cannot be scheduled, here is the kind of node you may create for it
+# NodePool = policy, NodeClass = provider detail
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: decoy
+spec:
+  template: # Everything under template describes the node that would be created, not the NodePool itself.
+    metadata:
+      labels:
+        node-role: decoy # Every node created from this pool gets this label.
+    spec:
+      taints: # Every created node gets this taint. A taint repels pods. NoSchedule means the scheduler will not place a pod here unless the pod explicitly tolerates it. This is what keeps TaskManagers off fake nodes.
+        - key: workload
+          value: flink
+          effect: NoSchedule
+      requirements: # The space of nodes Karpenter may pick from. For a real cloud this is where instance types and zones get narrowed. For kwok it just pins the fake node's arch and OS.
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+      nodeClassRef: # This reference points at the provider-specific object. Everything else in the NodePool is provider-neutral. It never says "kwok" or "AWS". Change those three lines to point at an EC2NodeClass and the identical NodePool provisions real EC2 instances.
+        group: karpenter.kwok.sh
+        kind: KWOKNodeClass
+        name: default
+  limits: # keep provisioning until the sum of CPU across all nodes from this pool reaches 20, then stop. 
+    cpu: "20"
+  disruption: # Karpenter removes nodes that are empty or underused, after 10 seconds
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 10s
+---
+apiVersion: karpenter.kwok.sh/v1alpha1
+kind: KWOKNodeClass
+metadata:
+  name: default

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Exports MINIO_ACCESS_KEY and MINIO_SECRET_KEY for the Phase 3 pipeline,
-# read from the storage-configuration Secret that bootstrap-minio-secret.sh
+# read from the storage-configuration Secret that bootstrap.sh minio-secret
 # created. Nothing is written to disk, same no-durable-secrets reasoning
 # README.md already applies to ArgoCD's admin password.
 #
@@ -26,7 +26,7 @@ _minio_config_env=$(kubectl get secret storage-configuration -n minio-tenant \
 
 if [ -z "${_minio_config_env}" ]; then
     printf 'error: could not read Secret storage-configuration in namespace minio-tenant.\n' >&2
-    printf '       is the cluster up, and has bootstrap-minio-secret.sh been run?\n' >&2
+    printf '       is the cluster up, and has bootstrap.sh minio-secret been run?\n' >&2
     unset _minio_config_env
     return 1
 fi

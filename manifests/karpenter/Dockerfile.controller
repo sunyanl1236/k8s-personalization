@@ -1,0 +1,27 @@
+# Build context is charts/karpenter, the ignored upstream checkout, so this file
+# lives here instead and is passed with -f. Built by scripts/bootstrap-karpenter.sh.
+#
+# Upstream publishes no image for the kwok provider: kwok/charts/values.yaml ships
+# controller.image.repository: "". Upstream's own `make apply` builds one with ko,
+# which needs a Go toolchain on the host. This does the same work in a container,
+# so nothing is installed on the machine.
+#
+# golang:1.26, because go.mod requires 1.26.6. distroless/static, because
+# CGO_ENABLED=0 produces a static binary and the chart sets
+# readOnlyRootFilesystem: true and runAsUser: 65536, so the image needs no shell,
+# no package manager and no writable path.
+FROM golang:1.26 AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /karpenter ./kwok
+
+FROM gcr.io/distroless/static:nonroot
+
+COPY --from=build /karpenter /karpenter
+
+ENTRYPOINT ["/karpenter"]

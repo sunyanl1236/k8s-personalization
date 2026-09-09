@@ -1067,7 +1067,7 @@ stays correct and is load-bearing.
   **Vertex IDs must be captured before a restart**, since the report names
   vertices by hex ID only and the IDs change with the job graph. Reading the
   mapping is now step 3 of the runbook's procedure.
-- 🟡 Task 5: Drill F, 2026-09-08. **Scaling gates passed.**
+- ✅ Task 5: Drill F, 2026-09-08. **Scaling gates passed.**
   [Runbook](../../runbooks/phase-6-drill-f-scale-up.md). **Three rescales.**
   CepOperator `2 -> 6` at 16:03:57, then Interval Join `1 -> 4` and
   Co-Keyed-Process `1 -> 2` at 16:08:14, 4m17s later. Three TaskManagers, and
@@ -1112,10 +1112,64 @@ stays correct and is load-bearing.
   capacity 2187.86 to 6992.00 for `2 -> 6`; measured was about 2950. Likely host
   CPU saturation, since three TaskManagers now share one host with 6 kind nodes,
   Kafka, MinIO and the generator. Reasoning from deployment shape, not measured.
-  **Outstanding: Step 7's gap check never ran.** It needs a `before.txt` snapshot
-  taken ahead of a rescale, and both rescales happened first. Fold it into Drill
-  G rather than forcing an extra rescale.
-- ⬜ Tasks 6 to 9: Drill G, Karpenter, Drill H, Documents.
+  **Step 7's gap check was folded into Drill G** and passed there, because both
+  of this Drill's rescales happened before a baseline existed.
+  A fourth rescale followed, Interval Join `4 -> 6`, before the job settled.
+- ✅ Task 6: Drill G, 2026-09-08.
+  [Runbook](../../runbooks/phase-6-drill-g-scale-down.md). Traffic stopped,
+  Co-Keyed-Process fell `2 -> 1` while draining, then CepOperator and Interval
+  Join both `6 -> 3`. **Three TaskManagers became two**, `taskmanager-1-2`
+  released. 6 restores, **0** exceptions across the session. Gap check: **no
+  gap**, duplicates unchanged at 5844.
+  **Two settings the plan never named govern this Drill.**
+  `job.autoscaler.scale-down.interval` defaults to **1 hour**, which is why the
+  plan's "wait 3 minutes plus stabilization" is wrong by about an hour. Set to
+  `5m` for this Drill; adding it did not restart the job, same as Drill F.
+  `job.autoscaler.scale-down.max-factor` defaults to **0.6**, so `6 × 0.6 = 3.6`
+  rounds to 3. **That is why an idle job stopped at parallelism 3 and not 1.**
+  Shrinking happens in bounded steps, each waiting out the interval again.
+  **This also explains the 81-minute idle gap earlier in the day**, when the job
+  came back at parallelism 1. 81 minutes is longer than the 1 hour default.
+  **The scheduler packed rather than spread.** Slots needed is the largest
+  parallelism of any one vertex, 3, so `ceil(3 ÷ 2)` = 2 pods and the third was
+  emptied and released. Had subtasks spread one per TaskManager, no pod would
+  have been freed. `prefer-minimal-taskmanagers` is unreadable on this cluster,
+  so this is observed behaviour, not a config reading.
+  **`/jobmanager/config` reports only explicitly-set keys**, 62 here. There is no
+  endpoint that reports effective defaults, so the plan's Step 1 cannot be run as
+  written. Both plan steps now carry the correction.
+  **Failed checkpoints went 2 to 4**, one per rescale. A checkpoint in flight
+  when parallelism changes is aborted and the next succeeds. Expected.
+  **`recommendation-snapshot.sh compare` exits 141 when it lists duplicates**, a
+  `SIGPIPE` from an internal pipeline. The summary is correct; the exit code is a
+  script bug worth fixing, since this is the gap instrument for every Drill from
+  Phase 5 on.
+  **Resolved: the 5844 duplicates are source replay, not an exactly-once
+  violation.** `PipelineConfig.java:54` defaults `startFromEarliest = true` and
+  the manifest never overrides it, so every stateless restart re-reads
+  `clickstream` from offset 0 and re-emits every Recommendation. Task 3's clean
+  start was deliberately `upgradeMode: stateless`. Offset distance between copies
+  is 2190 to 5516, never adjacent; `discountPercent` differs in 4712 of 4713
+  pairs because `generatedAt` is a deterministic window end while the enrichment
+  state is not. 1023 of 4672 records from 09-07 are duplicated.
+  **Two follow-ups.** Bound `recommendation-snapshot.sh` to the current run with
+  an optional `kcat -o s@<ms>` start time, so the gap instrument stops comparing
+  three phases of history. And decide `--start-from-earliest` deliberately.
+  `latest` stops the replays but makes a **cold start** skip whatever is already
+  in the topic. **The initializer applies only to a cold start**, so Phase 7's
+  promoted green, which ADR 0006 restores from blue's savepoint, is unaffected
+  either way. `OffsetsInitializer.committedOffsets(...)` is the middle option.
+  **Phase 4 already recorded the cost of `false`:** the promo-rule broadcast
+  source starts at *latest*, so a rule published before the job subscribed is
+  never read and every discount stays `0.0` until the next rule arrives. That is
+  the same flag, and it makes this an **ADR with a known trade, not a bug fix**.
+  **Pin the settings the Drills depend on.** `/jobmanager/config` reports only
+  explicitly-set keys, so an unset default is indistinguishable from a missing
+  key. `job.autoscaler.scale-down.max-factor` (0.6) and
+  `jobmanager.adaptive-scheduler.prefer-minimal-taskmanagers` are both unpinned.
+  The second is a JobManager key, so pinning it triggers a savepoint redeploy and
+  resets parallelism to 2; do it between Drills, not during one.
+- ⬜ Tasks 7 to 9: Karpenter, Drill H, Documents.
 
 **`apps/pipeline/conf/config.yaml` does not exist, and three documents were
 corrected to say so.** Task 5 of Phase 5 deleted it in commit `b0705e0`, 15

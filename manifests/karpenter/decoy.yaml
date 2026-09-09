@@ -1,0 +1,34 @@
+# A separate namespace so no label query can ever select both a Flink object and a Decoy object
+apiVersion: v1
+kind: Namespace 
+metadata:
+  name: karpenter-decoy 
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: # the DEPLOYMENT's identity!!
+  name: decoy # names the Deployment. Pods get decoy-xxxxx-yyyyy
+  namespace: karpenter-decoy # pods land here too
+spec: # what you want the DEPLOYMENT to do
+  replicas: 0 # Starts switched off. Applying this file provisions nothing.
+  selector:
+    matchLabels: # how the Deployment FINDS its pods
+      app: decoy
+  template: # defines pod!!
+    metadata:
+      labels: # what each pod IS LABELLED with. selector and template.metadata.labels must agree
+        app: decoy
+    spec: # copied onto EVERY pod, what should each pod look like
+      nodeSelector: 
+        node-role: decoy # each pod asks for a node labelled node-role=decoy
+      tolerations:
+        - key: workload
+          value: flink
+          effect: NoSchedule
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10.1
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi

@@ -46,8 +46,9 @@ Two permanent host settings are kept, see
 | Script | When to run it |
 |---|---|
 | `session-start.sh` | Start of every session. `--stop` at the end. |
-| `bootstrap-phase0.sh` | Once, after a full `kind delete` + `kind create`. |
-| `bootstrap-minio-secret.sh` | Once, after a full `kind delete` + `kind create`, before `minio-tenant` can go Healthy. |
+| `bootstrap.sh` | Once, after a full `kind delete` + `kind create`. `all` runs every stage in dependency order; `phase0`, `minio-secret`, `flink-secret` and `karpenter` run them one at a time. |
+| `build-image.sh` | After any change under `apps/`. Prints the tag to paste into `spec.image`. |
+| `recommendation-snapshot.sh` | During a Drill. `snapshot` before, `snapshot` + `compare` after. |
 | `minio-env.sh` | In each terminal that runs `:pipeline:run`. **Source it, do not execute it.** |
 
 ## Accessing installed services
