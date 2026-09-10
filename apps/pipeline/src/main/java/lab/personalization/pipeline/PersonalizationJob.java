@@ -53,25 +53,33 @@ public class PersonalizationJob {
         DataStream<Click> clicks = env.fromSource(
                 KafkaSources.of(config, config.inputTopic(), "", new ClickDeserializationSchema()),
                 eventTimeWatermarks(config, (Click click, long ts) -> click.eventTime().toEpochMilli()),
-                "click-stream");
+                "click-stream")
+                .uid("source-clickstream")
+                .name("source-clickstream");
 
         DataStream<ProductChange> productChanges = env.fromSource(
                 KafkaSources.of(config, config.productChangeTopic(), "-product-change",
                         new ProductChangeDeserializationSchema()),
                 eventTimeWatermarks(config, (ProductChange change, long ts) -> change.eventTime().toEpochMilli()),
-                "product-change-stream");
+                "product-change-stream")
+                .uid("source-product-change")
+                .name("source-product-change");
 
         // Promo Rules are not watermark-gated, which is why PromoRule has no eventTime.
         // A real strategy here would hold the job back on a stream that emits every 30s.
         DataStream<PromoRule> promoRules = env.fromSource(
                 KafkaSources.of(config, config.promoRuleTopic(), "-promo-rule",
                         new PromoRuleDeserializationSchema()),
-                WatermarkStrategy.noWatermarks(), "promo-rule-stream");
+                WatermarkStrategy.noWatermarks(), "promo-rule-stream")
+                .uid("source-promo-rule")
+                .name("source-promo-rule");
 
         DataStream<Recommendation> recommendations =
                 buildGraph(clicks, productChanges, promoRules, config, clientFactory(config));
 
-        recommendations.sinkTo(recommendationSink(config));
+        recommendations.sinkTo(recommendationSink(config))
+                .uid("sink-recommendation")
+                .name("sink-recommendation");
 
         env.execute("personalization-phase-4");
     }
@@ -95,6 +103,8 @@ public class PersonalizationJob {
 
         DataStream<ShopperSignal> shopperSignals = sessionSignals
                 .map(ShopperSignal::browsingSession).returns(ShopperSignal.class)
+                .uid("browsing-session-signal-map")
+                .name("browsing-session-signal-map")
                 .union(cartAbandonments);
 
         SingleOutputStreamOperator<RecommendationRequest> requests =
@@ -102,7 +112,9 @@ public class PersonalizationJob {
 
         SingleOutputStreamOperator<RecommendationRequest> priced = requests
                 .connect(promoRules.broadcast(PromoRuleApplier.RULE_STATE_DESCRIPTOR))
-                .process(new PromoRuleApplier());
+                .process(new PromoRuleApplier())
+                .uid("promo-rule-applier")
+                .name("promo-rule-applier");
 
         // Its own operator, downstream of the merge: a KeyedCoProcessFunction cannot make
         // this call and stay correct. orderedWait, because unordered reorders records
@@ -111,7 +123,9 @@ public class PersonalizationJob {
                 priced,
                 new AsyncRecommendationLookup(clientFactory),
                 config.recommendationTimeout().toMillis(), TimeUnit.MILLISECONDS,
-                config.recommendationCapacity());
+                config.recommendationCapacity())
+                .uid("async-recommendation-lookup")
+                .name("async-recommendation-lookup");
 
         if (config.debugPrints()) {
             printDebugStreams(productChanges, sessionSignals, cartAbandonments, shopperSignals,
@@ -125,13 +139,17 @@ public class PersonalizationJob {
         return byShopper
                 .window(EventTimeSessionWindows.withGap(config.sessionGap()))
                 .sideOutputLateData(SessionAggregator.LATE_CLICKS)
-                .process(new SessionAggregator());
+                .process(new SessionAggregator())
+                .uid("session-aggregator")
+                .name("session-aggregator");
     }
 
     private static SingleOutputStreamOperator<ShopperSignal> cepBranch(
             KeyedStream<Click, String> byShopper, PipelineConfig config) {
         return CEP.pattern(byShopper, CartAbandonmentPattern.pattern(config.cepWithin()))
-                .process(new CartAbandonmentMatcher());
+                .process(new CartAbandonmentMatcher())
+                .uid("cart-abandonment-cep")
+                .name("cart-abandonment-cep");
     }
 
     // Forked from the raw stream in parallel with keyBy(shopperId), never below it, and never
@@ -143,7 +161,9 @@ public class PersonalizationJob {
                 .keyBy(Click::productId)
                 .intervalJoin(productChanges.keyBy(ProductChange::productId))
                 .between(config.joinLowerBound(), config.joinUpperBound())
-                .process(new ProductChangeJoiner());
+                .process(new ProductChangeJoiner())
+                .uid("product-change-join")
+                .name("product-change-join");
     }
 
     // The re-key is what physically moves each match to the worker holding the session.
@@ -152,7 +172,9 @@ public class PersonalizationJob {
             SingleOutputStreamOperator<EnrichedClick> priceDropMatches, PipelineConfig config) {
         return shopperSignals.keyBy(ShopperSignal::shopperId)
                 .connect(priceDropMatches.keyBy(EnrichedClick::shopperId))
-                .process(new SignalMerger(config.cooldown(), config.abandonmentTtl()));
+                .process(new SignalMerger(config.cooldown(), config.abandonmentTtl()))
+                .uid("signal-merger")
+                .name("signal-merger");
     }
 
     // Captures only the catalogue and the latency, both serializable. A client cannot be
