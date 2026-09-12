@@ -300,6 +300,41 @@ clickstream records readable: 0
 
 The 5,844 pre-existing duplicate identities are gone with the data.
 
+### A second bug, found between steps 6 and 7
+
+**The fresh-deploy path would have resumed, not started fresh.**
+
+```
+blue    upgradeMode=savepoint   status.jobStatus.upgradeSavepointPath=s3://.../savepoint-6fc866-...
+green   status = {}             (never run)
+promote.sh:219   TO="${SIDES[0]}"   ->  blue
+```
+
+Resuming a side suspended under `upgradeMode: savepoint` **restores from the
+savepoint the operator recorded**. That is correct for a suspend-and-resume and
+exactly wrong for a fresh deploy: blue would have come back holding Browsing
+Sessions and CEP state from before the truncation, referring to data that no
+longer exists.
+
+The script now prefers a side with **no** recorded savepoint, and says which and
+why. If every side carries one it warns loudly that the operation is a RESUME
+rather than a fresh start, names the path, and points at
+`upgradeMode: stateless` as the way to get a genuinely clean start.
+
+Dry run against the truncated, both-down cluster:
+
+```
+    side     git wants    job status   lifecycle
+    -------- ------------ ------------ ------------
+    blue     suspended    FINISHED     SUSPENDED
+    green    suspended
+
+==> FRESH DEPLOY: starting green, which has never run, with no savepoint
+```
+
+**So Drill 1 makes green the Active Side**, not blue. That is the correct
+outcome, and it sets Drill 2 up to promote in the green-to-blue direction.
+
 ### Steps 7 to 11
 
 *Still to run.*

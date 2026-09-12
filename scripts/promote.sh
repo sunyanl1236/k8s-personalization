@@ -216,7 +216,23 @@ discover() {
   done
 
   if (( ${#active[@]} == 0 && ${#standby[@]} == 2 )); then
-    MODE=fresh; FROM=""; TO="${SIDES[0]}"
+    MODE=fresh; FROM=""
+    # Not just SIDES[0]. A side suspended under upgradeMode: savepoint carries
+    # status.jobStatus.upgradeSavepointPath, and resuming it RESTORES from that
+    # savepoint. That is correct for a resume and wrong for a fresh deploy: the
+    # side would come back holding state from before whatever made you want a
+    # fresh start. Prefer a side that has never run.
+    TO=""
+    local side
+    for side in "${SIDES[@]}"; do
+      if [[ -z "$(savepoint_path "${side}")" ]]; then TO="${side}"; break; fi
+    done
+    if [[ -z "${TO}" ]]; then
+      TO="${SIDES[0]}"
+      warn "every side carries a recorded savepoint, so this is a RESUME, not a fresh start."
+      warn "${TO} will restore from: $(savepoint_path "${TO}")"
+      warn "for a genuinely clean start, set upgradeMode: stateless for that one transition."
+    fi
     return 0
   fi
   if (( ${#active[@]} == 1 && ${#standby[@]} == 1 )); then
@@ -236,8 +252,15 @@ discover() {
 # ---------------------------------------------------------------------------
 
 do_fresh_deploy() {
-  info "FRESH DEPLOY: starting ${TO} with no savepoint"
-  warn "--start-from-earliest defaults to true, so this replays the whole clickstream topic. Take any baseline snapshot AFTER catch-up."
+  local recorded; recorded="$(savepoint_path "${TO}")"
+  if [[ -z "${recorded}" ]]; then
+    info "FRESH DEPLOY: starting ${TO}, which has never run, with no savepoint"
+  else
+    info "RESUME: starting ${TO}, which will restore from ${recorded}"
+  fi
+  warn "--start-from-earliest defaults to true, so this reads the input topics from their earliest"
+  warn "retained offset. On a topic that still holds history this is a full replay; take any"
+  warn "baseline snapshot AFTER catch-up rather than at start."
   clear_savepoint_path "${TO}"
   set_job_state "${TO}" running
   commit_and_sync "${TO}" "Fresh deploy: start ${TO}"
