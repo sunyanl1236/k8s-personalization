@@ -1490,6 +1490,67 @@ restored. `spec.job.initialSavepointPath` stayed empty throughout, and
 
 **What is left: the six Drills, Tasks 6 to 13.**
 
+### Drill 1 steps 1 to 6, 2026-09-12
+
+**`promote.sh` was polling two wrong fields, and it would have broken every
+promotion.** Measured on a real suspend:
+
+```
+lifecycleState                                 = SUSPENDED   <- the signal
+jobStatus.state                                = FINISHED
+jobStatus.savepointInfo.lastSavepoint.location = (absent)
+jobStatus.upgradeSavepointPath                 = s3://.../savepoint-6fc866-...
+```
+
+`stop-with-savepoint` leaves Flink's job status at **FINISHED**; `SUSPENDED` is
+the **operator's** `lifecycleState`. And the operator records the upgrade's
+savepoint in `upgradeSavepointPath`, not in `savepointInfo.lastSavepoint`, which
+is for independently triggered savepoints. The script polled
+`jobStatus.state == "SUSPENDED"` and read `lastSavepoint.location`, so every
+promotion would have run the full 300s `SUSPEND_TIMEOUT` and rolled itself back.
+
+**`--dry-run` cannot catch this, because a dry run never polls.** Rule: a dry run
+proves the branching, never the polling. Any condition a dry run skips must be
+checked against a real resource in the state it will actually see.
+
+The correct field name was already in this file, from Phase 6 Task 3: "empty
+`upgradeSavepointPath` beside `RUNNING`". The wrong names came from the original
+design spec's promotion runbook, written before Phase 5 existed.
+
+**`suspended` is two different states, and only one of them has no pods.**
+
+| | never run | suspended after running |
+|---|---|---|
+| JobManager Deployment | absent | **2/2, still up, 0 restarts** |
+| `<name>-rest` Service | absent | **still there** |
+| ConfigMaps | absent | **all five still there** |
+| TaskManagers | absent | gone with the job's slots |
+| `status` | `{}` entirely | populated |
+
+Suspending stops the **job**, not the cluster. The knowledge doc's claim that a
+suspended deployment has no pods was true only of a never-run side and has been
+corrected. This also means **the pre-warming analysis in the Phase 7 knowledge
+doc needs redoing**: a real Standby Side has been suspended, so its JobManager is
+already warm, and the saving from session mode is smaller than the tradeoff
+section claims. Not yet rewritten.
+
+**The topics are truncated.** Before: clickstream 10,041,754, product-change
+1,892,833, promo-rule 336,326, recommendation 183,688. After: every topic reports
+earliest equal to latest, cross-checked with a real consumer reading 0 records.
+The 5,844 pre-existing duplicate identities are gone with the data.
+
+**Kafka offsets do not reset to zero.** `kafka-delete-records.sh` moves the log
+start forward; numbering continues. `clickstream` reads earliest 10,041,754 and
+latest 10,041,754, and is empty.
+
+**Stale Phase 3 consumer groups still exist**: `personalization-phase-3`,
+`-product-change`, `-promo-rule`. Harmless, since Flink does not use consumer
+groups for offsets, but they confuse a lag reading.
+
+**Git pushes cannot be done from the assistant's shell.** The remote is HTTPS
+with no credential helper, so `git push` fails with "could not read Username".
+Commits land locally; the push is a manual step.
+
 ## Phase 8: Observability and docs — ⬜ not started
 
 Now also carries the OTel Collector, the Prometheus reporter plugin, the

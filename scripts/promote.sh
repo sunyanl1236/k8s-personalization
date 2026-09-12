@@ -38,13 +38,32 @@
 # it.
 #
 # ---------------------------------------------------------------------------
-# Why the suspend poll checks two conditions
+# Which status fields actually carry the suspend signal
 # ---------------------------------------------------------------------------
-# A job can report SUSPENDED while
-# status.jobStatus.savepointInfo.lastSavepoint.location is still empty. Writing
-# an empty initialSavepointPath into the other side is not an error: it is a
-# legal way to say "fresh start", so the Standby Side would come up having
-# silently discarded every Shopper's state. Both conditions, or keep waiting.
+# Measured on a real suspend, 2026-09-12:
+#
+#   status.lifecycleState                             = SUSPENDED   <- the signal
+#   status.jobStatus.state                            = FINISHED
+#   status.jobStatus.savepointInfo.lastSavepoint.location = (absent)
+#   status.jobStatus.upgradeSavepointPath             = s3://.../savepoint-6fc866-...
+#
+# `stop-with-savepoint` leaves Flink's own job status at FINISHED, not SUSPENDED.
+# SUSPENDED is the OPERATOR's lifecycle state, a different field. And the
+# operator records the savepoint it took in upgradeSavepointPath;
+# savepointInfo.lastSavepoint is for savepoints triggered on their own, not for
+# an upgrade, and stays empty here.
+#
+# An earlier version of this script polled jobStatus.state == "SUSPENDED" and
+# read savepointInfo.lastSavepoint.location. Both are wrong, so every promotion
+# would have polled for the full timeout and then rolled itself back. A dry run
+# cannot catch it, because a dry run never polls.
+#
+# The poll still checks TWO conditions. Writing an empty initialSavepointPath
+# into the other side is not an error: it is a legal way to say "fresh start", so
+# the Standby Side would come up having silently discarded every Shopper's state.
+#
+# Discovery is different and still reads jobStatus.state, because "is it RUNNING"
+# is exactly what that field answers.
 #
 # ---------------------------------------------------------------------------
 # What a never-run deployment reports
@@ -92,14 +111,19 @@ git_state() {  # what we WANT, from the file. lowercase: running | suspended
   awk '/^    state: /{print $2; exit}' "$(manifest "$1")"
 }
 
-live_state() { # what IS, from the controller. uppercase, or empty if never run
+live_state() { # Flink's own job status. RUNNING | FINISHED | FAILED | ...
   kubectl get flinkdeployment "$(crname "$1")" -n "$(namespace "$1")" \
     -o jsonpath='{.status.jobStatus.state}' 2>/dev/null || true
 }
 
-savepoint_path() {
+lifecycle_state() { # the OPERATOR's state. STABLE | SUSPENDED | DEPLOYED | ...
   kubectl get flinkdeployment "$(crname "$1")" -n "$(namespace "$1")" \
-    -o jsonpath='{.status.jobStatus.savepointInfo.lastSavepoint.location}' 2>/dev/null || true
+    -o jsonpath='{.status.lifecycleState}' 2>/dev/null || true
+}
+
+savepoint_path() { # the savepoint the operator took for THIS upgrade
+  kubectl get flinkdeployment "$(crname "$1")" -n "$(namespace "$1")" \
+    -o jsonpath='{.status.jobStatus.upgradeSavepointPath}' 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -139,7 +163,7 @@ commit_and_sync() { # side, message
 wait_suspended_with_savepoint() { # side -> prints the path on success
   local side="$1" waited=0 state path
   while (( waited < SUSPEND_TIMEOUT )); do
-    state="$(live_state "${side}")"
+    state="$(lifecycle_state "${side}")"
     path="$(savepoint_path "${side}")"
     if [[ "${state}" == "SUSPENDED" && -n "${path}" ]]; then
       printf '%s' "${path}"
@@ -166,12 +190,13 @@ wait_running() {
 # ---------------------------------------------------------------------------
 
 print_table() {
-  printf '\n    %-8s %-12s %-12s\n' side 'git wants' 'cluster has'
-  printf '    %-8s %-12s %-12s\n' -------- ------------ ------------
+  printf '\n    %-8s %-12s %-12s %-12s\n' side 'git wants' 'job status' 'lifecycle'
+  printf '    %-8s %-12s %-12s %-12s\n' -------- ------------ ------------ ------------
   local side
   for side in "${SIDES[@]}"; do
-    printf '    %-8s %-12s %-12s\n' \
-      "${side}" "$(git_state "${side}")" "$(live_state "${side}" || true)"
+    printf '    %-8s %-12s %-12s %-12s\n' \
+      "${side}" "$(git_state "${side}")" \
+      "$(live_state "${side}" || true)" "$(lifecycle_state "${side}" || true)"
   done
   printf '\n'
 }
@@ -228,7 +253,7 @@ do_promotion() {
   commit_and_sync "${FROM}" "Suspend ${FROM} for promotion to ${TO}"
 
   if [[ "${DRY_RUN}" == true ]]; then
-    printf '    would poll %s for SUSPENDED with a non-empty savepoint path\n' "${FROM}"
+    printf '    would poll %s for lifecycleState=SUSPENDED with a non-empty upgradeSavepointPath\n' "${FROM}"
     printf '    would write that path into %s and start it\n' "${TO}"
     ok "dry run complete"
     return 0
@@ -236,7 +261,7 @@ do_promotion() {
 
   local path
   if ! path="$(wait_suspended_with_savepoint "${FROM}")"; then
-    warn "${FROM} did not reach SUSPENDED with a savepoint within ${SUSPEND_TIMEOUT}s"
+    warn "${FROM} did not reach lifecycleState=SUSPENDED with an upgradeSavepointPath within ${SUSPEND_TIMEOUT}s"
     warn "rolling the suspend back. ${TO} was never touched, so nothing is lost."
     set_job_state "${FROM}" running
     commit_and_sync "${FROM}" "Abort promotion, resume ${FROM}"

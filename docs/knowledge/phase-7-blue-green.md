@@ -51,8 +51,23 @@ That depends entirely on whether `spec.job` is present.
 
 **With `spec.job`, which is what this project has, it is application mode**, and
 the deployment creates a Flink cluster **and** one job as a single inseparable
-thing. `state: suspended` means no pods at all. `state: running` means the job is
-running. There is no third state, and no way to have the cluster without the job.
+thing. There is no way to submit a job to it later, and no way to have it running
+with no job.
+
+**But `suspended` is not one state, it is two, and the difference matters.**
+Measured on 2026-09-12:
+
+| | never run | suspended after running |
+|---|---|---|
+| JobManager Deployment | absent | **2/2, still up** |
+| `<name>-rest` Service | absent | **still there** |
+| ConfigMaps | absent | **all five still there** |
+| TaskManagers | absent | gone, released with the job's slots |
+| `status` | `{}` entirely | `lifecycleState: SUSPENDED`, `jobStatus.state: FINISHED` |
+
+Suspending stops the **job**. It does not tear down the cluster. The TaskManagers
+go because the job released its slots, and the JobManager pods carry on with a
+job that has finished.
 
 **Without `spec.job` it is a session cluster**, and the deployment creates only
 the cluster. Jobs arrive later as separate `FlinkSessionJob` resources. The
@@ -96,8 +111,9 @@ because the operator is not the thing creating those pods. It is why the Phase 6
 autoscaler can change the pod count with no restart.
 
 **So `personalization-blue-rest` is created by the JobManager.** It is not in any
-manifest in this repository, and `kubectl get svc` will not show it while the
-side is suspended, because a suspended side has no JobManager to create it.
+manifest in this repository. A side that has **never run** has no Service,
+because it has no JobManager to create one. A side **suspended after running**
+keeps both, as the table above shows.
 
 **There is no internal `personalization-blue` Service.** Phase 5's doc left this
 as an open question: with `high-availability.type: kubernetes` the TaskManagers

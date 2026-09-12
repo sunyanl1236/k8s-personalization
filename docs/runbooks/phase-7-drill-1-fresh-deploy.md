@@ -231,8 +231,100 @@ now, not inherited, which is the whole benefit of having truncated.
 
 ## Observed result
 
-*To be filled in from the real run. Paste the actual output, not a summary.*
+### Steps 1 to 6, 2026-09-12
+
+**Step 2 exposed the suspend semantics, which are not what this phase assumed.**
+After `state: suspended` synced:
+
+```
+lifecycleState                                        = SUSPENDED
+jobStatus.state                                       = FINISHED
+jobStatus.savepointInfo.lastSavepoint.location        = (absent)
+jobStatus.upgradeSavepointPath                        = s3://checkpoints/phase-7/blue/savepoints/savepoint-6fc866-7cafc61b0838
+```
+
+`stop-with-savepoint` leaves Flink's own job status at **FINISHED**. `SUSPENDED`
+is the **operator's** `lifecycleState`, a different field. And the savepoint the
+operator took for the upgrade lands in `upgradeSavepointPath`, not in
+`savepointInfo.lastSavepoint`, which is for independently triggered savepoints.
+
+`scripts/promote.sh` was polling both of the wrong fields and was fixed before
+this Drill continued. See Notes.
+
+**A suspended side keeps its JobManager.** Only the TaskManagers went away:
+
+```
+deploy/personalization-blue        2/2, age 37m, 0 restarts
+svc/personalization-blue-rest      still present
+5 ConfigMaps                       still present
+TaskManagers                       3 -> 0
+```
+
+Suspending stops the **job**, not the cluster. Contrast green, which has never
+run and has nothing at all. Both are "suspended"; they are not the same state.
+
+**Step 3, sizes before truncation:**
+
+```
+clickstream      10,041,754
+product-change    1,892,833
+promo-rule          336,326
+recommendation      183,688
+```
+
+**Step 5, truncation.** `kafka-delete-records.sh` reported a new low watermark
+per partition, twelve in all:
+
+```
+clickstream-0     3,298,196      clickstream-1   3,506,966    clickstream-2   3,236,592
+product-change-0    618,389    product-change-1    644,418  product-change-2    630,026
+promo-rule-0        112,566        promo-rule-1    111,868      promo-rule-2    111,892
+recommendation-0     87,746     recommendation-1     38,236   recommendation-2     57,706
+```
+
+**Step 6, verification.** Every topic reports earliest equal to latest:
+
+```
+clickstream      earliest=10041754   latest=10041754   EMPTY
+product-change   earliest=1892833    latest=1892833    EMPTY
+promo-rule       earliest=336326     latest=336326     EMPTY
+recommendation   earliest=183688     latest=183688     EMPTY
+```
+
+Cross-checked with a real consumer rather than trusting the offsets alone:
+
+```
+recommendation records readable: 0
+clickstream records readable: 0
+```
+
+The 5,844 pre-existing duplicate identities are gone with the data.
+
+### Steps 7 to 11
+
+*Still to run.*
 
 ## Notes
 
-*Anything the run taught that this runbook did not predict.*
+**The bug this Drill found, and why a dry run could not.** `promote.sh` polled
+`status.jobStatus.state == "SUSPENDED"` and read
+`status.jobStatus.savepointInfo.lastSavepoint.location`. The real values are
+`FINISHED` and absent, so every promotion would have polled for the full
+`SUSPEND_TIMEOUT` of 300 seconds and then rolled itself back. `--dry-run` never
+polls, so it passed cleanly.
+
+Verified against blue's live suspended state before and after the fix:
+
+```
+OLD: jobStatus.state='FINISHED'  lastSavepoint.location=''       -> poll forever
+NEW: lifecycleState='SUSPENDED'  upgradeSavepointPath='s3://...' -> proceed
+```
+
+The evidence had been in the repository the whole time. Phase 6's `status.md`
+records "empty `upgradeSavepointPath` beside `RUNNING`", naming the correct
+field. The wrong names came from the original design spec's promotion runbook,
+written before Phase 5 existed.
+
+**Rule worth keeping: a dry run proves the branching, never the polling.** Any
+condition a dry run skips has to be checked against a real resource in the state
+it will actually see.
