@@ -335,9 +335,96 @@ Dry run against the truncated, both-down cluster:
 **So Drill 1 makes green the Active Side**, not blue. That is the correct
 outcome, and it sets Drill 2 up to promote in the green-to-blue direction.
 
-### Steps 7 to 11
+### A third bug, found at step 8
 
-*Still to run.*
+**`git push` with no arguments.** The script ran a bare `git push`, which needs an
+upstream. The working branch has been `phase-2` since Phase 2, and every ArgoCD
+Application uses `targetRevision: HEAD` against the repository's default branch,
+`master`. So the push failed outright:
+
+```
+fatal: The current branch phase-2 has no upstream branch.
+```
+
+The edit and the commit had already happened, leaving the repository
+**half-applied**: Git wanted green running, the cluster had not started it.
+Re-running the script aborted with a generic message.
+
+Three changes came out of it:
+
+- `git push "${REMOTE}" "HEAD:${TARGET_BRANCH}"`, with `TARGET_BRANCH=master` as
+  a named constant and a comment saying why the working branch is not it.
+- **A landed-revision check.** After pushing, the script compares
+  `git ls-remote origin master` against local `HEAD` and refuses to sync if they
+  differ. This is the trap hit twice on 2026-09-12: ArgoCD syncs the *previous*
+  revision, reports `unchanged`, and the edit appears to have done nothing. It
+  also now runs `argocd app get --refresh` first, so the poll is forced rather
+  than waited out.
+- **A diagnosis for the half-applied state**, naming the side, the likely cause,
+  and both ways out.
+
+### Steps 7 to 11, 2026-09-12
+
+**Step 8 took the fresh-deploy branch and named the right side:**
+
+```
+    side     git wants    job status   lifecycle
+    -------- ------------ ------------ ------------
+    blue     suspended    FINISHED     SUSPENDED
+    green    suspended
+
+==> FRESH DEPLOY: starting green, which has never run, with no savepoint
+```
+
+**Step 9, the transition, read from `kubectl get flinkdeployment -A -w`:**
+
+```
+personalization-green   RECONCILING   DEPLOYED
+personalization-green   CREATED       DEPLOYED
+personalization-green   RUNNING       STABLE
+```
+
+`RECONCILING` to `CREATED` to `RUNNING`, and `DEPLOYED` to `STABLE`. Two distinct
+state machines, the job's and the operator's, which is the same split that made
+the poll bug possible.
+
+**Step 10, the clean-start gate:**
+
+```
+initialSavepointPath=[]
+upgradeSavepointPath=[]
+```
+
+Both empty. Nothing was restored.
+
+**Data flowing**, generator at `--click-rate=800 --shopper-count=2000
+--product-change-rate=400`:
+
+```
+clickstream      260,603
+product-change   131,473
+promo-rule        33,235
+recommendation     1,242
+```
+
+**Zone spread on green**, confirming the selector fix carried to both sides:
+
+```
+personalization-green-78685465dd-4bt9c   jobmanager    worker2
+personalization-green-78685465dd-q8t9x   jobmanager    worker3
+personalization-green-taskmanager-1-1    taskmanager   worker2
+personalization-pdb   minAvailable 1   ALLOWED DISRUPTIONS 1
+```
+
+**Step 11, the baseline, and the gate that justifies the truncation:**
+
+```
+912 records, 912 identities
+```
+
+**Zero duplicates.** Before truncation the same command read 140,598 records
+against 134,754 identities. From here on a duplicate in a comparison is a Phase 7
+duplicate happening now, not history leaking in.
 
 ## Notes
 
@@ -363,3 +450,14 @@ written before Phase 5 existed.
 **Rule worth keeping: a dry run proves the branching, never the polling.** Any
 condition a dry run skips has to be checked against a real resource in the state
 it will actually see.
+
+**Three bugs, and none of them was in the logic the dry run exercised.** The
+field names, the side selection, and the push target were all wrong, and all
+three only surfaced against a real cluster in a real state. A dry run against a
+healthy cluster proves that discovery branches correctly and nothing else.
+
+**Two state machines, not one.** `status.jobStatus.state` is Flink's job status:
+`RECONCILING`, `CREATED`, `RUNNING`, `FINISHED`. `status.lifecycleState` is the
+operator's: `DEPLOYED`, `STABLE`, `SUSPENDED`. They move together but they are
+not the same field, and reading one where the other is meant is what caused the
+first bug.

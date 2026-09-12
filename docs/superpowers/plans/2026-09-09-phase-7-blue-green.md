@@ -64,7 +64,7 @@ constraints below rather than left as a cross-reference.
 | 3 | Blue's manifest: rename, paths, savepoint format | ✅ done, 2026-09-12 |
 | 4 | Green's directory and Application | ✅ done, 2026-09-12 |
 | 5 | `scripts/promote.sh`: discovery and promotion | ✅ done, 2026-09-12 |
-| 6 | Drill 1: fresh deploy | ⬜ |
+| 6 | Drill 1: fresh deploy | ✅ done, 2026-09-12 |
 | 7 | Drill 2: promotion under a Load Ramp | ⬜ |
 | 8 | Drill 3: promotion back | ⬜ |
 | 9 | Drill 4: break the Standby Side | ⬜ |

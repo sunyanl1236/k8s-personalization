@@ -52,6 +52,19 @@ checkpoints at a 10 second interval is thirty seconds of history.
 
 **Draft the recovery command before breaking anything.**
 
+## Snapshots cover the whole topic
+
+**Use a whole-topic snapshot, not a window.** Drill 1 truncated every topic, so
+`recommendation` holds only Phase 7 data and there is no history to exclude.
+A window opened at the moment you snapshot captures **zero records**, because the
+snapshot reads from that offset to the end of the topic. The BEFORE file would be
+empty, `compare` would report no gap and no duplicates against an empty set, and
+the Drill would pass while checking nothing. Measured 2026-09-12: window-from-now
+gave 0 records where the whole topic gave 3,262.
+
+The `since-epoch-ms` argument earns its place only once the topic again carries
+data from outside the Drill.
+
 ## Procedure
 
 **1. Preconditions.** As Drill 1 step 1. Confirm `promote.sh --recover` exists.
@@ -99,10 +112,9 @@ fails; the discovery in `--recover` skips those.
 **6. Recover.**
 
 ```bash
-BEFORE=$(( $(date +%s) * 1000 ))
-./scripts/recommendation-snapshot.sh snapshot /tmp/drill-6-before.txt "${BEFORE}"
+./scripts/recommendation-snapshot.sh snapshot /tmp/drill-6-before.txt
 ./scripts/promote.sh --recover --image <previous good tag>
-./scripts/recommendation-snapshot.sh snapshot /tmp/drill-6-after.txt "${BEFORE}"
+./scripts/recommendation-snapshot.sh snapshot /tmp/drill-6-after.txt
 ./scripts/recommendation-snapshot.sh compare /tmp/drill-6-before.txt /tmp/drill-6-after.txt
 ```
 

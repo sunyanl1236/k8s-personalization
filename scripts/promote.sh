@@ -3,7 +3,7 @@
 # Moves the Active Side from one namespace to the other, in either direction.
 #
 # Usage:
-#   ./scripts/promote.sh [--dry-run]
+#   ./scripts/promote.sh [--dry-run] [--yes]
 #
 # Per CONTEXT.md a Promotion is directionless: `blue` and `green` are namespace
 # names, not roles. This script therefore takes no --from and no --to. It reads
@@ -96,11 +96,33 @@ POLL_INTERVAL=1          # seconds. 1 and not 5: it is part of the pause a promo
 SUSPEND_TIMEOUT=300      # seconds to reach SUSPENDED with a savepoint path
 RUNNING_TIMEOUT=600      # seconds for the incoming side to reach RUNNING
 DRY_RUN=false
+ASSUME_YES=false
 
 manifest() { printf 'manifests/flink/%s/flinkdeployment.yaml' "$1"; }
 crname()   { printf 'personalization-%s' "$1"; }
 namespace(){ printf 'personalization-%s' "$1"; }
 appname()  { printf 'flink-job-%s' "$1"; }
+
+# Asked ONCE, before anything mutates, and never again.
+#
+# A promotion has two commit points, and the second sits between suspending one
+# side and starting the other. A prompt there would hold the pause open while a
+# human reads it, inflating the exact number Drill 2 exists to measure. So the
+# whole plan is shown up front and confirmed once; after that the run is
+# uninterrupted.
+#
+# Reads from /dev/tty rather than stdin, so a redirected stdin does not silently
+# answer for you.
+confirm() {
+  [[ "${ASSUME_YES}" == true ]] && return 0
+  [[ -t 0 || -e /dev/tty ]] || die "no terminal to prompt on; re-run with --yes if you mean it"
+  local reply
+  printf '\n    This will COMMIT and PUSH to %s/%s, and sync ArgoCD.\n' \
+    "${REMOTE}" "${TARGET_BRANCH}"
+  printf '    Continue? [y/N] '
+  read -r reply < /dev/tty || true
+  [[ "${reply}" == "y" || "${reply}" == "Y" ]] || die "aborted, nothing changed"
+}
 
 run() {
   if [[ "${DRY_RUN}" == true ]]; then
@@ -273,15 +295,32 @@ discover() {
   # The common cause, by a distance: an earlier run committed the state change
   # and then failed before or during the sync, so Git wants a side running that
   # the cluster has not started. Name it rather than leaving a generic message.
-  local side
+  local side unpushed
+  unpushed="$(git log --oneline "${REMOTE}/${TARGET_BRANCH}..HEAD" -- manifests/flink/ 2>/dev/null | head -3)"
   for side in "${SIDES[@]}"; do
-    if [[ "$(git_state "${side}")" == "running" && "$(live_state "${side}")" != "RUNNING" ]]; then
+    local want have
+    want="$(git_state "${side}")"
+    have="$(live_state "${side}")"
+
+    if [[ "${want}" == "running" && "${have}" != "RUNNING" ]]; then
       warn "Git wants ${side} running and the cluster has not started it."
-      warn "An earlier run probably committed and then failed to push or sync. Either finish it:"
+      warn "An earlier run committed and then failed to push or sync. Either finish it:"
       warn "  git push ${REMOTE} HEAD:${TARGET_BRANCH} && argocd app sync $(appname "${side}")"
-      warn "or undo it, and re-run this script:"
+      warn "or undo it and re-run this script:"
       warn "  git revert --no-edit HEAD"
+      [[ -n "${unpushed}" ]] && { warn "unpushed commits touching manifests/flink/:"; printf '      %s\n' "${unpushed}" >&2; }
       die "refusing to act on a half-applied change"
+    fi
+
+    if [[ "${want}" == "suspended" && "${have}" == "RUNNING" ]]; then
+      warn "Git wants ${side} suspended and the cluster is still running it."
+      warn "An earlier promotion committed its FIRST step and never reached the cluster,"
+      warn "so the suspend exists only in Git. A promotion is one operation; do not resume"
+      warn "it half way. Undo the commit and start again:"
+      warn "  git revert --no-edit HEAD"
+      warn "  ./scripts/promote.sh"
+      [[ -n "${unpushed}" ]] && { warn "unpushed commits touching manifests/flink/:"; printf '      %s\n' "${unpushed}" >&2; }
+      die "refusing to resume a half-applied promotion"
     fi
   done
 
@@ -299,6 +338,9 @@ do_fresh_deploy() {
   else
     info "RESUME: starting ${TO}, which will restore from ${recorded}"
   fi
+  printf '    plan: set %s to running, commit, push, sync %s, poll for RUNNING\n' \
+    "${TO}" "$(appname "${TO}")"
+  [[ "${DRY_RUN}" == true ]] || confirm
   warn "--start-from-earliest defaults to true, so this reads the input topics from their earliest"
   warn "retained offset. On a topic that still holds history this is a full replay; take any"
   warn "baseline snapshot AFTER catch-up rather than at start."
@@ -312,6 +354,13 @@ do_fresh_deploy() {
 
 do_promotion() {
   info "PROMOTION: ${FROM} -> ${TO}"
+  printf '    plan: 1. set %s to suspended, commit, push, sync %s\n' "${FROM}" "$(appname "${FROM}")"
+  printf '          2. poll %s for lifecycleState=SUSPENDED with an upgradeSavepointPath\n' "${FROM}"
+  printf '          3. write that path into %s, set it running, commit, push, sync %s\n' "${TO}" "$(appname "${TO}")"
+  printf '          4. poll %s for RUNNING\n' "${TO}"
+  printf '    %s stops processing at step 1 and %s resumes at step 4. That gap is the pause.\n' \
+    "${FROM}" "${TO}"
+  [[ "${DRY_RUN}" == true ]] || confirm
 
   set_job_state "${FROM}" suspended
   commit_and_sync "${FROM}" "Suspend ${FROM} for promotion to ${TO}"
@@ -364,7 +413,8 @@ main() {
   while (( $# )); do
     case "$1" in
       --dry-run) DRY_RUN=true; shift ;;
-      *) die "usage: $0 [--dry-run]" ;;
+      --yes|-y)  ASSUME_YES=true; shift ;;
+      *) die "usage: $0 [--dry-run] [--yes]" ;;
     esac
   done
 
