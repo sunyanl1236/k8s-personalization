@@ -904,6 +904,34 @@ T+~7m   window refilled, next decision possible
 than the scheduler's cooldown and the autoscaler will log a scaling decision that
 the JobManager quietly defers.
 
+### Correction: there are six, and the two missing ones govern scale-down
+
+**Found in Drill G, 2026-09-09.** The four above pace scaling **up**. Scaling
+down is governed by two more that this section originally omitted, and between
+them they explain everything Drill G observed.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `job.autoscaler.scale-down.interval` | **1 hour** | delays a scale-down decision so several can merge |
+| `job.autoscaler.scale-down.max-factor` | **0.6** | a vertex may not drop below 60% of its parallelism in one decision |
+
+- **The interval is the dominant timer, not the metrics window.** With the
+  default, stopping the load produces no scale-down for 55 minutes after the
+  window has filled. Drill G set it to `5m` to make the Drill runnable.
+- This also explains an earlier observation: between Drills E and F the job sat
+  idle for 81 minutes and came back at parallelism 1. 81 is longer than 60.
+- **The max-factor is why an idle job stopped at 3 instead of 1.** `0.6 × 6 =
+  3.6`, and the result was **3**, so the implementation floors. Shrinking happens
+  in bounded steps: 6, then `0.6 × 3 = 1.8` which floors to 1.
+- **The cap overrides the want.** An idle job needs `vertex.min-parallelism`,
+  which defaults to 1. It got 3 because that is as far as one decision may go.
+
+**Scaling down is deliberately asymmetric with scaling up**, at three separate
+points: a one-hour delay against none, a bounded step against a jump straight to
+target, and pods that leave only when one is fully emptied. Every one of those
+favours keeping capacity, because shrinking eagerly turns a traffic dip into a
+restart.
+
 With the shipped defaults this cycle runs closer to twenty minutes, which is
 unwatchable in a lab. **Set the window and the interval explicitly.** The most
 common "the autoscaler is broken" report is someone watching for ninety seconds.
@@ -1715,3 +1743,153 @@ Deployment  ──creates──>  ReplicaSet  ──creates──>  Pod
   - `template.metadata.labels` is stamped onto **pods**.
   - `template.spec.nodeSelector` searches for **nodes**. Only this one has
     anything to do with Karpenter.
+
+### Watching Karpenter in k9s
+
+The general k9s keys are in [README.md](../../README.md#inspecting-the-cluster-with-k9s).
+These are the views that matter for a provisioning Drill.
+
+- **`:nodes`** — six rows to start, all `personalization-lab-*`. A seventh named
+  `kwok-decoy-*` appears when the Decoy scales up, with an `AGE` of a few
+  seconds. k9s refreshes on its own; `ctrl-r` forces it.
+- **`:nodes node-role=decoy`** — the command prompt takes a **label selector**
+  directly, no `-l` needed. This is the sharpest check, because that label exists
+  only on nodes the NodePool creates. Empty means nothing was provisioned.
+- **`/kwok`** inside `:nodes` filters by **name** instead. Both work, but the
+  label filter is the honest test. A name could coincide; the label cannot.
+- **`<enter>` on the new node** drills into the pods running on it. Expect the
+  five Decoy pods. If that does not drill in, use `:po`, press `0`, and read the
+  `NODE` column.
+- **`:nodeclaims`** — Karpenter's receipt for the node. One row links the
+  NodePool, the instance type, the capacity type and the Node that fulfilled it.
+  `ctrl-d` on that row deletes the node with it, which is how you know Karpenter
+  owns the node rather than kind.
+- **`:nodepools`** — the policy object. Its `NODES` column counts what it
+  currently owns, so it reads 0, then 1, then 0 again.
+- **`d`** describes, **`y`** shows the YAML. On the kwok node, `y` is where the
+  node's fakeness is visible: `kubeletVersion: kwok-v0.8.0`, and `machineID`,
+  `bootID` and `osImage` all empty.
+
+Two things that mislead:
+
+- **Namespace scope is sticky.** Coming from `personalization-blue`, `:po` shows
+  the Decoy pods as `[0]` results rather than an error. Press `0` for all
+  namespaces. Nodes, NodeClaims and NodePools are cluster-scoped, so this never
+  affects those three.
+- **An empty view looks like a broken one.** Before the Decoy scales up,
+  `:nodeclaims` and `:nodes node-role=decoy` are both legitimately empty. Confirm
+  with `kubectl get nodeclaims`, which prints `No resources found` rather than
+  nothing at all.
+
+## What the Drills corrected in this document
+
+Written after Drills E to H. The sections above were drafted before the Drills
+ran, so where a Drill contradicted one, the correction is recorded rather than
+the section deleted.
+
+### `web.adaptive-scheduler.rescale-history.size` does nothing on Flink 2.2.0
+
+- Task 3 set it to `"10"` so Drill F could read a rescale record with
+  `triggerCause: UPDATE_REQUIREMENT`.
+- The endpoint is `GET /jobs/:jobid/rescales/history`, and it arrives in **Flink
+  2.3**. All four candidate paths 404 on 2.2.0.
+- The key was accepted by `--dry-run=server`, applied without complaint, and
+  **appears in `/jobmanager/config`**. It still does nothing.
+- **Lesson: a key being set proves nothing.** Flink drops unknown keys silently,
+  and a key present in the config may simply be unimplemented in that version.
+  Only behaviour is proof.
+- The substitute, used in Drills F and G: **zero entries in
+  `/jobs/:jobid/exceptions` beside a checkpoint restore proves no failover**,
+  because a rescale restores without an exception and a failover always leaves
+  one. The operator's `In-place scaling triggered` audit line names the trigger.
+
+### Effective defaults cannot be read off a running cluster
+
+- `/jobmanager/config` returns only the keys someone explicitly set, 62 on this
+  cluster. **A default that was never overridden is indistinguishable from a key
+  that does not exist.**
+- `job.autoscaler.*` keys never reach the JobManager at all; they are consumed by
+  the operator. Read them from the CR.
+- **Consequence: pin what a Drill depends on.** A pinned value appears in the
+  config, sits in Git where ArgoCD owns it, and cannot be changed by an upstream
+  default. Phase 6 ended with `scale-down.interval`, `scale-down.max-factor` and
+  `prefer-minimal-taskmanagers` pinned for exactly this reason.
+
+### A recommendation under backlog is not a steady-state recommendation
+
+- Drill E, at 800 Clicks/sec, recommended CepOperator go `2 -> 5` then `2 -> 6`.
+- Drill F, at the same rate, recommended nothing. The autoscaler had already
+  scaled **down** to 1.
+- The difference: Drill E ran on a job about 8 minutes into its life that was
+  still draining Kafka backlog on a cold JVM. Per-subtask capacity measured
+  551/sec then and about 1250/sec once warm.
+- **So Drill E measured the `catch-up.duration` term, not load.** That is why its
+  numbers would not reconcile: `850.59 ÷ 0.6` needs 3 subtasks and it asked for 5.
+- **At 800 Clicks/sec in steady state this job wants parallelism 1 to 2.** Forcing
+  a real scale-up took `--click-rate=4000 --shopper-count=10000`.
+
+### The autoscaler extrapolates capacity linearly, and on one host that fails
+
+- For CepOperator `2 -> 6` it projected capacity 2187.86 to 6992.00, which is
+  linear in parallelism.
+- Measured afterwards, 6 subtasks at 90% busy handled about 2650 Clicks/sec, so
+  full speed is roughly 2950. **2.4x short of the projection.**
+- The likely cause is host CPU: three TaskManagers with `cpu: 1` each now share
+  one machine that also runs 6 kind nodes, both JobManagers, Kafka, MinIO and the
+  generator. Reasoning from the deployment shape, not a measurement.
+- **The blind spot generalises.** Linear extrapolation holds when new subtasks
+  land on genuinely new CPU. Once the host saturates it stops holding, and busy
+  time cannot tell the difference. Same shape as the CFS-throttling warning: a
+  throttled job is not a busy job.
+
+### The autoscaler never writes to the CR
+
+- `pipeline.jobvertex-parallelism-overrides` stayed **empty** through a
+  scale-down and two scale-ups.
+- With `jobmanager.scheduler: Adaptive` the operator uses
+  `PUT /jobs/:jobid/resource-requirements` against the running JobManager. The
+  job does not restart, no pod is replaced, and the CR is untouched.
+- Its own memory lives in the `autoscaler-personalization` ConfigMap, not in Git.
+- **Consequence: `spec.job.parallelism` is still the number the job starts at.**
+  Any full restart drops it back and the autoscaler must climb again from stored
+  metrics. Phase 7's promotion restarts the job by design.
+
+### `--start-from-earliest` replays the whole topic on any stateless restart
+
+- The `recommendation` topic held 5844 duplicate `(shopperId, generatedAt)`
+  identities before Drill G began, and the count did not move during it.
+- `PipelineConfig.java:54` defaults `startFromEarliest = true`, so
+  `KafkaSources.java:17` uses `OffsetsInitializer.earliest()`. Task 3's clean
+  start was `upgradeMode: stateless`, which re-read `clickstream` from offset 0
+  and re-emitted every Recommendation.
+- Offset distance between the two copies was 2190 to 5516, never adjacent, which
+  is the signature of a whole-topic re-emission rather than a checkpoint replay.
+  `discountPercent` differs in 4712 of 4713 pairs, because `generatedAt` is a
+  deterministic window end while the enrichment state is not.
+- **Exactly-once was never violated.** It guarantees no duplicates across a
+  restore from checkpoint. It says nothing about a deliberate stateless restart
+  that rewinds the source.
+- **The gap instrument needs bounding.** `recommendation-snapshot.sh` reads the
+  whole topic, spanning three phases and at least one replay. It needs an
+  optional `kcat -o s@<ms>` start time so a Drill compares its own run.
+- **Setting `--start-from-earliest=false` is an ADR, not a fix.** Phase 4 already
+  recorded its cost: the promo-rule broadcast source would start at *latest*, so
+  a rule published before the job subscribed is never read and every discount
+  stays `0.0`. One flag, three sources, and the right answer is not obviously the
+  same for all three.
+
+### A kwok node crashes the real CNI
+
+- Drill H put 5 of 6 `kindnet` pods into `CrashLoopBackOff` on the **real** nodes
+  while a kwok node existed.
+- kube-controller-manager gives the kwok node a pod CIDR like any other node.
+  kindnet on every real node then routes to it via the node's internal IP, and
+  kwok picked an address inside worker's own pod CIDR, unreachable as a gateway.
+  `ip route add` fails `ENETUNREACH` and kindnet panics.
+- **Flink pods were unaffected**, because kindnet runs FailOpen, but the CNI
+  genuinely died. Not cosmetic.
+- Each run also consumes a `/24` permanently. Two runs took `10.244.4.0/24` and
+  `10.244.7.0/24` and never returned them.
+- **No clean fix.** `--allocate-node-cidrs` is cluster-wide in kind and the
+  provider chooses the node IP. Keep the kwok node's life short and restart
+  kindnet after.

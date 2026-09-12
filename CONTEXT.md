@@ -151,7 +151,12 @@ reactive scaling. Never promoted.
 _Avoid_: Reactive deployment, KEDA deployment
 
 **Decoy Workload**:
-A pause-image Deployment that tolerates the Karpenter NodePool taint purely to
-generate unschedulable pods. Never carries real work, because kwok nodes have no
-kubelet behind them.
+A pause-image Deployment whose only purpose is to be unschedulable, because an
+unschedulable pod is the only thing that makes Karpenter provision anything.
+Two fields do two different jobs. The `nodeSelector` on `node-role=decoy` is what
+makes it unschedulable, since no real worker carries that label. The toleration
+for `workload=flink:NoSchedule` only grants permission to land on a kwok node
+once one exists. **A toleration is permission, not attraction**: a Decoy carrying
+only the toleration schedules onto a real worker, and the Drill proves nothing.
+Never carries real work, because kwok nodes have no kubelet behind them.
 _Avoid_: Dummy pods, filler, ballast

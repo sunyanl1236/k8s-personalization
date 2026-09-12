@@ -158,6 +158,19 @@ wait_for_node_exec() {
 # every one of them is reconnected to its pinned address. No reconnect in
 # the second pass can collide with a stale holder from this run, because all
 # of them were vacated in the first pass.
+#
+# A third case, found on 2026-09-11. The external load balancer is not pinned,
+# because nothing references its IP, only its DNS name (verified: the apiserver
+# cert carries DNS:...-external-load-balancer, and every kubelet.conf reaches it
+# by name). But an unpinned container can still be handed a pinned node's
+# address on restart, and then pass 2 fails with "Address already in use". That
+# is exactly what happened: the load balancer took 172.18.0.3, worker3's
+# address, and worker3 came up with no address at all.
+#
+# So pass 1 now also evicts any unpinned container squatting on an address this
+# run intends to hand out. Those containers are reattached after pass 2, with no
+# --ip, so they take whatever is left. Pinning the load balancer would fix this
+# one collision; evicting squatters fixes the class.
 # ---------------------------------------------------------------------------
 recorded_ip_for() {
   local name="$1"
@@ -399,10 +412,32 @@ if (( ${#nodes[@]} == 0 )); then
 fi
 
 info "Checking node IPs against pinned addresses"
-to_reconnect=()
+
+# Every address this run intends to hand out, keyed by address, so a squatter
+# can be recognised by the address it is sitting on.
+declare -A pinned_by_ip=()
 for n in "${nodes[@]}"; do
-  # Skip the external load balancer: nothing else's certs reference its IP.
   [[ "$n" == *external-load-balancer ]] && continue
+  r=$(recorded_ip_for "$n")
+  [[ -n "$r" ]] && pinned_by_ip["$r"]="$n"
+done
+
+to_reconnect=()
+evicted=()
+for n in "${nodes[@]}"; do
+  # The external load balancer is never pinned, because nothing references its
+  # IP, only its DNS name. It can still be squatting on a node's pinned address,
+  # which would make the reconnect below fail with "Address already in use".
+  if [[ "$n" == *external-load-balancer ]]; then
+    current=$(current_ip_for "$n")
+    owner="${pinned_by_ip[$current]:-}"
+    if [[ -n "$current" && -n "$owner" && "$owner" != "$n" ]]; then
+      warn "${n} is holding ${current}, which is pinned to ${owner}. Evicting it."
+      d network disconnect --force "$KIND_NETWORK" "$n" >/dev/null 2>&1 || true
+      evicted+=("$n")
+    fi
+    continue
+  fi
 
   recorded=$(recorded_ip_for "$n")
   if [[ -z "$recorded" ]]; then
@@ -426,6 +461,13 @@ for n in "${to_reconnect[@]}"; do
   recorded=$(recorded_ip_for "$n")
   d network connect --ip "$recorded" "$KIND_NETWORK" "$n"
   ok "${n} reconnected at ${recorded}"
+done
+
+# Reattached last, and without --ip, so they take whatever the pinned nodes did
+# not want. Must happen before the load balancer routes are repopulated below.
+for n in "${evicted[@]}"; do
+  d network connect "$KIND_NETWORK" "$n"
+  ok "${n} reattached at $(current_ip_for "$n")"
 done
 
 mapfile -t stopped < <(d ps -a --filter "label=io.x-k8s.kind.cluster=${CLUSTER_NAME}" --filter "status=exited" --format '{{.Names}}' 2>/dev/null || true)

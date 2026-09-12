@@ -5,8 +5,11 @@
 # Usage:
 #   ./scripts/build-image.sh
 #
-# Prints the full image tag on the last line. Paste that into
-# manifests/flink/blue/flinkdeployment.yaml as spec.image.
+# Prints the full image tag on the last line. Paste that into the STANDBY
+# side's manifest, manifests/flink/<side>/flinkdeployment.yaml, as spec.image.
+# Since Phase 7 there are two sides and only one is Active at a time; a new
+# image is deployed by promoting the Standby Side onto it, never by editing the
+# Active Side in place. scripts/promote.sh discovers which side is which.
 set -euo pipefail
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

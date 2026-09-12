@@ -188,30 +188,44 @@ observable.
 
 ---
 
-## Phase 6: Autoscaling (11h)
+## Phase 6: Autoscaling (7h)
 
-Two variants, never running together
-([ADR 0005](../../adr/0005-autoscaling-two-deployment-modes.md)).
+> **Rewritten 2026-09-09, after the phase ran.** The original budgeted 11h across
+> two variants and described the Karpenter mechanism incorrectly.
 
-**6a, native (5h)**: Job Autoscaler under a Load Ramp. Backpressure drives a
-parallelism change. Requires Flink 1.18+ for in-place rescaling.
+**Scope changed.** One variant, not two. The Standalone Variant and KEDA are
+**dropped by decision**, not deferred, so 6b does not exist. See the amendment to
+[ADR 0005](../../adr/0005-autoscaling-two-deployment-modes.md). The lab loses
+external-metric-driven autoscaling, which was that ADR's stated reason for
+keeping KEDA. Nothing in Phase 7 depends on it, since
+[ADR 0006](../../adr/0006-blue-green-native-mode.md) runs blue/green native.
 
-**6b, standalone (4h)**: swap to `mode: standalone`, `scheduler-mode: reactive`.
-KEDA `ScaledObject` on Kafka consumer-group lag drives
-`spec.taskManager.replicas`. Confirm the reactive scheduler absorbs the change
-with no savepoint restart. Zone spread and the PodDisruptionBudget are not
-re-verified under this mode. That is a deliberate scope limit.
+**Native Variant (5h)**: Job Autoscaler under a Load Ramp, `mode: native`,
+adaptive scheduler. Requires Flink 1.18+ for in-place rescaling. Four Drills:
+E dry run, F scale up, G scale down, H Karpenter.
 
 **Karpenter (2h)**: real controller, kwok provider, NodePool with a
-`workload=flink:NoSchedule` taint. Flink pods must **not** tolerate it. A Decoy
-Workload of pause-image pods tolerates the taint and generates the unschedulable
-pods that drive provisioning. Routing real TaskManagers onto kwok nodes would
-mark them Running with no process behind them, and the job would hang waiting
-for slots that never register.
+`workload=flink:NoSchedule` taint. Flink pods must **not** tolerate it.
 
-**Done when**: 6a shows a parallelism change from backpressure. 6b shows a
-replica change from lag. Karpenter provisions under the Decoy Workload and
-consolidates when it is scaled down.
+**The mechanism, corrected.** The original said the Decoy "tolerates the taint
+and generates the unschedulable pods". It does not. **The `nodeSelector` on
+`node-role=decoy` is what makes the Decoy unschedulable**, because no real worker
+carries that label. The toleration only lets it land on a kwok node once one
+exists. A toleration is permission, not attraction: a Decoy with only the
+toleration schedules onto a real worker immediately, Karpenter sees nothing
+pending, and the Drill appears to run while proving nothing. Resource pressure
+cannot substitute, because every kind node advertises the whole 23.5 GiB host.
+
+Routing real TaskManagers onto kwok nodes would mark them `Running` with no
+process behind them, and the job would hang waiting for slots that never
+register.
+
+**Done when**: the Native Variant shows a parallelism change from backpressure,
+Karpenter provisions under the Decoy Workload and consolidates when it is scaled
+down, and each of the four Drills leaves a runbook carrying a real transcript.
+
+**Outcome**: all met. See
+[status.md](status.md#what-phase-7-inherits-from-phase-6) and the four runbooks.
 
 ---
 

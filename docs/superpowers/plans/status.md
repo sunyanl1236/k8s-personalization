@@ -966,7 +966,7 @@ was designed and `status.md` records what was built.
 `kcat -b localhost:30016 -L | head -5`.
 
 
-## Phase 6: Autoscaling — 🟡 in progress
+## Phase 6: Autoscaling — ✅ done
 
 Design and plan both written:
 [design](../specs/2026-09-07-autoscaling-design.md),
@@ -979,7 +979,7 @@ ahead of the Drills rather than after them.
 Standalone Variant and KEDA are **dropped by decision**, not deferred. The lab
 loses external-metric-driven autoscaling, which was ADR 0005's stated reason for
 keeping KEDA. Nothing in Phase 7 depends on it, since ADR 0006 runs blue/green on
-the Native Variant. **ADR 0005's Decision still needs amending**; its analysis
+the Native Variant. **ADR 0005's Decision was amended on 2026-09-09**; its analysis
 stays correct and is load-bearing.
 
 - ✅ Task 0: Baseline capture, 2026-09-08. Read-only, and every later gate compares
@@ -1169,7 +1169,135 @@ stays correct and is load-bearing.
   `jobmanager.adaptive-scheduler.prefer-minimal-taskmanagers` are both unpinned.
   The second is a JobManager key, so pinning it triggers a savepoint redeploy and
   resets parallelism to 2; do it between Drills, not during one.
-- ⬜ Tasks 7 to 9: Karpenter, Drill H, Documents.
+- ✅ Task 7: Karpenter installed, 2026-09-08 and 2026-09-09.
+  `bootstrap.sh karpenter` covers four stages: pin the upstream checkout at
+  `02caf5a`, install kwok `v0.8.0`, build the controller image, then CRDs plus
+  chart. **Upstream publishes no chart and no image for the kwok provider**, so
+  the chart is applied from a path inside the checkout and the image is compiled
+  in Docker (`manifests/karpenter/Dockerfile.controller`, Go 1.26.6) and
+  `kind load`ed. Neither `go` nor `make` is on the host, and neither was
+  installed.
+  NodePool `decoy` reports `NodeClassReady=True` / `Ready=True`. Both safety
+  checks pass: no real node carries `node-role=decoy`, and nothing outside
+  `karpenter-decoy` tolerates `workload=flink`.
+  **Beyond the plan:** `manifests/argocd-apps/karpenter-resources.yaml` puts the
+  hand-written CRs under ArgoCD. The controller cannot go in, because ArgoCD does
+  not build images. It carries `ignoreDifferences` on the Decoy's
+  `spec.replicas` plus `RespectIgnoreDifferences=true`, so a sync cannot reset
+  the Drill mid-run.
+  **The `karpenter-decoy` Namespace lives in `decoy.yaml`, not the script.** The
+  cost: `--dry-run=server` on that file fails with `namespaces not found`,
+  because a dry run does not create the namespace the Deployment needs.
+  **The Decoy carries resource requests the plan does not mention**, `cpu: "1"`
+  and `memory: 256Mi`. Without them Karpenter sizes a node for pods that ask for
+  nothing and `limits.cpu` is decorative.
+- ✅ Task 8: Drill H, 2026-09-09.
+  [Runbook](../../runbooks/phase-6-drill-h-karpenter.md). Two runs. **Gate
+  passes.** One kwok node appeared 5 seconds after scaling the Decoy to 5, all
+  five pods landed on it, and it went away 45 seconds after scaling to 0.
+  **`pending-pods: 5` in the controller log is the only durable proof the pods
+  were unschedulable.** The `Pending` window is about 5 seconds, since kwok
+  creates a node instantly, so watching by hand does not work.
+  **`consolidateAfter: 10s` is not a countdown to deletion.** It is how long a
+  node must sit idle before Karpenter will *consider* disruption. Observed 45s.
+  Run 1 logged `marking consolidatable` while the node was still fully loaded,
+  which is the same distinction from the other side.
+  **Karpenter bin-packs first, then asks for one node.** The NodeClaim requested
+  `cpu: 5100m, memory: 1330Mi, pods: 7`: five Decoy pods at 1 CPU, plus 100m and
+  two slots for the `kindnet` and `kube-proxy` DaemonSets that land on any new
+  node. **Seven pods on the kwok node, not five, and that is not a leak.**
+  **`limits.cpu: "20"` was never reached**, so that path is untested. It would
+  take roughly 20 replicas.
+  **`instance-type`, `capacity-type` and `zone` are invented by the kwok
+  provider** (`c-8x-amd64-linux`, `spot`, `test-zone-a`/`b`). Run 1 shows six
+  types considered. None exists, and that fabrication is what makes the loop
+  exercised here the same code that runs on EKS.
+  **The node's fakeness is visible in `kubectl get nodes`**: `kwok-v0.8.0` in the
+  `VERSION` column against `v1.34.8`. In `nodeInfo`, `bootID`, `machineID`,
+  `systemUUID` and `osImage` are all empty strings.
+  **DEFECT: a kwok node crashes kindnet on the real nodes.** 5 of 6 kindnet pods
+  went `CrashLoopBackOff` with 14 restarts each. kube-controller-manager gives
+  the kwok node a pod CIDR, kindnet on every real node tries to route to it via
+  the node's internal IP, and kwok picked `10.244.3.7`, an address inside
+  worker's own pod CIDR and unreachable as a gateway. `ip route add` fails
+  `ENETUNREACH` and kindnet panics. **Flink pods were unaffected** (`RESTARTS 0`,
+  job `RUNNING`) because kindnet runs FailOpen, but the CNI genuinely died.
+  Recovery is `kubectl -n kube-system delete pod -l app=kindnet` once the kwok
+  node is gone. **No clean fix found:** `--allocate-node-cidrs` is cluster-wide
+  in kind and the provider picks the node IP. Mitigation is to keep the kwok
+  node's life short and restart kindnet after.
+  **Each run permanently consumes a `/24`.** Workers moved from `10.244.3/4/5`
+  to `3/5/6`; runs took `.4` and `.7` and never gave them back. 256 available,
+  so not urgent, but a cluster rebuild is the only reset.
+  **Carry into Phase 7:** promotion depends on pod networking across two
+  namespaces. Do not run a Karpenter Drill and a promotion together.
+- ✅ Task 9: documents, 2026-09-09. ADR 0005's Decision superseded in place, the
+  `CONTEXT.md` Decoy Workload entry corrected to the two-mechanism version, the
+  phase plan's Phase 6 section rewritten (11h to 7h, 6b removed, the Karpenter
+  mechanism corrected), the knowledge doc given a
+  "What the Drills corrected in this document" section, and the four Drill E to H
+  runbooks added to `docs/knowledge/README.md`.
+  **The sharpest thing found while amending ADR 0005.** That ADR argues a KEDA
+  `ScaledObject` against `mode: native` is a no-op. Verified on the live cluster,
+  it is worse: the CRD **does** declare a `scale` subresource pointing at
+  `.spec.taskManager.replicas`, so `kubectl scale flinkdeployment personalization
+  --replicas=3 --dry-run=server` returns **`scaled`** against a native deployment
+  whose field is unset and never read. **Every layer reports success and the
+  number goes nowhere.**
+  **A gap the knowledge doc had:** its "Four timers" section listed only the four
+  that pace scaling *up*. `job.autoscaler.scale-down.interval` (default **1h**)
+  and `scale-down.max-factor` (default **0.6**) govern the entire scale-down half
+  and were absent. Now recorded as a correction rather than a rewrite.
+
+## What Phase 7 inherits from Phase 6
+
+Carried forward deliberately, because a later phase would otherwise rediscover
+each of these the hard way.
+
+- **Parallelism is no longer deterministic.** The Promotion runbook must not
+  assume 6, or 3 TaskManagers, or any fixed pod count. Across Phase 6 the job ran
+  at 1, 2, 3 and 6, with 1 to 3 TaskManagers, all without a restart. **Read the
+  live value.**
+- **`upgradeMode` is back to `savepoint`**, restored in Drill F's first step.
+  Promotion depends on it. It was `stateless` for one transition only.
+- **`spec.job.parallelism` is still the number the job starts at.** The
+  autoscaler writes only to the running JobManager, never to the CR, so any full
+  restart drops the job back to `2` and the autoscaler must climb again from the
+  `autoscaler-personalization` ConfigMap. **Promotion restarts the job by
+  design.**
+- **The two-config-lists rule is dead.** `apps/pipeline/conf/config.yaml` was
+  deleted in `b0705e0`; every key lives in `spec.flinkConfiguration` alone. Phase
+  7 inherits a single list and should not re-derive a drift rule for it.
+- **Karpenter sits outside the GitOps tree.** A cluster rebuild must install it by
+  hand with `scripts/bootstrap.sh karpenter`, alongside cert-manager and ArgoCD.
+  Its `nodepool.yaml` and `decoy.yaml` *are* in ArgoCD; the controller cannot be,
+  because ArgoCD does not build images.
+- **Do not run a Karpenter Drill and a promotion at the same time.** A kwok node
+  crashes `kindnet` on the real nodes, and promotion depends on pod networking
+  across two namespaces.
+- **Task 5 Step 6's probe came back EMPTY.** The autoscaler never writes
+  `pipeline.jobvertex-parallelism-overrides` to the CR, so no `ignoreDifferences`
+  is needed in `flink-job-blue.yaml` and the Application does not go permanently
+  `OutOfSync`.
+- **The generator's measured ceiling is about 2650 Clicks/sec.** Task 1 removed
+  the 1000/sec ceiling and verified 2507.9 against a requested 2500. Drill F
+  asked for 4000 and got 2648, read off the source vertex. **Always measure the
+  achieved rate rather than trusting `--click-rate`.**
+- **Raise `--shopper-count` with `--click-rate`, every time.** Session length is
+  `e^(6 × clickRate ÷ shopperCount)`. 4000 Clicks over 2000 Shoppers is `e^12`,
+  about 163,000 Clicks per Session, and the window state would exhaust the host.
+- **Host headroom is the binding constraint.** Task 0 measured it at 2.5 GiB,
+  halved since the spec was written. Drill F showed the autoscaler's linear
+  capacity projection coming in 2.4x optimistic, most likely CPU contention on a
+  single host.
+- **Open: `recommendation-snapshot.sh` reads the whole topic**, spanning three
+  phases and at least one full source replay. It needs an optional
+  `kcat -o s@<ms>` start time before its duplicate count means anything. It also
+  exits 141 (SIGPIPE) when it lists duplicates.
+- **Open: `--start-from-earliest` is an ADR, not a bug.** `true` replays the whole
+  topic on any stateless restart. `false` stops that, but Phase 4 recorded its
+  cost: the promo-rule broadcast source would miss rules published before the job
+  subscribed, leaving every discount at `0.0`.
 
 **`apps/pipeline/conf/config.yaml` does not exist, and three documents were
 corrected to say so.** Task 5 of Phase 5 deleted it in commit `b0705e0`, 15
@@ -1190,10 +1318,132 @@ rather than protection of a Drill, but Phase 7 and Phase 8 inherit the
 Application.
 
 
-## Phase 7: Blue/green and OTel — ⬜ not started
+## Phase 7: Blue/green and the deployment mechanism — ⬜ not started
 
-Reconsideration flagged, not yet designed: whether Blue/Green should also
-serve as a recovery mechanism, not just zero-downtime deployment. See the
-plan's Phase 7 section.
+Design and plan both written on 2026-09-09:
+[design](../specs/2026-09-09-blue-green-and-deployment-design.md),
+[implementation plan](2026-09-09-phase-7-blue-green.md). The plan runs 14 tasks;
+check its Progress table for the live position. A
+[knowledge doc](../../knowledge/phase-7-blue-green.md) exists already, written
+during design rather than during the phase, and says so at the top.
+
+**Scope changed from the phase plan, three ways.**
+
+- **OTel moved wholesale to Phase 8.** Its Drill needs Prometheus, node-exporter
+  and kube-state-metrics, and none of the three is installed. A Drill that shows
+  a blast-radius boundary cannot run when neither side of the boundary is
+  observable. Phase 7 is renamed accordingly.
+- **The recovery reconsideration is resolved as partially adopted.** Promotion
+  **is** the recovery path for a deployment failure, where high availability
+  makes things worse by faithfully restoring a broken jar forever. It is **not**
+  a failover mechanism for an infrastructure failure, where Phase 5's Drills
+  already recover in under a minute. The full classification lives in the
+  [Phase 5 knowledge doc](../../knowledge/phase-5-operator-and-ha.md), section
+  "Every failure this project can have".
+- **No CI.** A merge-request-triggered pipeline was designed and rejected: a
+  hosted runner cannot reach this cluster, so the runner would be self-hosted on
+  this machine either way, and CI would then add only a trigger you did not type.
+  Deployment is `scripts/promote.sh` plus six Drills.
+
+**Phase 7 touches `apps/pipeline`**, which the phase plan did not anticipate.
+Nine `.uid()` and `.name()` calls, and a new image. Budget rises from 9 hours to
+roughly 12.
+
+**Five facts were not settled at design time** and are gates inside the tasks
+that need them, with both branches written out: what `status.jobStatus.state`
+reads on a never-run FlinkDeployment, whether the `app` label carries the
+cluster-id, the REST Service name, whether
+`kubernetes.operator.savepoint.format.type` is honoured per resource, and whether
+`execution.checkpointing.num-retained` should rise from 3.
+
+**One decision is open**: amend ADR 0006, or write ADR 0010, for the
+promotion-as-recovery scope.
+
+### Tasks 0 to 5, 2026-09-10
+
+- ✅ **Task 0: Baseline capture.** Blue `RUNNING` on `0.1-0bd7f52`, parallelism 2,
+  **1 TaskManager**, 2 JobManagers on `worker3` and `worker2`, job id
+  `7a3bdfb1491018179b282896485e8fe6`, `upgradeMode: savepoint`. PDB reported
+  `ALLOWED DISRUPTIONS 1`. No kwok nodes.
+  **Host headroom has recovered**: 6 GiB available against the 2.5 GiB Phase 6
+  Task 0 measured. MinIO holds 2081 objects under `phase-3/`, `phase-5/`,
+  `phase-5-ha/`, `phase-6/`, `phase-6-ha/`, `phase-6-savepoints/`. Nothing under
+  `phase-7/` yet.
+  `mc` is **not** on the host PATH. Read the bucket from inside the tenant pod:
+  `kubectl exec -n minio-tenant personalization-pool-0-0 -- mc ...` after
+  `mc alias set` with the credentials from `scripts/minio-env.sh`.
+- ✅ **Task 1: the snapshot window.** `snapshot` gained an optional
+  `since-epoch-ms`, mapping to `kcat -o s@<ms>`.
+  **The premise was right and now has a number: 140,598 records carrying only
+  134,754 identities, so 5,844 duplicates were already present before any Phase 7
+  Drill ran.** All of them sit in the older part of the topic; a window from the
+  topic's midpoint returned 127,728 records with **zero** duplicates.
+  **The window is an OFFSET, not a timestamp filter.** `kcat -o s@` resolves the
+  timestamp to one starting offset per partition and reads everything after it.
+  Because this topic's record timestamp is `generatedAt`, an event-time value,
+  timestamps within a partition are not monotonic: asking for the midpoint
+  returned 127,728 records where a strict timestamp filter over the same data
+  returns 117,191. Harmless for a Drill, because BEFORE and AFTER share the same
+  starting offsets. Do not use it as an exact time filter.
+  **The exit 141 was real and is fixed.** `printf | head -20` on the duplicate
+  listing: `head` closes the pipe, `printf` takes SIGPIPE, `pipefail` propagates
+  141. Now a herestring. Measured before and after on the same input: **old exit
+  141, new exit 1**, where 1 correctly means "did not recover cleanly".
+  The window is recorded in a sidecar `.meta` file rather than the snapshot's
+  first line, because the snapshot is sorted and `comm` would read a header as an
+  identity. `compare` now refuses a mismatched pair outright.
+- ✅ **Task 2: uids and names.** **Eleven call sites, not the nine the plan
+  counted.** The plan's own list held ten items; the eleventh is the stateless
+  `ShopperSignal` map, pinned so that toggling `--debug-prints` adds and removes
+  print sinks without moving any other id. 27 tests pass, read from the XML
+  report. Image `lab/personalization-pipeline:0.1-0902abb` built and loaded onto
+  every node.
+- 🟡 **Task 3: blue's manifest.** All file edits done: renamed to
+  `personalization-blue`, the three storage paths split under
+  `s3://checkpoints/phase-7/blue/`, `kubernetes.operator.savepoint.format.type:
+  NATIVE` added, prefix moved to `personalization-phase-7`, image at
+  `0.1-0902abb`, PDB selector at `app: personalization-blue`,
+  `rest-nodeport.yaml` deleted, `build-image.sh`'s closing hint rewritten to name
+  the Standby Side rather than blue. **Steps 8 and 9 need a push and a sync.**
+- 🟡 **Task 4: green.** Directory and Application written.
+  `diff -r manifests/flink/blue manifests/flink/green` shows **exactly the seven
+  intended fields** and nothing else. The Application differs from blue's in
+  three lines.
+  **Gate settled: a never-run FlinkDeployment has no status at all.** Applied by
+  hand, watched 60 seconds, removed: `.status` is `{}`, and both the JOB STATUS
+  and LIFECYCLE STATE columns print blank. So discovery tests "is it RUNNING" and
+  never compares to the literal `SUSPENDED`. Zero pods, as application mode
+  requires.
+  **`minio-credentials` already exists in `personalization-green`**, 9 days old.
+  **New finding: `manifests/flink/namespaces.yaml` is owned by no Application.**
+  Both namespaces carry `kubectl.kubernetes.io/last-applied-configuration` and no
+  ArgoCD tracking id, so they were applied by hand. A cluster rebuild must apply
+  that file by hand, the same way the Karpenter controller must.
+- 🟡 **Task 5: `scripts/promote.sh`.** Written. Discovery reads both sources for
+  both sides and permits exactly three arrangements; the abort prints all four
+  cells. Suspend polls two conditions at 1 second. A suspend timeout rolls itself
+  back; a start timeout prints the manual fallback and refuses to guess.
+  **`yq` is not a dependency, against the plan's sketch.** `yq -i` reflows the
+  whole document and these manifests carry load-bearing comments. Anchored `sed`
+  instead, on the only two fields that change. Verified: after a suspend, a
+  savepoint write and a start, the whole-file diff was **exactly two lines** with
+  every comment intact, and setting the savepoint path twice leaves one line.
+  `^    state: ` is anchored to four spaces because `state.backend.type` sits at
+  the same indent under `flinkConfiguration`.
+  **Neither `argocd` nor `yq` is installed on this host.** `argocd` is required;
+  the script dies with the install URL.
+  **Step 10's dry run cannot pass until Task 3 has synced**, an ordering
+  dependency the plan did not state: discovery reads the live CR by its new name,
+  which does not exist until the rename is applied.
+
+**What is left before the Drills.** Push `phase-2` to `master`, sync
+`flink-job-blue` and `flink-job-green`, then run Task 3 Steps 8 and 9, Task 4
+Step 6, and Task 5 Step 10. The sync **destroys the running Phase 6 job**, by
+design: `metadata.name` changed, Kubernetes has no rename, and the Application
+prunes.
 
 ## Phase 8: Observability and docs — ⬜ not started
+
+Now also carries the OTel Collector, the Prometheus reporter plugin, the
+Collector-kill Drill, and the Grafana namespace grouping, all moved out of
+Phase 7. Host port 30011 is freed by Phase 7 and available here.

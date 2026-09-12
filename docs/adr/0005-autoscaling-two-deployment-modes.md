@@ -58,6 +58,35 @@ conflict. It is a no-op.
 
 ## Decision
 
+> **Superseded on 2026-09-08, and again on 2026-09-09.** The decision below is
+> kept for the record; the [Amendment](#amendment-2026-09-08) is what happened.
+> **Phase 6 maintains one manifest**, `manifests/flink/blue/flinkdeployment.yaml`.
+> The Standalone Variant was never written and KEDA was never installed. The
+> Context and Alternatives sections above and below remain correct and are cited
+> by the design spec and the Phase 6 knowledge doc.
+>
+> **A fact this ADR did not have, verified on the live cluster 2026-09-09.**
+> This ADR argues that a KEDA `ScaledObject` against a `mode: native`
+> `FlinkDeployment` is a no-op. That is true, and it understates the problem.
+> The CRD **does** declare a `scale` subresource:
+>
+> ```
+> subresources.scale:
+>   specReplicasPath:   .spec.taskManager.replicas
+>   statusReplicasPath: .status.taskManager.replicas
+>   labelSelectorPath:  .status.taskManager.labelSelector
+> ```
+>
+> So the plumbing is complete. `kubectl scale flinkdeployment personalization
+> --replicas=3 --dry-run=server` returns **`scaled`** against the live
+> `mode: native` deployment, whose `spec.taskManager.replicas` is unset and never
+> read. KEDA or an HPA would report success in exactly the same way.
+>
+> **That is more dangerous than a no-op**, because a no-op usually fails loudly
+> somewhere. Here every layer reports success and terminates in a field the
+> native code path ignores. Nothing in the CRD, the operator, or `kubectl` tells
+> you the number went nowhere.
+
 Maintain two manifests. Phase 6 splits accordingly.
 
 - `manifests/flinkdeployment-native.yaml`: `mode: native`, adaptive scheduler,

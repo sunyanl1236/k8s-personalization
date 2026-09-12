@@ -63,9 +63,9 @@ When this plan was written the job was running at parallelism 6 on image
 | 4 | Drill E: dry run under a Load Ramp | ✅ done, 2026-09-08 |
 | 5 | Drill F: enable scaling, and the overrides gate | ✅ done, 2026-09-08 |
 | 6 | Drill G: scale down | ✅ done, 2026-09-08 |
-| 7 | Karpenter: install, NodePool, Decoy Workload | not started |
-| 8 | Drill H: provision and consolidate | not started |
-| 9 | Documents | not started |
+| 7 | Karpenter: install, NodePool, Decoy Workload | ✅ done, 2026-09-09 |
+| 8 | Drill H: provision and consolidate | ✅ done, 2026-09-09 |
+| 9 | Documents | ✅ done, 2026-09-09 |
 
 Tasks 1 and 2 both live in `:generator` and depend on nothing. Task 3 needs
 neither, but Drill E needs all three. Tasks 4, 5 and 6 are strictly sequential.
@@ -74,9 +74,11 @@ Task 7 depends on nothing and can be done at any point; Task 8 needs 7.
 **Per-task measurements and the traps they exposed live in
 [status.md](status.md), not here.** This table carries position only.
 
-**Next: Task 7, Karpenter.** Tasks 3 to 6 all ran on 2026-09-08 and Drills E, F
-and G each have a runbook with a real transcript. Task 5's outstanding gap check
-was folded into Drill G and passed there. Task 7 depends on nothing above it. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
+**Phase 6 is complete.** All ten tasks done on 2026-09-08 and 2026-09-09, four
+Drills with real transcripts, and what Phase 7 inherits is listed in
+[status.md](status.md#what-phase-7-inherits-from-phase-6). **Drill H found a
+defect worth carrying forward:** a kwok node crashes `kindnet` on the real nodes,
+so a Karpenter Drill and a blue/green promotion must not run at the same time. The deployment sits at `upgradeMode: stateless` until Task 5 Step 1
 restores `savepoint`; any other spec edit in that window discards state
 silently.
 
@@ -645,7 +647,11 @@ Also check `LOAD` and `TRUE_PROCESSING_RATE` on the session window. If
 `TRUE_PROCESSING_RATE` is implausibly low, the print sinks are still chained and
 Task 3 Step 3 did not land.
 
-- [ ] **Step 4b: If nothing rises, escalate the pressure. Only then.**
+- [~] **Step 4b: If nothing rises, escalate the pressure. Only then.**
+
+> **Not needed. 2026-09-08.** `--product-change-rate=400` moved the
+> recommendation on the first attempt, so neither the 2000/sec escalation nor the
+> 0.5 CPU TaskManager was tried. Left unticked on purpose: this step never ran.
 
 `--product-change-rate` is the primary lever and it should be tried and measured
 first. If `LOAD` stays well under `job.autoscaler.target.utilization: "0.6"` on
@@ -927,7 +933,7 @@ cannot rescue it either: every node advertises 23.5 GiB that does not exist.
 | Decoy `tolerations` for `workload=flink:NoSchedule` | Lets it land once Karpenter creates a node |
 | Flink pods: neither | Can never reach a kwok node |
 
-- [ ] **Step 1: Install, outside ArgoCD, and record why.**
+- [x] **Step 1: Install, outside ArgoCD, and record why.**
 
 > **Expanded on 2026-09-08, after probing upstream at `02caf5a` (2026-09-02).**
 >
@@ -1018,7 +1024,7 @@ The Decoy Workload gets its **own** namespace, `karpenter-decoy`, created by
 this script. It is kept apart from `personalization-blue` so that no Flink
 object and no Decoy object can ever be selected by the same label query.
 
-- [ ] **Step 2: Write the NodePool and the KWOKNodeClass.**
+- [x] **Step 2: Write the NodePool and the KWOKNodeClass.**
 
 ```yaml
 apiVersion: karpenter.sh/v1
@@ -1065,7 +1071,7 @@ fake nodes.
 
 `consolidateAfter: 10s` makes Drill H's scale-down observable in seconds.
 
-- [ ] **Step 3: Write the Decoy Workload.**
+- [x] **Step 3: Write the Decoy Workload.**
 
 A `Deployment` of `registry.k8s.io/pause`, `replicas: 0` to start, carrying
 **both** the `nodeSelector` and the toleration from the table above.
@@ -1073,7 +1079,7 @@ A `Deployment` of `registry.k8s.io/pause`, `replicas: 0` to start, carrying
 `pause` is chosen because it does nothing. A pod that does nothing does not care
 that it is never really executed, which matters because a kwok node runs nothing.
 
-- [ ] **Step 4: Confirm no real node carries the label.**
+- [x] **Step 4: Confirm no real node carries the label.**
 
 ```bash
 kubectl get nodes -l node-role=decoy
@@ -1082,7 +1088,7 @@ kubectl get nodes -l node-role=decoy
 **Expected: no resources found.** If any real worker matches, the Decoy will
 schedule there and Drill H will prove nothing.
 
-- [ ] **Step 5: Confirm Flink cannot reach a kwok node.**
+- [x] **Step 5: Confirm Flink cannot reach a kwok node.**
 
 ```bash
 kubectl -n personalization-blue get pods -o json \
@@ -1111,13 +1117,13 @@ That cannot be demonstrated on one laptop with fake nodes or real ones. It prove
 the control loop, which is identical on EKS with real EC2 instances. Only the
 provider beneath it changes. Say this in the runbook.
 
-- [ ] **Step 1: Scale the Decoy Workload up.**
+- [x] **Step 1: Scale the Decoy Workload up.**
 
 ```bash
 kubectl -n karpenter-decoy scale deploy/decoy --replicas=5
 ```
 
-- [ ] **Step 2: Confirm the pods are actually unschedulable.** This is the step
+- [x] **Step 2: Confirm the pods are actually unschedulable.** This is the step
   that catches the toleration-only bug.
 
 ```bash
@@ -1129,7 +1135,7 @@ kubectl -n karpenter-decoy describe pod <one-of-them> | tail -20
 `reason=Unschedulable`.** If they are `Running` on a real worker, the
 `nodeSelector` is missing or a real node carries the label.
 
-- [ ] **Step 3: Watch Karpenter react.**
+- [x] **Step 3: Watch Karpenter react.**
 
 ```bash
 kubectl get nodeclaims -w
@@ -1139,7 +1145,7 @@ kubectl -n "$KARPENTER_NS" logs deploy/karpenter --tail=50
 
 A `NodeClaim` appears, then a `Node`. The Decoy pods then land on it.
 
-- [ ] **Step 4: Confirm the fake nodes are fake.**
+- [x] **Step 4: Confirm the fake nodes are fake.**
 
 ```bash
 kubectl get node <kwok-node> -o jsonpath='{.status.nodeInfo}{"\n"}'
@@ -1148,7 +1154,7 @@ kubectl get node <kwok-node> -o jsonpath='{.status.nodeInfo}{"\n"}'
 There is no kubelet behind it. This is worth capturing in the runbook, because it
 is the reason the Decoy exists at all.
 
-- [ ] **Step 5: Scale to zero and watch consolidation.**
+- [x] **Step 5: Scale to zero and watch consolidation.**
 
 ```bash
 kubectl -n karpenter-decoy scale deploy/decoy --replicas=0
@@ -1157,7 +1163,7 @@ kubectl get nodes -l node-role=decoy -w
 
 With `consolidateAfter: 10s` the nodes should go within seconds.
 
-- [ ] **Step 6: Confirm Flink was untouched throughout.**
+- [x] **Step 6: Confirm Flink was untouched throughout.**
 
 ```bash
 kubectl -n personalization-blue get pods -o wide
@@ -1177,7 +1183,7 @@ runbook says plainly what the Drill does and does not prove.
 
 **Goal.** Leave the record correct for Phase 7.
 
-- [ ] **Step 1: Amend ADR 0005, its Decision only.**
+- [x] **Step 1: Amend ADR 0005, its Decision only.**
 
 Its analysis stays correct and is load-bearing: the spec leans on it, and the
 Phase 6 knowledge doc cites it. Its conclusion that two manifests will be
@@ -1189,26 +1195,26 @@ mapping to `spec.taskManager.replicas`, so KEDA and an HPA can both target a
 terminates in a field the native code path never reads. That is sharper and more
 dangerous than "it is a no-op", because every layer says it worked.
 
-- [ ] **Step 2: Correct the Decoy Workload entry in `CONTEXT.md`.**
+- [x] **Step 2: Correct the Decoy Workload entry in `CONTEXT.md`.**
 
 It currently reads that the Decoy "tolerates the Karpenter NodePool taint purely
 to generate unschedulable pods". The toleration is not what generates them. The
 `nodeSelector` is. The glossary should carry the two-mechanism version.
 
-- [ ] **Step 3: Update the Phase 6 section of the phase plan.**
+- [x] **Step 3: Update the Phase 6 section of the phase plan.**
 
 `docs/superpowers/plans/2026-08-10-implementation-phases.md` still carries the
 Karpenter paragraph with the mechanism Task 7 corrects, and still budgets 4 hours
 for a 6b that is not being built.
 
-- [ ] **Step 4: Finish the knowledge doc.**
+- [x] **Step 4: Finish the knowledge doc.**
 
 `docs/knowledge/phase-6-autoscaling.md` is already drafted. Add whatever the
 Drills actually taught, particularly anything that contradicts it. The doc is
 honest about where the difficulty was, so a section that turned out wrong is
 worth more corrected than deleted.
 
-- [ ] **Step 5: Update `status.md`.**
+- [x] **Step 5: Update `status.md`.**
 
 Follow the level of detail the Phase 3, 4 and 5 sections set: not "Task 5 done",
 but what was learned and what a later phase would otherwise rediscover. Carry
@@ -1226,7 +1232,7 @@ forward at least these, which Phase 7 needs:
 - The answer to Task 5 Step 6's probe, whichever way it went.
 - The generator's **measured** rate ceiling, from Task 1.
 
-- [ ] **Step 6: Add the four runbooks to `docs/knowledge/README.md`,** alongside
+- [x] **Step 6: Add the four runbooks to `docs/knowledge/README.md`,** alongside
   the existing index entries, so they are findable without knowing their
   filenames.
 

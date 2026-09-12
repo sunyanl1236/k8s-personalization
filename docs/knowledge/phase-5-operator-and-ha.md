@@ -2111,11 +2111,28 @@ basic-session-example-rest   LoadBalancer   10.96.36.250   8081:30572/TCP
 `CLUSTER-IP: None` is what headless means. No virtual IP, and DNS returns the pod
 IPs directly. 6123 is JobManager RPC and 6124 is the blob server.
 
-**Open question for this deployment.** With `high-availability.type: kubernetes`,
-TaskManagers find the leader through the HA ConfigMap rather than through a
-Service. Whether Flink then skips the internal `personalization` Service is not
-verified for 2.2.0. Read `kubectl get svc -n personalization-blue` after Task 5
-Step 9 and record the answer here.
+**Answered on 2026-09-10, during Phase 7 Task 0. Flink skips it.**
+
+With `high-availability.type: kubernetes` the TaskManagers find the leader
+through the HA ConfigMap rather than through a Service, and Flink 2.2.0 does not
+create the internal headless Service at all. `kubectl get svc -n
+personalization-blue` returned exactly two rows:
+
+```
+NAME                              TYPE        CLUSTER-IP      PORT(S)
+personalization-flink-dashboard   NodePort    10.96.130.220   8081:30011/TCP
+personalization-rest              ClusterIP   10.96.50.69     8081/TCP
+```
+
+The first is `rest-nodeport.yaml`, hand written, and Phase 7 deletes it. The
+second is the one the JobManager creates. There is no `personalization` row, so
+the listing quoted above from the operator's development guide is a **session**
+cluster without Kubernetes HA, not this deployment's shape.
+
+One consequence worth carrying: `personalization-rest` exists only while the
+JobManager does. A suspended side has no pods, therefore no Service, so
+`kubectl port-forward` against the Standby Side has nothing to reach. That is
+expected, not a fault.
 
 ### Why `kubernetes.rest-service.exposed.type: ClusterIP`
 
@@ -3764,3 +3781,590 @@ job could not continue without.
 records do not disappear, so `comm -23 BEFORE AFTER` is structurally near-empty
 whatever happens. The duplicate check and each Drill's own specific evidence are
 what carry the result.
+
+## Nobody is told a node died. Four clocks discover it separately.
+
+### What the three Drills did not cover
+
+- Drill C drained a node. `kubectl drain` is a **Voluntary Disruption**.
+- During a drain the node stays `Ready` and reachable. The kubelet answers the
+  whole time.
+- Cordon means "no new arrivals". Drain then asks the node to hand its pods over.
+- **So none of Drills A, B or C exercised a node that simply stops answering.**
+- That is a different failure, and it is the one behind "what if a whole Zone
+  goes down".
+
+Before reading on:
+
+- Everything below is **reasoning from the documented configuration keys**.
+- **It was not run on this cluster.**
+- The numbers are stated as **defaults**, not as measurements.
+- The commands to read the real values are at the end of the section.
+
+### The one idea
+
+- **There is no death notification.** No signal, no callback, no event.
+- A stopped container just stops answering.
+- Every component discovers the same fact the same way:
+  1. It expected a message.
+  2. The message did not arrive.
+  3. After some patience, it concludes the sender is gone.
+- **That is why recovery is slow, and why the numbers differ so much.** Four
+  components each wait out their own timer for the same dead node.
+- **None of them tells the others.**
+
+```
+worker2 stops answering
+        |
+        +-- the standby JobManager notices the lease stopped moving
+        +-- the Kubernetes node controller notices the kubelet went quiet
+        +-- the leader JobManager notices a TaskManager stopped heartbeating
+        +-- the taint-based eviction controller starts a five-minute countdown
+```
+
+- The order below is the usual one, **not a guaranteed one**.
+- Each timer starts wherever in its own cycle the failure happened to land.
+- A failure just after a heartbeat waits nearly a full cycle longer than one just
+  before.
+
+### Clock 1, roughly 15 to 30 seconds: leadership moves
+
+- **Who is watching:** the standby JobManager. `spec.jobManager.replicas: 2`
+  means two pods exist and exactly one is leader.
+- **What it watches:** a lease field in the HA ConfigMap.
+- **What being leader actually is:** continuously writing a fresh timestamp into
+  that field. Nothing more.
+- **How the follower decides**, from the Flink docs:
+
+> The leader will continuously renew its lease time to indicate its existence.
+> And the followers will do a lease checking against the current time.
+> `renewTime + leaseDuration > now` means the leader is alive.
+
+- **Why this is the fastest clock:** the lease lives in etcd, on the control
+  plane. The follower never has to reach `worker2`. It reads a field that stopped
+  changing.
+- **If the leader was on a surviving node this clock never fires.** Nothing
+  happens, and the job keeps running with one fewer standby.
+
+### Clock 2, roughly 40 seconds: the node is marked `NotReady`
+
+- **Who is watching:** the node controller inside `kube-controller-manager`, on
+  the control plane.
+- **What it watches:** each kubelet posts a heartbeat by updating a `Lease`
+  object. A dead kubelet stops updating.
+- **What it does:** after `--node-monitor-grace-period` passes with no heartbeat,
+  it flips the node to `NotReady`.
+- **The surprise: this changes nothing about the pods.** Run
+  `kubectl get pods -o wide` at this moment and the pods on the dead node still
+  read `Running`.
+- **That is not a bug.** The control plane cannot tell "the pods are dead" from
+  "the pods are fine behind a network partition". Unreachable is not the same
+  fact as dead, so it reports the last thing it heard.
+- **What this costs you in practice:** `kubectl get pods` cannot tell you whether
+  a workload survived a node loss. It reports the control plane's last known
+  state, not the truth.
+
+### Clock 3, roughly 50 seconds: the job fails and restarts
+
+- **This is the clock that matters. Everything before it is bookkeeping.**
+- **Who is watching:** the leader JobManager, watching each registered
+  TaskManager.
+- **What it watches:** TaskManagers heartbeat on `heartbeat.interval`. The
+  JobManager gives up after `heartbeat.timeout` with none.
+
+What happens when it fires, in order:
+
+1. The TaskManager is marked dead and its slots are released.
+2. **The job fails.** Not the subtask. The whole job.
+3. The job restarts from the last completed checkpoint, at most
+   `execution.checkpointing.interval` old, which is `10s` here.
+4. State is restored and the Kafka sources resume from the offsets inside that
+   checkpoint.
+
+Why the whole job and not just the lost subtask:
+
+- A streaming job is one connected graph with records in flight between
+  operators.
+- A subtask that vanishes takes buffered records and part of the keyed state with
+  it.
+- There is no consistent way to patch one subtask back in, because the rest of
+  the graph has moved on.
+- **The last checkpoint is the only state everyone can agree on**, so Flink
+  rewinds every subtask to it.
+
+Where `jobmanager.scheduler: Adaptive` earns its place:
+
+- The **Default** scheduler needs the full slot count before the job can run at
+  all. It sits `RESTARTING` until a replacement TaskManager pod is scheduled,
+  started and registered. **That is minutes.**
+- **Adaptive** restarts the job at whatever parallelism the surviving slots
+  allow. Throughput drops, availability does not.
+- When the replacement TaskManager registers, the scheduler rescales back up.
+- **What you would see:** the job cycles `RESTARTING` then `RUNNING` at a lower
+  parallelism about a minute after the node died, while `kubectl` still shows a
+  `Running` pod on a `NotReady` node.
+
+### The job did not fail on the dead node. A JobManager declared it failed.
+
+- The work stopped the instant the node died. Nothing on it is computing
+  anything.
+- But **`FAILED` is a status transition, not a physical fact.**
+- Something has to perform it, and only a JobManager can. Until one does, nothing
+  restarts.
+- The thing to un-learn is that "the job" lives on the worker nodes. It does not:
+
+```
+JobGraph, and the job's authoritative status  ->  the leader JobManager,
+                                                  in memory, backed by the HA store
+the subtasks doing the actual work            ->  TaskManager slots
+```
+
+- Killing TaskManagers destroys the second row.
+- The first row is untouched, and **it is the row that owns the word `FAILED`**.
+
+Which clock performs the declaration depends on where the leader was. The
+counter-intuitive result is that **losing the leader as well is faster**:
+
+- **If the leader JobManager survived:** it holds the JobGraph and its
+  TaskManagers have gone quiet. It waits out `heartbeat.timeout`, declares the
+  job `FAILED`, and restarts from the checkpoint. That is clock 3, about 50
+  seconds.
+- **If the leader JobManager died too:** clock 1 fires first, at 15 to 30
+  seconds. The standby takes leadership, reads the JobGraph and the checkpoint
+  pointer out of the HA store, and starts the job. **It never reaches clock 3**,
+  because it has no previously registered TaskManager to time out. This is the
+  Drill B path recorded above: job id unchanged, `leaderTransitions` +1, and
+  `Job ... was recovered successfully` in 15 seconds.
+- Either way the restart lands on the **surviving** slots at reduced parallelism,
+  because `jobmanager.scheduler: Adaptive`.
+
+**The new leader adopts the survivors.** It does not start a fresh set of
+TaskManagers and abandon the old ones.
+
+- A TaskManager does not hold a fixed JobManager address.
+- It watches the HA ConfigMap for whoever currently holds the lease.
+- When leadership moves, the TaskManagers still alive see the new address and
+  reconnect on their own.
+- **Drill B is the direct evidence:** leader JobManager killed, and the
+  TaskManager pods survived with 0 restarts and were re-adopted. No new pods were
+  created for them.
+
+So after a node death the new leader ends up with:
+
+```
+TaskManagers on surviving nodes  ->  reconnect, re-adopted, keep their slots
+TaskManagers on the dead node    ->  gone, their slots are missing
+                                     ->  the ResourceManager requests
+                                         replacement pods for the shortfall
+```
+
+- It restarts the job from the checkpoint on whatever slots it has, at reduced
+  parallelism, and rescales up when the replacements register.
+
+### Clock 4, roughly 5 minutes 40 seconds: the dead pods are cleaned up
+
+This clock is about **taints**, and the mechanism is not obvious. Start away from
+Kubernetes.
+
+A building's alarm reports a possible gas leak:
+
+- **The notice on the door** says nobody should be inside.
+- **Everyone already inside holds a five-minute pass** for that specific notice.
+  A timed pass, not a permanent exemption.
+- After five minutes the passes expire, the notice applies to everyone, and
+  security clears the building.
+- **Why not clear it at once?** Most gas alarms are false. Evacuating on every
+  twitch of a sensor costs more than waiting five minutes to find out.
+
+Mapping each piece back:
+
+- **The notice on the door is a taint.** A mark on a node meaning "do not put
+  pods here". Phase 6 uses this deliberately: the Karpenter NodePool carries
+  `workload=flink:NoSchedule`, Flink pods do **not** tolerate it, and the Decoy
+  Workload does.
+- **A notice that also clears the building is the `NoExecute` effect.** A
+  `NoSchedule` taint only blocks new arrivals. `NoExecute` also removes pods
+  already there. When the node controller marks a node `NotReady`, it adds
+  `node.kubernetes.io/unreachable` with the `NoExecute` effect.
+- **The five-minute pass is a toleration carrying `tolerationSeconds`.** Read the
+  default as "I will put up with my node being unreachable for 300 seconds, and
+  then you may evict me."
+- **Nobody in this repo issued that pass.** Kubernetes writes it onto every pod
+  automatically. Nothing in `manifests/` mentions tolerations.
+
+The sequence:
+
+```
+node marked NotReady
+  -> taint node.kubernetes.io/unreachable:NoExecute added to the node
+  -> every pod on it holds a 300-second pass for that taint
+  -> 300 seconds elapse, the pass expires, the taint now applies
+  -> the pods are deleted
+  -> their owners (a Deployment, or the Flink operator) create replacements
+     somewhere else
+```
+
+- **Why it does not matter to Flink.** Clock 3 gave up on that TaskManager after
+  about 50 seconds and the job already recovered. Clock 4 only removes the
+  corpse.
+- **Where it does matter: `ReadWriteOnce` volumes.** A PVC cannot attach to a new
+  pod while the old pod still holds the claim. Any workload with such a volume
+  waits the full five minutes before its replacement can even start. On this
+  cluster that workload is MinIO.
+
+### What happens if the dead node comes back
+
+Two outcomes, and the 300 seconds of clock 4 is the dividing line.
+
+- **After 300 seconds:** clock 4 already deleted the pod objects. When the
+  kubelet rejoins and reports what it is running, the API server tells it those
+  pods no longer exist, and it kills the containers. Nothing survives to cause
+  trouble.
+- **Before 300 seconds:** clock 4 never fired. The pods were never deleted, the
+  containers ran the whole time, and they simply resume.
+
+On the returning JobManager:
+
+- **Leadership is a lease, not an identity.** Nothing about that pod was "the
+  leader" except that it was writing timestamps into a ConfigMap field.
+- It stopped writing, another pod started, and that is the whole transfer.
+- The returning pod tries to renew, finds a different holder, and becomes a
+  follower. Nothing crashes.
+- The cluster is back to its normal shape: two JobManager pods, one holding the
+  lease, one waiting.
+- **You never end up with three.** Before 300 seconds no replacement was ever
+  created; after 300 seconds the returning kubelet is told to kill its
+  containers. The two branches cannot both happen.
+
+**Three independent fences** protect the seconds before the returning process
+notices it has been deposed. They sit at three layers, and each catches an escape
+the others cannot:
+
+1. **Control layer: the leader lease.** Catches an old JobManager that still
+   believes it leads. It tries to renew, finds a different holder, steps down and
+   becomes a follower. It does not crash. **No split brain**, because the lease
+   has exactly one authoritative copy and it lives in etcd on the control plane,
+   which survived.
+2. **RPC layer: Flink's fencing token.** Catches an old JobManager issuing
+   orders. Every RPC between JobManager, ResourceManager and TaskManagers carries
+   the leader session id. The returning JobManager's token is stale, so
+   TaskManagers reject its messages rather than obeying them.
+3. **Data layer: the Kafka producer epoch.** Catches an old sink committing
+   output. When the restarted job's sink claimed
+   `personalization-phase-7-0-N`, Kafka bumped that transactional id's epoch. A
+   returning TaskManager trying to commit its old transaction under the same id
+   is rejected with `ProducerFenced`, so the records never become visible.
+   **This is why blue and green share one `--transactional-id-prefix`.**
+
+On the returning TaskManagers:
+
+- They are harmless.
+- They register with whoever leads now.
+- Their old task assignments are cancelled.
+- They come back as free slots, and the Adaptive scheduler rescales the job up to
+  use them.
+
+### The two numbers that matter, and the mistake to avoid
+
+- **The Flink job recovers in about 1 minute.** Clock 3, checkpoint restore,
+  Adaptive scheduler.
+- **The Kubernetes pod objects are tidied up at about 6 minutes.** Clock 4, the
+  300-second toleration.
+- **The mistake is reading the second number as the recovery time.** The job was
+  producing Recommendations again five minutes before Kubernetes finished tidying
+  up.
+
+### The keys, their owners, and where to read them
+
+Flink's own keys:
+
+- `high-availability.kubernetes.leader-election.lease-duration`, default in the
+  docs, see
+  [Flink HA config](https://nightlies.apache.org/flink/flink-docs-release-2.2/docs/deployment/config/#high-availability-kubernetes-leader-election)
+- `high-availability.kubernetes.leader-election.renew-deadline`, same page
+- `heartbeat.timeout`, default **50000 ms**, see
+  [Flink heartbeat config](https://nightlies.apache.org/flink/flink-docs-release-2.2/docs/deployment/config/#heartbeat-timeout)
+- `heartbeat.interval`, default **10000 ms**, same page
+
+Kubernetes' keys, owned by different components:
+
+- `--node-monitor-grace-period`, owned by `kube-controller-manager`, historically
+  **40s**, see
+  [kube-controller-manager flags](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-controller-manager/)
+- `--default-unreachable-toleration-seconds`, owned by `kube-apiserver`, default
+  **300**, see
+  [kube-apiserver flags](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/)
+- taint-based eviction behaviour itself, see
+  [Taint-based evictions](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/#taint-based-evictions)
+
+**None of those numeric defaults were read off this cluster.** To read the real
+values instead of trusting the list:
+
+```bash
+# Flink's effective config, as the JobManager resolved it
+kubectl logs -n personalization-blue -l component=jobmanager --tail=-1 \
+  | grep -E 'heartbeat\.(timeout|interval)|leader-election'
+
+# the control-plane flags kind actually passed
+kubectl -n kube-system get pod -l component=kube-controller-manager \
+  -o jsonpath='{.items[0].spec.containers[0].command}' | tr ',' '\n' | grep node-monitor
+kubectl -n kube-system get pod -l component=kube-apiserver \
+  -o jsonpath='{.items[0].spec.containers[0].command}' | tr ',' '\n' | grep toleration
+
+# the automatic tolerations Kubernetes added to a running pod
+kubectl get pod -n personalization-blue -l component=taskmanager \
+  -o jsonpath='{.items[0].spec.tolerations}'
+```
+
+- **That last command is the cheapest way to make clock 4 concrete.** The
+  `tolerationSeconds` in the output is the countdown, written onto the pod by
+  Kubernetes rather than by anything in this repo.
+
+## Every failure this project can have, and how each one is recovered
+
+- This section spans Phases 5 and 7.
+- It lives in the Phase 5 document because every mechanism it depends on is
+  explained above.
+- The Phase 7 spec points here rather than repeating it.
+
+### How to read it
+
+There are two families, and telling them apart is the whole skill.
+
+**An infrastructure failure** means something in the cluster broke while the
+deployment itself is correct.
+
+- The job is fine. Its surroundings are not.
+- Flink's own high availability handles all of these, in under a minute.
+
+**A deployment failure** means the deployment itself is the problem.
+
+- The job is what is wrong.
+- **High availability makes this worse, not better**, because it faithfully
+  restores the broken thing, and does so forever.
+
+Why the distinction matters:
+
+- Reaching for the wrong family is the mistake this section exists to prevent.
+- **Promotion** is slow, needs a healthy side to snapshot, and buys nothing
+  against an infrastructure failure.
+- **Checkpoint restore** is fast, automatic, and buys nothing against a
+  deployment failure.
+
+### Family one: infrastructure failures
+
+**1. A TaskManager pod dies.**
+
+- The leader JobManager stops receiving heartbeats, fails the job, and restarts
+  it from the last completed checkpoint on the surviving slots.
+- At `execution.checkpointing.interval: 10s` that checkpoint is at most ten
+  seconds old.
+- Nothing is lost and nothing is duplicated, because committed output and
+  completed checkpoints advance together.
+- **Phase 5 Drill A observed 15 seconds, twice.**
+- **Promotion was considered and rejected here.** It is slower, it needs the
+  Active Side still healthy enough to take a savepoint, and the thing it fixes,
+  a wrong deployment, is not what broke.
+
+**2. The leader JobManager dies.**
+
+- The standby notices the lease stopped moving and takes leadership.
+- It recovers the JobGraph and the checkpoint pointer from the HA store, then
+  restarts the job.
+- The TaskManager pods survive untouched and are re-adopted.
+- **Phase 5 Drill B observed 15 seconds, with the job id unchanged.**
+- **A single JobManager plus a Kubernetes restart was considered and rejected.**
+  It works, but the replacement has to start a JVM, read the HA store and
+  re-acquire every TaskManager, which is minutes rather than seconds.
+  `spec.jobManager.replicas: 2` buys the difference for the cost of one idle pod.
+
+**3. A node is drained.**
+
+- This is a Voluntary Disruption, so the eviction API consults every
+  PodDisruptionBudget.
+- With `minAvailable: 1` and two JobManagers the budget has slack, permits one
+  eviction, and the replacement schedules, because two replicas across three
+  Zones always leave a spare Zone.
+- TaskManagers carry no budget and are evicted at once, which fails the job and
+  restarts it from a checkpoint.
+- **Phase 5 Drill C observed the job staying `RUNNING` throughout**, because only
+  one of six slots moved.
+- **Raising `minAvailable` to 2 was considered and rejected.** It would refuse
+  the eviction outright, which reads as stronger protection but blocks the drain
+  entirely and teaches nothing about how a budget negotiates.
+
+**4. A node stops answering.**
+
+- Four separate clocks discover it independently, as described above.
+- The job recovers in about a minute, through clock 3.
+- Kubernetes finishes tidying up at about six minutes, through clock 4.
+- **Those are different numbers measuring different things.**
+- **One hard exception on this cluster.** If the dead node held the MinIO pod,
+  nothing recovers at all: `servers: 1` plus local-path PVCs mean MinIO cannot be
+  rescheduled, and the checkpoint store is simply unreachable. Flink restarts,
+  fails to read its checkpoint, and crash-loops until the node returns.
+- **Making MinIO survivable was considered and rejected for this lab.**
+  Distributed mode needs `servers: 2` or more, which needs real distributed
+  storage underneath, which a single-host `kind` cluster cannot provide honestly.
+  Recording the limit is worth more than pretending past it.
+
+**5. ArgoCD drift.**
+
+- Somebody patched a live object and Git disagrees.
+- Recovery is a manual sync, which reapplies what Git says.
+- `selfHeal: false` is deliberate, set in Phase 0 for this Phase 5 reason:
+  automatic healing would erase the drift before it could be observed.
+
+**6. A Zone burns down.**
+
+- **Not recoverable, and not claimable.**
+- `CONTEXT.md` defines a Zone as simulated. Every node is a container on one
+  host, so the Zone label drives real scheduling decisions but is not a real
+  failure domain.
+- Real Zone failover works because state lives **outside** the failure domain:
+  object storage is regional, and Kafka replicas span Zones through
+  `broker.rack`.
+- This cluster has neither, and cannot.
+
+### Family two: deployment failures
+
+- Every one of these is recovered by a **promotion**.
+- They differ only in **where the state comes from**.
+- The image always rolls back to the previous one.
+- **The state does not roll back with it unless it has to.**
+
+**1. The new image crash-loops.**
+
+- The job never reaches `RUNNING`, so it cannot take a savepoint.
+- Recovery uses the newest **retained checkpoint** of the failed side.
+- `externalized-checkpoint-retention: RETAIN_ON_CANCELLATION` keeps checkpoints
+  after the job dies.
+- `initialSavepointPath` accepts a retained checkpoint directory, not only a
+  savepoint.
+- Find the highest `chk-N` carrying a `_metadata` file, point the other side at it
+  with the previous image.
+- **No Recommendation is duplicated**, because the restart resumes from offsets
+  that match the last committed transaction exactly.
+- **The limit worth knowing:** `execution.checkpointing.num-retained: "3"`. At a
+  ten second interval that is thirty seconds of history. Notice the failure later
+  than that and this path is gone.
+
+**2. The new image runs but produces wrong Recommendations.**
+
+- The job is healthy, so it can take a savepoint.
+- This is an ordinary promotion pointed at the previous image.
+- **No duplicates.**
+- **What it does not do is un-publish.** Every wrong Recommendation already
+  committed stays in the topic forever. Rollback stops the bleeding; it does not
+  undo it.
+
+**3. HA metadata is corrupt and the JobManager will not start.**
+
+- Corrupt HA metadata and corrupt checkpoints are **different things**.
+- The HA store holds the JobGraph and the pointers. The checkpoints are separate
+  objects under a separate prefix.
+- Losing the first usually leaves the second intact.
+- So this recovers the same way as a crash loop: newest retained checkpoint,
+  previous image, **no duplicates**.
+
+**4. HA metadata and the checkpoints are both gone.**
+
+- Nothing newer than the last promotion survives.
+- Recovery falls back to the savepoint sitting in the Standby Side's manifest.
+- **This is the only case where that savepoint is the right answer.**
+- It duplicates every Recommendation the failed side produced since it became
+  Active.
+
+**5. The new image wrote poison into the state.**
+
+- The newest snapshot is **useless** here, because it contains the poison and the
+  old image will restore it faithfully.
+- Recovery needs an older savepoint from before the bug.
+- It duplicates everything in between.
+
+### The one rule underneath all five
+
+- Exactly-once ties committed output to completed snapshots.
+- Records written after a snapshot sit in a transaction that was pre-committed
+  and never committed, so they were never visible to a `read_committed` consumer.
+- Reprocessing them emits them for the **first** time.
+
+So:
+
+- **Restoring the newest snapshot of the failed job produces no duplicates and no
+  gap.**
+- **Restoring any older snapshot duplicates everything in between.**
+- Those duplicates are indistinguishable from the originals, because a
+  Recommendation Identity is `(shopperId, generatedAt)` and `generatedAt` is an
+  event-time window end that a replay reproduces exactly.
+
+Which gives the recovery order, always:
+
+1. A freshly taken savepoint, if the job can still take one.
+2. The newest retained checkpoint, if it cannot.
+3. An older snapshot, only when nothing newer survived.
+
+### Alternatives considered for the scheme as a whole, and why each was rejected
+
+**1. Always fall back to the last promotion's savepoint, for every case.**
+
+- Tempting, because that path is already in the Standby Side's manifest in Git
+  and needs no discovery at all.
+- **Rejected:** that savepoint is as old as the Active Side's uptime.
+- Six hours of uptime at the drill rates is roughly **1.1 million duplicate
+  Recommendations**, against zero for the newest checkpoint.
+- It converts a clean recovery into a very large mess in exchange for skipping
+  one `mc ls`.
+- It stays in the scheme as the floor, never as the default.
+
+**2. Replay into a fresh topic instead of accepting duplicates.**
+
+- Restore the older savepoint writing to `recommendation-v2`, let it catch up,
+  switch consumers, delete the old topic.
+- **Rejected:** it only fixes the stored log. Any consumer that already read the
+  duplicated range has already been served both copies.
+- It solves the smaller half of the problem and adds a topic per replay.
+
+**3. Compact the `recommendation` topic so duplicates collapse.**
+
+Rejected on three counts:
+
+- The record key today is `shopperId`. Compacting on that keeps only the newest
+  Recommendation per Shopper and deletes the history, **which is the opposite of
+  the goal**.
+- Making it work would need the key to become `shopperId` plus `generatedAt`,
+  which scatters one Shopper's Recommendations across all three partitions and
+  destroys per-Shopper ordering.
+- **Compaction is asynchronous garbage collection, not deduplication.** It runs
+  on closed segments subject to `min.cleanable.dirty.ratio`, so duplicates stay
+  visible for an unbounded window and live consumers never benefit at all.
+
+**4. Have the Standby Side retain a "last known good" savepoint of its own.**
+
+- **Rejected:** it makes the Standby Side hold state the next recovery depends
+  on, which contradicts its definition in `CONTEXT.md`.
+- It also adds a stale snapshot that is attractive to reach for and almost always
+  the wrong choice.
+- The newest snapshot of the failed side is nearly always available and nearly
+  always better.
+
+**5. Use `--allowNonRestoredState` to get past a failed restore.**
+
+- **Rejected in the forward direction.** When a topology change shifts operator
+  ids, the flag makes the job start by silently discarding every piece of state
+  it could not place: open Browsing Sessions, partial CEP matches, join buffers,
+  and the Kafka offsets.
+- The job then reports `RUNNING` and looks healthy.
+- **That is a stateless restart wearing a costume, and worse than an honest
+  failure.**
+- **Accepted in one narrow direction only.** Rolling *back* to an image whose job
+  graph lacks an operator the newer one added, the unplaceable state genuinely
+  belongs to an operator that does not exist in the target graph, so nothing is
+  lost that anything wanted.
+
+**6. Use blue/green as a failover mechanism for infrastructure failures.**
+
+- **Rejected.** Every failure in family one is already handled in under a minute
+  by mechanisms that need no human and no second namespace.
+- Promotion is slower, needs a healthy side to snapshot, and fixes a category of
+  problem that has not occurred.

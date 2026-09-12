@@ -72,16 +72,32 @@ Credentials are never written into this file, only how to fetch them.
 The dashboard is the JobManager's own web server. It ships no authentication,
 so there is no credential to fetch.
 
-1. Open http://localhost:30011
-2. Open **Running Jobs**, then the job. Its name is set in the job code, not
-   in the FlinkDeployment.
+Reach it with `kubectl port-forward`.
 
-If port 30011 does not answer, forward the operator's own ClusterIP Service
-instead. Leave it running, then use http://localhost:8081:
+**1. Find the Active Side.** Only one side has pods; the Standby Side is
+suspended and has none.
 
 ```bash
-kubectl port-forward svc/personalization-rest -n personalization-blue 8081:8081
+kubectl get flinkdeployment -A
 ```
+
+The side reporting `RUNNING` is the Active Side.
+
+**2. Forward that side's REST Service.** Leave it running in its own terminal.
+
+```bash
+# blue or green
+kubectl port-forward -n personalization-blue svc/personalization-blue-rest 8081:8081
+```
+
+The Service is named `<metadata.name>-rest`. Confirm with
+`kubectl get svc -n personalization-<side>` rather than guessing.
+
+**3. Open <http://localhost:8081>**, then **Running Jobs**, then the job. Its
+name is set in the job code, not in the FlinkDeployment.
+
+To watch a promotion, forward both sides at once on different local ports, for
+example `8081:8081` and `8082:8081`.
 
 ### MinIO S3 API
 

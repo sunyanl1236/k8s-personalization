@@ -1,0 +1,28 @@
+# The Standby Side's Application. Identical to flink-job-blue.yaml apart from
+# the name, the path, and the destination namespace.
+#
+# selfHeal stays false, per ADR 0004 and the Phase 5 drift Drill. prune stays
+# true, because Phase 7 renamed metadata.name and Kubernetes has no rename: a
+# name change is a delete plus a create, and without prune the old object would
+# be orphaned.
+#
+# Which side is Active is NOT recorded here. It lives in each side's
+# spec.job.state, and scripts/promote.sh discovers it by reading both sides.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flink-job-green
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sunyanl1236/k8s-personalization
+    targetRevision: HEAD
+    path: manifests/flink/green
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: personalization-green
+  syncPolicy:
+    automated:
+      selfHeal: false
+      prune: true

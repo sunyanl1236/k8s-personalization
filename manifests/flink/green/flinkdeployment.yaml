@@ -4,8 +4,8 @@ metadata:
   # name becomes kubernetes.cluster-id, which Flink stamps on every object it
   # creates for this cluster, including the `app` label on the pods. pdb.yaml
   # selects on that label, so the two files change together.
-  name: personalization-blue
-  namespace: personalization-blue
+  name: personalization-green
+  namespace: personalization-green
 spec:
   image: lab/personalization-pipeline:0.1-0902abb
   imagePullPolicy: IfNotPresent
@@ -29,10 +29,10 @@ spec:
     # One bucket, three disjoint prefixes per side. The rename alone would
     # separate only storageDir, which appends the cluster id; the checkpoint dir
     # appends the JOB id instead, so it needs its own prefix.
-    execution.checkpointing.dir: s3://checkpoints/phase-7/blue/checkpoints
+    execution.checkpointing.dir: s3://checkpoints/phase-7/green/checkpoints
     high-availability.type: kubernetes
-    high-availability.storageDir: s3://checkpoints/phase-7/blue/ha #  the JobGraph and pointers. The ConfigMap holds only a pointer to this
-    execution.checkpointing.savepoint-dir: s3://checkpoints/phase-7/blue/savepoints
+    high-availability.storageDir: s3://checkpoints/phase-7/green/ha #  the JobGraph and pointers. The ConfigMap holds only a pointer to this
+    execution.checkpointing.savepoint-dir: s3://checkpoints/phase-7/green/savepoints
     # NATIVE writes RocksDB's own format. CANONICAL, the default, rewrites all
     # state into a backend-independent form and pays that cost twice, once
     # writing the savepoint and once restoring it. Both sides run rocksdb from
@@ -127,7 +127,7 @@ spec:
     jarURI: local:///opt/flink/usrlib/pipeline.jar
     parallelism: 2
     upgradeMode: savepoint
-    state: running
+    state: suspended
     args:
       - "--bootstrap-servers=personalization-kafka-bootstrap.kafka.svc.cluster.local:9092"
       - "--debug-prints=false"

@@ -31,7 +31,12 @@ nodes:
   - containerPort: 30010
     hostPort: 30010
     protocol: TCP
-  # Flink
+  # Flink. FREE since Phase 7. Both sides' rest-nodeport.yaml were deleted,
+  # because a nodePort is allocated cluster-wide rather than per namespace, so
+  # personalization-blue and personalization-green cannot both claim 30011, and
+  # giving it to one side would make that side permanently special. Reach either
+  # dashboard with kubectl port-forward instead; see README "Flink UI".
+  # Phase 8 may take this port.
   - containerPort: 30011
     hostPort: 30011
     protocol: TCP
