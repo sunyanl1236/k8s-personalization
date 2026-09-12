@@ -85,6 +85,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 SIDES=(blue green)
+REMOTE=origin
+# The branch ArgoCD watches. Every Application uses targetRevision: HEAD against
+# this repository, which resolves to its default branch. The local working branch
+# is NOT that branch (it has been `phase-2` since Phase 2), so a bare `git push`
+# either fails for want of an upstream or pushes somewhere ArgoCD never reads.
+# Always push HEAD explicitly at the branch ArgoCD watches.
+TARGET_BRANCH=master
 POLL_INTERVAL=1          # seconds. 1 and not 5: it is part of the pause a promotion costs
 SUSPEND_TIMEOUT=300      # seconds to reach SUSPENDED with a savepoint path
 RUNNING_TIMEOUT=600      # seconds for the incoming side to reach RUNNING
@@ -150,9 +157,27 @@ commit_and_sync() { # side, message
   local side="$1" message="$2"
   run git add "$(manifest "${side}")"
   run git commit -m "${message}"
-  run git push
-  # ArgoCD polls Git every 3 minutes on its own. Asking directly turns that into
-  # seconds, and the wait is part of the pause a promotion costs.
+  run git push "${REMOTE}" "HEAD:${TARGET_BRANCH}"
+
+  if [[ "${DRY_RUN}" == true ]]; then
+    printf '    would verify %s/%s matches HEAD, then sync %s\n' \
+      "${REMOTE}" "${TARGET_BRANCH}" "$(appname "${side}")"
+    return 0
+  fi
+
+  # Confirm the push actually landed on the branch ArgoCD reads. Without this the
+  # sync below succeeds against the PREVIOUS revision and reports "unchanged",
+  # which looks like the edit did nothing. Observed twice on 2026-09-12.
+  local local_sha remote_sha
+  local_sha="$(git rev-parse HEAD)"
+  remote_sha="$(git ls-remote "${REMOTE}" "${TARGET_BRANCH}" | cut -f1)"
+  [[ "${local_sha}" == "${remote_sha}" ]] \
+    || die "${REMOTE}/${TARGET_BRANCH} is at ${remote_sha:0:7}, not ${local_sha:0:7}. The push did not land, so a sync would apply the wrong revision."
+
+  # ArgoCD polls Git every 3 minutes on its own, and reports Synced against the
+  # revision it last looked at rather than against the remote. --refresh forces
+  # the poll; without it the sync can be a no-op.
+  run argocd app get "$(appname "${side}")" --refresh >/dev/null
   run argocd app sync "$(appname "${side}")"
 }
 
@@ -244,6 +269,22 @@ discover() {
   if (( ${#active[@]} == 2 )); then
     die "BOTH sides are Active. Every Click is being processed twice. Do not promote; suspend one side through Git first."
   fi
+
+  # The common cause, by a distance: an earlier run committed the state change
+  # and then failed before or during the sync, so Git wants a side running that
+  # the cluster has not started. Name it rather than leaving a generic message.
+  local side
+  for side in "${SIDES[@]}"; do
+    if [[ "$(git_state "${side}")" == "running" && "$(live_state "${side}")" != "RUNNING" ]]; then
+      warn "Git wants ${side} running and the cluster has not started it."
+      warn "An earlier run probably committed and then failed to push or sync. Either finish it:"
+      warn "  git push ${REMOTE} HEAD:${TARGET_BRANCH} && argocd app sync $(appname "${side}")"
+      warn "or undo it, and re-run this script:"
+      warn "  git revert --no-edit HEAD"
+      die "refusing to act on a half-applied change"
+    fi
+  done
+
   die "neither a clean fresh deploy nor a clean promotion. Git and the cluster disagree on at least one side; reconcile them before promoting."
 }
 
@@ -307,7 +348,8 @@ do_promotion() {
     warn "To mitigate now, resume ${FROM} from its own pre-promotion savepoint:"
     warn "  git revert --no-edit HEAD          # undo the promote commit"
     warn "  sed -i '0,/^    state: .*/s//    state: running/' $(manifest "${FROM}")"
-    warn "  git commit -am 'Resume ${FROM} after failed promotion' && git push"
+    warn "  git commit -am 'Resume ${FROM} after failed promotion'"
+    warn "  git push ${REMOTE} HEAD:${TARGET_BRANCH}"
     warn "  argocd app sync $(appname "${FROM}")"
     warn ""
     warn "Then debug ${TO} separately. Its savepoint path is still in Git."
