@@ -112,7 +112,7 @@ spec:
     jarURI: local:///opt/flink/usrlib/pipeline.jar
     parallelism: 2
     upgradeMode: savepoint
-    state: running
+    state: suspended
     args:
       - "--bootstrap-servers=personalization-kafka-bootstrap.kafka.svc.cluster.local:9092"
       - "--debug-prints=false"
