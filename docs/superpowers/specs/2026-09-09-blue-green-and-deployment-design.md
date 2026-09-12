@@ -62,15 +62,31 @@ check. The rename costs those two things and buys structural distinctness: the
 isolation survives even if someone later collapses the storage paths back
 together.
 
-**Consequence that is easy to miss.** The `app` label changes per side, so both
-supporting manifests need per-side selectors:
+**Consequence that is easy to miss.** The `app` label changes per side, so
+**three** selectors need per-side values, not one. This spec originally listed
+only the first, and the omission was caught in execution on 2026-09-12 after both
+JobManagers landed in one Zone:
 
-- `manifests/flink/<side>/pdb.yaml` selector becomes `app: personalization-<side>`
+- `manifests/flink/<side>/pdb.yaml`, the PodDisruptionBudget selector
+- `manifests/flink/<side>/flinkdeployment.yaml`, the **jobManager**
+  `topologySpreadConstraints.labelSelector`
+- `manifests/flink/<side>/flinkdeployment.yaml`, the **taskManager**
+  `topologySpreadConstraints.labelSelector`
 
 A `PodDisruptionBudget` whose selector matches nothing is **not an error**. It
 reports `ALLOWED DISRUPTIONS` against an expected count of zero and permits every
 eviction. Phase 5's Drill C would still appear to pass while proving nothing.
-This is the single most dangerous consequence of the rename.
+
+A `topologySpreadConstraint` whose `labelSelector` matches nothing is **also not
+an error**, and it is worse, because `whenUnsatisfiable: DoNotSchedule` reads
+like a hard guarantee. With no matching pods there is no skew to violate, so the
+scheduler places the pods anywhere and reports success. **Observed on
+2026-09-12**: both JobManagers on `personalization-lab-worker2`, zone-b, giving a
+skew of 2 against `maxSkew: 1`. Phase 5 had recorded one per Zone.
+
+This class of silent selector breakage is the single most dangerous consequence
+of the rename. Every selector that names `app` must be checked, not just the
+ones in separate files.
 
 ### Storage layout
 

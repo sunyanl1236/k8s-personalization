@@ -469,7 +469,9 @@ sides run `rocksdb` from the same image. Whether this key is honoured inside
 
 - [ ] **Step 5: Point `spec.image` at Task 2's tag.**
 
-- [ ] **Step 6: Fix the PDB selector.**
+- [ ] **Step 6: Fix all THREE selectors, not one.**
+
+`manifests/flink/blue/pdb.yaml`:
 
 ```yaml
   selector:
@@ -477,6 +479,27 @@ sides run `rocksdb` from the same image. Whether this key is honoured inside
       app: personalization-blue
       component: jobmanager
 ```
+
+And **both** `topologySpreadConstraints.labelSelector` blocks inside
+`flinkdeployment.yaml`, one under `jobManager.podTemplate` and one under
+`taskManager.podTemplate`:
+
+```yaml
+            labelSelector:
+              matchLabels:
+                app: personalization-blue
+                component: jobmanager      # and, in the other block, taskmanager
+```
+
+**This plan originally listed only the PDB, and the omission was caught the hard
+way on 2026-09-12.** After the first sync both JobManagers landed on
+`worker2`, zone-b: skew 2 against `maxSkew: 1`, which is impossible if the
+selector matches. A spread constraint selecting nothing has no skew to violate,
+so `whenUnsatisfiable: DoNotSchedule` permits any placement and reports success.
+Phase 5's zone-spread work was silently inert.
+
+Grep before syncing: `grep -n 'app: personalization' manifests/flink/<side>/*`
+must return three lines per side, all carrying the side's name.
 
 - [ ] **Step 7: Delete `rest-nodeport.yaml`, and check `build-image.sh`.**
 
