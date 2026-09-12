@@ -61,9 +61,9 @@ constraints below rather than left as a cross-reference.
 | 0 | Baseline capture | ✅ done, 2026-09-10 |
 | 1 | `recommendation-snapshot.sh` gains a time window | ✅ done, 2026-09-10 |
 | 2 | Operator uids and names, and a new image | ✅ done, 2026-09-10 |
-| 3 | Blue's manifest: rename, paths, savepoint format | 🟡 files done, sync pending a push |
-| 4 | Green's directory and Application | 🟡 files done, sync pending a push |
-| 5 | `scripts/promote.sh`: discovery and promotion | 🟡 written, dry run pending Task 3's sync |
+| 3 | Blue's manifest: rename, paths, savepoint format | ✅ done, 2026-09-12 |
+| 4 | Green's directory and Application | ✅ done, 2026-09-12 |
+| 5 | `scripts/promote.sh`: discovery and promotion | ✅ done, 2026-09-12 |
 | 6 | Drill 1: fresh deploy | ⬜ |
 | 7 | Drill 2: promotion under a Load Ramp | ⬜ |
 | 8 | Drill 3: promotion back | ⬜ |
@@ -109,8 +109,15 @@ Every task's requirements implicitly include this section.
 - **`--start-from-earliest` defaults to `true`**, at
   `apps/pipeline/src/main/java/lab/personalization/pipeline/PipelineConfig.java:54`.
   Any start without an `initialSavepointPath` replays the whole `clickstream`
-  topic, which spans Phases 3 to 6. That is why Task 1 exists and why Drill 1
-  takes its baseline after catch-up, not before.
+  topic. On 2026-09-12 that was **10,041,754 Clicks** spanning Phases 3 to 6 plus
+  a full source replay, and the `recommendation` topic already held **5,844
+  duplicate identities** before any Phase 7 Drill ran.
+  **Drill 1 therefore truncates all four topics first**, with
+  `kafka-delete-records.sh` rather than by deleting the `KafkaTopic` resources,
+  which the `strimzi-kafka-cluster` Application owns. From Drill 2 onward a
+  duplicate in a comparison is a real Phase 7 duplicate rather than history
+  leaking in. Drill 1 no longer measures catch-up time; there is nothing to catch
+  up on.
 - **`:pipeline` changes are limited to Task 2.** Task 2 adds `.uid()` and
   `.name()` and nothing else. No operator may be added, removed, or reordered in
   this phase, because that is the change the uids are being added to make

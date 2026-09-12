@@ -46,6 +46,16 @@ Step-by-step Drill procedures, with the rationale per command and an
 | 5 | [A: TaskManager kill](../runbooks/phase-5-drill-a-taskmanager-kill.md) | a slice of RocksDB state |
 | 5 | [B: JobManager kill](../runbooks/phase-5-drill-b-jobmanager-kill.md) | the leader, and therefore the coordinator |
 | 5 | [C: Zone drain](../runbooks/phase-5-drill-c-zone-drain.md) | a whole Zone, through the eviction API |
+| 6 | [E: autoscaler dry run](../runbooks/phase-6-drill-e-dry-run.md) | nothing; reads the recommendation before anything acts |
+| 6 | [F: scale up](../runbooks/phase-6-drill-f-scale-up.md) | throughput, by ramping load until backpressure |
+| 6 | [G: scale down](../runbooks/phase-6-drill-g-scale-down.md) | the load, to watch the job shrink |
+| 6 | [H: Karpenter](../runbooks/phase-6-drill-h-karpenter.md) | schedulability, with a Decoy Workload |
+| 7 | [1: fresh deploy](../runbooks/phase-7-drill-1-fresh-deploy.md) | nothing; establishes the floor with a stateless start |
+| 7 | [2: promotion](../runbooks/phase-7-drill-2-promotion.md) | the Active Side, under a Load Ramp |
+| 7 | [3: promotion back](../runbooks/phase-7-drill-3-promotion-back.md) | the assumption that a direction was hardcoded |
+| 7 | [4: Standby timeout](../runbooks/phase-7-drill-4-standby-timeout.md) | the Standby Side, to reach the one failure with no safe path |
+| 7 | [5: rollback as deployment](../runbooks/phase-7-drill-5-rollback-deploy.md) | a deployment, deliberately, then reverses it |
+| 7 | [6: rollback as recovery](../runbooks/phase-7-drill-6-rollback-recovery.md) | the job itself, with an image that checkpoints then crash-loops |
 | 6 | [E: Autoscaler dry run](../runbooks/phase-6-drill-e-dry-run.md) | nothing. It reads the autoscaler's recommendation before anything may act on it |
 | 6 | [F: Scale up](../runbooks/phase-6-drill-f-scale-up.md) | the assumption that parallelism is fixed. Four rescales, no restart |
 | 6 | [G: Scale down](../runbooks/phase-6-drill-g-scale-down.md) | the assumption that shrinking mirrors growing. It does not |

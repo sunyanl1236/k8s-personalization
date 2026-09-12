@@ -1436,11 +1436,59 @@ promotion-as-recovery scope.
   dependency the plan did not state: discovery reads the live CR by its new name,
   which does not exist until the rename is applied.
 
-**What is left before the Drills.** Push `phase-2` to `master`, sync
-`flink-job-blue` and `flink-job-green`, then run Task 3 Steps 8 and 9, Task 4
-Step 6, and Task 5 Step 10. The sync **destroys the running Phase 6 job**, by
-design: `metadata.name` changed, Kubernetes has no rename, and the Application
-prunes.
+### Tasks 3 to 5 closed, 2026-09-12
+
+**A bug was introduced and caught by the cluster, not by review.** The rename
+changed the `app` label, and `pdb.yaml`'s selector was updated while the **two
+`topologySpreadConstraints.labelSelector` blocks inside `flinkdeployment.yaml`**
+were not. After the first sync both JobManagers landed on `worker2`, zone-b:
+skew 2 against `maxSkew: 1`, which is impossible if the selector matches.
+
+**A spread constraint selecting nothing is not an error, and it is worse than the
+PDB case**, because `whenUnsatisfiable: DoNotSchedule` reads like a hard
+guarantee. With no matching pods there is no skew to violate, so the scheduler
+places pods anywhere and reports success. Phase 5's Zone spread was silently
+inert for the duration. **Rule: after any rename, grep every selector that names
+`app`, not just the ones in separate files.** Three per side.
+
+**`Synced` does not mean "matches GitHub".** It means "matches the revision I last
+looked at". After the fix was pushed, `flink-job-blue` reported `Synced` at the
+previous commit for minutes. `argocd app get <app> --refresh` forces the poll.
+
+Gates settled on the live cluster:
+
+- **The `app` label carries `kubernetes.cluster-id`.** Conclusive only after the
+  rename made the two strings differ: pods now carry `app=personalization-blue`.
+- **Zone spread works again**: JobManagers on `worker3` (zone-c) and `worker2`
+  (zone-b), PDB `ALLOWED DISRUPTIONS 1`.
+- **The REST Service is `personalization-blue-rest`**, ClusterIP, and it is the
+  **only** Service in the namespace. No internal headless Service, confirming
+  Flink skips it under Kubernetes HA.
+- **The storage split is real**: `phase-7/blue/{checkpoints,ha,savepoints}` all
+  created, nothing leaking into the phase-6 prefixes.
+- **`kubernetes.operator.savepoint.format.type: NATIVE` IS honoured inside
+  `spec.flinkConfiguration`**, which settles Task 7 Step 7 early. The savepoint
+  holds **200 UUID-named files**, RocksDB's own layout. A `CANONICAL` savepoint
+  would be one `_metadata` plus a few large chunks.
+- **`promote.sh --dry-run` discovers `blue -> green`** and echoes every mutating
+  command.
+
+**A Standby Side's PDB reports `ALLOWED DISRUPTIONS 0`, and that is correct.**
+Green is suspended, so there are no pods to match. The PDB check only carries
+meaning on the Active Side; do not read 0 on a Standby Side as the broken-selector
+signature.
+
+**Two job ids now exist under `phase-7/blue/checkpoints/`**, `834237ec…` then
+`6fc8664a…`. The rename was a delete-and-create and started clean; the selector
+fix was an ordinary spec change, so `upgradeMode: savepoint` savepointed and
+restored. `spec.job.initialSavepointPath` stayed empty throughout, and
+`status.jobStatus.upgradeSavepointPath` carries the savepoint the operator used.
+
+**The `argocd` CLI is required and was not installed.** Server is v3.5.0 with
+`server.insecure: true`, so the CLI needs `--plaintext` on login. Installed to
+`~/.local/bin`, which is already first on PATH, rather than machine-wide.
+
+**What is left: the six Drills, Tasks 6 to 13.**
 
 ## Phase 8: Observability and docs — ⬜ not started
 
